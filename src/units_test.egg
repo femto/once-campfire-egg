@@ -1,0 +1,52 @@
+// Checks of the pure modules against values Ruby gives.
+uses alloc, io
+
+const tf = @import("timefmt.egg")
+const codec = @import("codec.egg")
+
+fn show_time(io: Io, a: Allocator, ns: i64) void {
+    var b: Buf(u8) = .empty
+    defer a.free(b)
+    tf.db_time(a, &b, ns)
+    a.append_str(&b, " | ")
+    tf.iso8601_ms(a, &b, ns)
+    a.append_str(&b, " | ")
+    tf.http_date(a, &b, ns)
+    io.print(b)
+}
+
+fn main(io: Io, a: Allocator) void {
+    show_time(io, a, 0)
+    show_time(io, a, 1762164000123456789)
+    show_time(io, a, 951782400000000000)
+    show_time(io, a, tf.add_years(951782400000000000, 20))
+    show_time(io, a, -1000000000)
+    var b: Buf(u8) = .empty
+    defer a.free(b)
+    codec.base64_encode(a, &b, "\"AxJs94fteQ5Autv2VrKsH68c\"")
+    a.append_str(&b, " ")
+    codec.base64_encode(a, &b, "ab")
+    a.append_str(&b, " ")
+    codec.base64_encode(a, &b, "a")
+    io.print(b)
+    var d: Buf(u8) = .empty
+    defer a.free(d)
+    _ = codec.base64_decode(a, &d, "ImFiYyI=")
+    a.append_str(&d, " ")
+    _ = codec.base64_decode(a, &d, "eyJfcmFpbHMiOnsiZGF0YSI6MTQ5MDg3NjU5LCJwdXIiOiJ1c2VyL2F2YXRhciJ9fQ")
+    io.print(d)
+    var e: Buf(u8) = .empty
+    defer a.free(e)
+    codec.escape(a, &e, "a b=c/d+e")
+    a.append_str(&e, " ")
+    codec.unescape(a, &e, "x%3D%3dy+z%zz")
+    io.print(e)
+    if (codec.form_value(a, "email_address=david%4037signals.com&password=p+w", "email_address")) |v| {
+        defer a.free(v)
+        io.print(v)
+    }
+    if (codec.cookie_value(a, "a=1; session_token=abc%3D%3D--ff; b=2", "session_token")) |v| {
+        defer a.free(v)
+        io.print(v)
+    }
+}

@@ -45,6 +45,12 @@ and Rack-escaped on the wire.
 ## Status
 
 - `GET /up` serves; the worker pool opens the seed's SQLite
+- written, checked against Ruby (src/units_test.egg): codec (Base64, hex,
+  form and cookie escaping), timefmt (DB, ISO 8601, HTTP dates)
+- written, not yet compiled or wired in: crypto (PBKDF2, HMAC, bcrypt via
+  vendor/crypt_blowfish), cookie (sign/verify session_token)
+- next: GET /session/new, POST /session (users by email, bcrypt, insert a
+  session with a base58 token, Set-Cookie, 302), then the room page
 
 ## Later
 
@@ -58,9 +64,7 @@ Recorded as they come up; each becomes an egg issue or PR.
   (`@strPtr` of any text, `@bufPtr`, `@sliceFromPtr`)
 - no environment variables (`getenv` cannot be declared): egg #75 (`args.env`)
 - no top-level value constants: egg #76 (`const MAX = 8192`)
-- no wall clock: cookie expiry and `created_at` need the current time
-- no random bytes: session tokens need them (/dev/urandom through `fs` works
-  on Linux and macOS)
+- no wall clock, no random bytes: egg #77 (`uses time` Clock, `uses rand` Random)
 
 Until those merge, `make` builds with ~/git/egg-dev, a checkout of egg main
 with the branches merged.

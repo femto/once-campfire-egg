@@ -1,0 +1,61 @@
+// Hashes and password checks from C: OpenSSL's libcrypto for PBKDF2 and
+// HMAC, and crypt_blowfish (vendor/) for bcrypt.
+uses alloc
+allow unsafe
+link "crypto"
+link "cfbcrypt"
+
+extern fn EVP_sha1() *u8
+extern fn EVP_sha256() *u8
+extern fn PKCS5_PBKDF2_HMAC(pass: *u8, passlen: i32, salt: *u8, saltlen: i32, iter: i32, md: *u8, keylen: i32, out: *u8) i32
+extern fn HMAC(md: *u8, key: *u8, keylen: i32, data: *u8, n: usize, out: *u8, outlen: *u32) *u8
+extern fn cf_bcrypt(key: *u8, setting: *u8, out: *u8, size: i32) *u8
+
+// ActiveSupport::KeyGenerator: PBKDF2-HMAC-SHA256 of the secret with salt,
+// 1000 rounds, as Rails derives every key from secret_key_base.
+fn derive_key(a: Allocator, secret: []u8, salt: []u8, n: i64) Buf(u8) {
+    const key: Buf(u8) = a.alloc(n, 0)
+    _ = PKCS5_PBKDF2_HMAC(@strPtr(secret), @as(i32, @len(secret)), @strPtr(salt), @as(i32, @len(salt)), 1000, EVP_sha256(), @as(i32, n), @bufPtr(key))
+    return key
+}
+
+fn hmac(a: Allocator, md: *u8, size: i64, key: []u8, data: []u8) Buf(u8) {
+    const out: Buf(u8) = a.alloc(size, 0)
+    var n: u32 = 0
+    _ = HMAC(md, @strPtr(key), @as(i32, @len(key)), @strPtr(data), @as(usize, @len(data)), @bufPtr(out), &n)
+    return out
+}
+
+fn hmac_sha1(a: Allocator, key: []u8, data: []u8) Buf(u8) {
+    return hmac(a, EVP_sha1(), 20, key, data)
+}
+
+fn hmac_sha256(a: Allocator, key: []u8, data: []u8) Buf(u8) {
+    return hmac(a, EVP_sha256(), 32, key, data)
+}
+
+// Does password match the bcrypt digest ("$2a$12$...")? Like
+// has_secure_password, only the first 72 bytes count.
+fn bcrypt_matches(a: Allocator, password: []u8, digest: []u8) bool {
+    const key = a.concat(password, "\0")
+    defer a.free(key)
+    const setting = a.concat(digest, "\0")
+    defer a.free(setting)
+    const out: Buf(u8) = a.alloc(64, 0)
+    defer a.free(out)
+    if (cf_bcrypt(@strPtr(key), @strPtr(setting), @bufPtr(out), 64) == null) {
+        return false
+    }
+    // 60 characters, then the 0.
+    return @len(digest) == 60 and same(out[0..60], digest)
+}
+
+fn same(x: []u8, y: []u8) bool {
+    var diff: u8 = 0
+    var i = 0
+    while (i < @len(x)) {
+        diff = diff | (x[i] ^ y[i])
+        i = i + 1
+    }
+    return diff == 0
+}

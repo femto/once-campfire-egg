@@ -1,0 +1,144 @@
+// Dates from Unix time in nanoseconds (clock.now()), UTC, in the forms
+// Rails and HTTP write them. Days to dates after Howard Hinnant's
+// civil_from_days.
+uses alloc
+
+const NS_PER_SEC = 1000000000
+const SECS_PER_DAY = 86400
+
+const Civil = struct {
+    year: i64
+    month: i64
+    day: i64
+    hour: i64
+    minute: i64
+    second: i64
+    nanos: i64
+    weekday: i64     // 0 is Sunday
+}
+
+fn floor_div(x: i64, y: i64) i64 {
+    const q = x / y
+    return if ((x % y != 0) and ((x < 0) != (y < 0))) q - 1 else q
+}
+
+fn civil(ns: i64) Civil {
+    const secs = floor_div(ns, NS_PER_SEC)
+    const days = floor_div(secs, SECS_PER_DAY)
+    const rest = secs - days * SECS_PER_DAY
+    const z = days + 719468
+    const era = floor_div(z, 146097)
+    const doe = z - era * 146097
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    const mp = (5 * doy + 2) / 153
+    const d = doy - (153 * mp + 2) / 5 + 1
+    const m = if (mp < 10) mp + 3 else mp - 9
+    const y = yoe + era * 400 + (if (m <= 2) 1 else 0)
+    return Civil{
+        .year = y,
+        .month = m,
+        .day = d,
+        .hour = rest / 3600,
+        .minute = rest / 60 % 60,
+        .second = rest % 60,
+        .nanos = ns - secs * NS_PER_SEC,
+        .weekday = days + 4 - floor_div(days + 4, 7) * 7,
+    }
+}
+
+// Days since 1970-01-01 of a date.
+fn days_from_civil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year
+    const era = floor_div(y, 400)
+    const yoe = y - era * 400
+    const mp = if (month > 2) month - 3 else month + 9
+    const doy = (153 * mp + 2) / 5 + day - 1
+    const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn leap(year: i64) bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+}
+
+// ns moved n calendar years on, as Ruby's n.years.from_now: February 29
+// becomes the 28th in a year that has none.
+fn add_years(ns: i64, n: i64) i64 {
+    const c = civil(ns)
+    const year = c.year + n
+    const day = if (c.month == 2 and c.day == 29 and !leap(year)) 28 else c.day
+    const secs = days_from_civil(year, c.month, day) * SECS_PER_DAY + c.hour * 3600 + c.minute * 60 + c.second
+    return secs * NS_PER_SEC + c.nanos
+}
+
+fn digits(a: Allocator, inout out: Buf(u8), n: i64, width: i64) void {
+    var div = 1
+    var i = 1
+    while (i < width) {
+        div = div * 10
+        i = i + 1
+    }
+    const v = n
+    while (div > 0) {
+        a.push(&out, @as(u8, v / div % 10) + '0')
+        div = div / 10
+    }
+}
+
+fn date_time(a: Allocator, inout out: Buf(u8), c: Civil, sep: u8) void {
+    digits(a, &out, c.year, 4)
+    a.push(&out, '-')
+    digits(a, &out, c.month, 2)
+    a.push(&out, '-')
+    digits(a, &out, c.day, 2)
+    a.push(&out, sep)
+    digits(a, &out, c.hour, 2)
+    a.push(&out, ':')
+    digits(a, &out, c.minute, 2)
+    a.push(&out, ':')
+    digits(a, &out, c.second, 2)
+}
+
+// How Rails writes a datetime(6) column: "2026-11-03 10:00:00", and
+// ".123456" after it unless the microseconds are 0.
+fn db_time(a: Allocator, inout out: Buf(u8), ns: i64) void {
+    const c = civil(ns)
+    date_time(a, &out, c, ' ')
+    const us = c.nanos / 1000
+    if (us != 0) {
+        a.push(&out, '.')
+        digits(a, &out, us, 6)
+    }
+}
+
+// Time#iso8601(3) in UTC: "2046-11-03T10:00:00.000Z", the fraction cut,
+// not rounded.
+fn iso8601_ms(a: Allocator, inout out: Buf(u8), ns: i64) void {
+    const c = civil(ns)
+    date_time(a, &out, c, 'T')
+    a.push(&out, '.')
+    digits(a, &out, c.nanos / 1000000, 3)
+    a.push(&out, 'Z')
+}
+
+// An HTTP date: "Sat, 03 Nov 2046 10:00:00 GMT".
+fn http_date(a: Allocator, inout out: Buf(u8), ns: i64) void {
+    const c = civil(ns)
+    const days = "SunMonTueWedThuFriSat"
+    const months = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    a.append_str(&out, days[c.weekday * 3..c.weekday * 3 + 3])
+    a.append_str(&out, ", ")
+    digits(a, &out, c.day, 2)
+    a.push(&out, ' ')
+    a.append_str(&out, months[(c.month - 1) * 3..c.month * 3])
+    a.push(&out, ' ')
+    digits(a, &out, c.year, 4)
+    a.push(&out, ' ')
+    digits(a, &out, c.hour, 2)
+    a.push(&out, ':')
+    digits(a, &out, c.minute, 2)
+    a.push(&out, ':')
+    digits(a, &out, c.second, 2)
+    a.append_str(&out, " GMT")
+}

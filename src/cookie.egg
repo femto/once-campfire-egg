@@ -1,0 +1,126 @@
+// Rails' signed cookies, as cookies.signed[:session_token] writes and reads
+// them (once-campfire-rust's rails_compat/cookies.rs). The value is the
+// JSON string, in the legacy envelope
+//   {"_rails":{"message":<base64 of it>,"exp":<iso8601 ms>,"pur":"cookie.NAME"}}
+// strict Base64, then "--" and the hex HMAC-SHA1 of that Base64, under
+// the key derived from secret_key_base with the salt "signed cookie".
+uses alloc
+
+const text = @import("std/text")
+const codec = @import("codec.egg")
+const crypto = @import("crypto.egg")
+const tf = @import("timefmt.egg")
+
+const SALT = "signed cookie"
+const KEY_SIZE = 64
+const DIGEST_HEX = 40
+
+fn key(a: Allocator, secret_key_base: []u8) Buf(u8) {
+    return crypto.derive_key(a, secret_key_base, SALT, KEY_SIZE)
+}
+
+// The cookie's value as it goes on the wire, Rack-escaped. value must need
+// no JSON escaping (a token does not).
+fn sign(a: Allocator, k: []u8, name: str, value: []u8, expires_ns: i64) Buf(u8) {
+    const dumped = a.concat("\"", value, "\"")
+    defer a.free(dumped)
+    var envelope: Buf(u8) = .empty
+    defer a.free(envelope)
+    a.append_str(&envelope, "{\"_rails\":{\"message\":\"")
+    codec.base64_encode(a, &envelope, dumped)
+    a.append_str(&envelope, "\",\"exp\":\"")
+    tf.iso8601_ms(a, &envelope, expires_ns)
+    a.append_str(&envelope, "\",\"pur\":\"cookie.")
+    a.append_str(&envelope, name)
+    a.append_str(&envelope, "\"}}")
+    var raw: Buf(u8) = .empty
+    defer a.free(raw)
+    codec.base64_encode(a, &raw, envelope)
+    const mac = crypto.hmac_sha1(a, k, raw)
+    defer a.free(mac)
+    a.append_str(&raw, "--")
+    codec.hex_encode(a, &raw, mac)
+    var wire: Buf(u8) = .empty
+    codec.escape(a, &wire, raw)
+    return wire
+}
+
+// The string a signed cookie holds, already unescaped from the Cookie
+// header, or null when it is forged, expired, for another cookie, or not
+// a JSON string without escapes.
+fn verify(a: Allocator, k: []u8, name: str, raw: []u8, now_ns: i64) ?Buf(u8) {
+    if (@len(raw) < DIGEST_HEX + 3) {
+        return null
+    }
+    const cut = @len(raw) - DIGEST_HEX - 2
+    if (raw[cut..cut + 2] != "--") {
+        return null
+    }
+    const encoded = raw[0..cut]
+    const mac = crypto.hmac_sha1(a, k, encoded)
+    defer a.free(mac)
+    var want: Buf(u8) = .empty
+    defer a.free(want)
+    codec.hex_encode(a, &want, mac)
+    if (!codec.same_secret(want, raw[cut + 2..])) {
+        return null
+    }
+    var envelope: Buf(u8) = .empty
+    defer a.free(envelope)
+    if (!codec.base64_decode(a, &envelope, encoded)) {
+        return null
+    }
+    const head = "{\"_rails\":{\"message\":\""
+    if (!text.starts_with(envelope, head)) {
+        return null
+    }
+    const end = text.find_from(envelope, "\"", @len(head)) orelse -1
+    if (end < 0) {
+        return null
+    }
+    const message = envelope[@len(head)..end]
+    // The purpose must be this cookie's.
+    const pur = a.concat("\"pur\":\"cookie.", name, "\"}}")
+    defer a.free(pur)
+    if (!text.ends_with(envelope, pur)) {
+        return null
+    }
+    // An expiry, if any, must be in the future: ISO 8601 in one format
+    // orders as text.
+    const exp_at = text.find_from(envelope, ",\"exp\":\"", end) orelse -1
+    if (exp_at >= 0) {
+        const from = exp_at + @len(",\"exp\":\"")
+        const exp_end = text.find_from(envelope, "\"", from) orelse -1
+        if (exp_end < 0) {
+            return null
+        }
+        var now: Buf(u8) = .empty
+        defer a.free(now)
+        tf.iso8601_ms(a, &now, now_ns)
+        if (!later(envelope[from..exp_end], now)) {
+            return null
+        }
+    }
+    var dumped: Buf(u8) = .empty
+    defer a.free(dumped)
+    if (!codec.base64_decode(a, &dumped, message)) {
+        return null
+    }
+    const n = @len(dumped)
+    if (n < 2 or dumped[0] != '"' or dumped[n - 1] != '"' or text.contains(dumped[1..n - 1], "\\") or text.contains(dumped[1..n - 1], "\"")) {
+        return null
+    }
+    return a.concat(dumped[1..n - 1], "")
+}
+
+// Is x after y, comparing bytes?
+fn later(x: []u8, y: []u8) bool {
+    var i = 0
+    while (i < @len(x) and i < @len(y)) {
+        if (x[i] != y[i]) {
+            return x[i] > y[i]
+        }
+        i = i + 1
+    }
+    return @len(x) > @len(y)
+}
