@@ -47,10 +47,10 @@ and Rack-escaped on the wire.
 - `GET /up` serves; the worker pool opens the seed's SQLite
 - written, checked against Ruby (src/units_test.egg): codec (Base64, hex,
   form and cookie escaping), timefmt (DB, ISO 8601, HTTP dates)
-- written, not yet compiled or wired in: crypto (PBKDF2, HMAC, bcrypt via
-  vendor/crypt_blowfish), cookie (sign/verify session_token)
-- next: GET /session/new, POST /session (users by email, bcrypt, insert a
-  session with a base58 token, Set-Cookie, 302), then the room page
+- sign-in: `GET /session/new`, `POST /session` (bcrypt, a sessions row with a
+  base58 token, a Rails-signed `session_token` cookie that Ruby's OpenSSL
+  verifies, 302); `session.current_user` reads the cookie back
+- next: the room page
 
 ## Later
 

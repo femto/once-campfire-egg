@@ -1,28 +1,62 @@
 // Routing, and what one worker keeps between requests.
-uses alloc, net
+uses alloc, net, rand, time
 
 const http = @import("http.egg")
 const sqlite = @import("sqlite.egg")
+const codec = @import("codec.egg")
+const cookie = @import("cookie.egg")
+const session = @import("session.egg")
 
 const Context = owned struct {
     db: sqlite.Db
+    // The signed-cookie key, derived from SECRET_KEY_BASE once.
+    key: Buf(u8)
+    clock: Clock
+    rng: Random
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
+        a.free(self.key)
         @forget(self)
     }
 }
 
-fn open(a: Allocator, path: str) !Context {
+fn open(a: Allocator, path: str, secret: str, clock: Clock, rng: Random) !Context {
     const db = try sqlite.open(a, path)
-    return Context{ .db = db }
+    return Context{ .db = db, .key = cookie.key(a, secret), .clock = clock, .rng = rng }
 }
 
 const HTML = "Content-Type: text/html; charset=utf-8\r\n"
+
+const SIGN_IN = "<!DOCTYPE html><html><head><title>Campfire</title></head><body><form action=\"/session\" method=\"post\"><input type=\"email\" name=\"email_address\" required autofocus><input type=\"password\" name=\"password\" required><button type=\"submit\">Sign in</button></form></body></html>"
 
 fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
     if (req.method == "GET" and req.path == "/up") {
         return http.write_response(c, a, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>", req.keep)
     }
+    if (req.method == "GET" and req.path == "/session/new") {
+        return http.write_response(c, a, "200 OK", HTML, SIGN_IN, req.keep)
+    }
+    if (req.method == "POST" and req.path == "/session") {
+        return sign_in(c, a, &ctx, req)
+    }
     return http.write_response(c, a, "404 Not Found", HTML, "Not found", req.keep)
+}
+
+fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const email = codec.form_value(a, req.body, "email_address") orelse a.concat("", "")
+    defer a.free(email)
+    const password = codec.form_value(a, req.body, "password") orelse a.concat("", "")
+    defer a.free(password)
+    const user = try session.authenticate(a, ctx.db, email, password) orelse {
+        return http.write_response(c, a, "401 Unauthorized", HTML, SIGN_IN, req.keep)
+    }
+    const token = try session.start(a, ctx.db, ctx.clock, ctx.rng, user)
+    defer a.free(token)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: /\r\n")
+    session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
+    a.append_str(&headers, HTML)
+    return http.write_response(c, a, "302 Found", headers, "", req.keep)
 }

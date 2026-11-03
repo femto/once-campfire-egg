@@ -1,7 +1,7 @@
 // ONCE Campfire in Egg. A fixed pool of worker threads takes connections
 // from a queue; each worker has its own SQLite connection, since threads
 // share nothing.
-uses alloc, args, net, thread, io
+uses alloc, args, net, rand, thread, time, io
 
 const text = @import("std/text")
 const http = @import("http.egg")
@@ -28,9 +28,9 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     }
 }
 
-fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, db_path: str) void {
+fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, db_path: str, secret: str) void {
     defer jobs.close()
-    var ctx = app.open(a, db_path) catch |e| {
+    var ctx = app.open(a, db_path, secret, clock, rng) catch |e| {
         io.eprint("cannot open ", db_path, ": ", @errorName(e))
         return
     }
@@ -43,7 +43,7 @@ fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, db_path: str) void {
     }
 }
 
-fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads) !void {
+fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random) !void {
     const port_text = args.env("HTTP_PORT") orelse "3000"
     const port = text.parse_int(port_text) orelse -1
     if (port < 0 or port > 65535) {
@@ -55,6 +55,10 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads) !void {
     const default_db = a.concat(storage, "/db/production.sqlite3")
     const db_path = args.env("CAMPFIRE_DATABASE_PATH") orelse a.leak(default_db)
     a.free(default_db)
+    const secret = args.env("SECRET_KEY_BASE") orelse {
+        io.eprint("SECRET_KEY_BASE is not set")
+        return
+    }
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
     io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers")
@@ -66,7 +70,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads) !void {
     defer queue.close()      // first: they finish what is queued, and stop
     var i = 0
     while (i < workers) {
-        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, db_path) })
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, db_path, secret) })
         i = i + 1
     }
     jobs.close()
