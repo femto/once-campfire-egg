@@ -1,0 +1,76 @@
+// ONCE Campfire in Egg. A fixed pool of worker threads takes connections
+// from a queue; each worker has its own SQLite connection, since threads
+// share nothing.
+uses alloc, args, net, thread, io
+
+const text = @import("std/text")
+const http = @import("http.egg")
+const app = @import("app.egg")
+
+const Worker = owned struct {
+    t: Thread
+
+    fn deinit(sink self: Worker) void {
+        self.t.join()
+        @forget(self)
+    }
+}
+
+fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
+    var served = 0
+    while (try http.read_request(c, a, served)) |req| {
+        defer req.deinit(a)
+        served = served + 1
+        try app.handle(c, a, &ctx, req)
+        if (!req.keep) {
+            return
+        }
+    }
+}
+
+fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, db_path: str) void {
+    defer jobs.close()
+    var ctx = app.open(a, db_path) catch |e| {
+        io.eprint("cannot open ", db_path, ": ", @errorName(e))
+        return
+    }
+    defer ctx.close(a)
+    while (jobs.recv()) |c| {
+        defer c.close()
+        serve(c, a, &ctx) catch {
+            continue
+        }
+    }
+}
+
+fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads) !void {
+    const port_text = args.env("HTTP_PORT") orelse "3000"
+    const port = text.parse_int(port_text) orelse -1
+    if (port < 0 or port > 65535) {
+        io.eprint("bad HTTP_PORT: ", port_text)
+        return
+    }
+    const workers = text.parse_int(args.env("CAMPFIRE_WORKERS") orelse "32") orelse 32
+    const storage = args.env("CAMPFIRE_STORAGE_PATH") orelse "storage"
+    const default_db = a.concat(storage, "/db/production.sqlite3")
+    const db_path = args.env("CAMPFIRE_DATABASE_PATH") orelse a.leak(default_db)
+    a.free(default_db)
+    const listener = try net.tcp_listen("0.0.0.0", port)
+    defer listener.close()
+    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers")
+
+    const jobs = threads.channel(TcpConn, 64)
+    const queue = jobs.sender()
+    var pool: Buf(Worker) = .empty
+    defer a.free(pool)       // joins them
+    defer queue.close()      // first: they finish what is queued, and stop
+    var i = 0
+    while (i < workers) {
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, db_path) })
+        i = i + 1
+    }
+    jobs.close()
+    while (true) {
+        queue.send(try listener.accept())
+    }
+}

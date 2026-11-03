@@ -1,0 +1,28 @@
+// Routing, and what one worker keeps between requests.
+uses alloc, net
+
+const http = @import("http.egg")
+const sqlite = @import("sqlite.egg")
+
+const Context = owned struct {
+    db: sqlite.Db
+
+    fn close(sink self: Context, a: Allocator) void {
+        self.db.close()
+        @forget(self)
+    }
+}
+
+fn open(a: Allocator, path: str) !Context {
+    const db = try sqlite.open(a, path)
+    return Context{ .db = db }
+}
+
+const HTML = "Content-Type: text/html; charset=utf-8\r\n"
+
+fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    if (req.method == "GET" and req.path == "/up") {
+        return http.write_response(c, a, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>", req.keep)
+    }
+    return http.write_response(c, a, "404 Not Found", HTML, "Not found", req.keep)
+}
