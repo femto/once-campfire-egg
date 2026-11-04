@@ -67,7 +67,11 @@ and Rack-escaped on the wire.
 - gzip (zlib, level 6, bodies of 1 KB or more but not compressed images),
   as the Rust app's Rack::Deflater rules; the Rust app splices fragments it
   compressed before, so its room page is 24 KB gzipped against Egg's 21 KB
-- next: a Docker image, then the benchmark
+- Dockerfile: egg at a pinned commit, the app on debian-slim, laid out
+  as once-campfire-rust's image (/rails, storage mounted at
+  /rails/storage/{db,files}); `docker build -t once-campfire-egg:app .`
+  after script/assets.sh build/assets RUST_URL. Its pages match Rust's.
+- next: the benchmark
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
 checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
