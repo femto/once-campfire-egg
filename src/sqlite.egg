@@ -211,9 +211,25 @@ const Stmt = owned struct {
 }
 
 // Open the database at path, read-write, waiting up to 5 s on a lock
-// another connection holds.
+// another connection holds, with the settings Rails gives each connection
+// (SQLite3Adapter#configure_connection), as the Rust app does but for
+// mmap_size: WAL, and synchronous=NORMAL, so a commit is not synced to disk
+// until a checkpoint.
 fn open(a: Allocator, path: []u8) !Db {
-    return open_with(a, path, OPEN_FLAGS)
+    const db = try open_with(a, path, OPEN_FLAGS)
+    configure(db) catch |e| {
+        db.close()
+        return e
+    }
+    return db
+}
+
+fn configure(db: Db) !void {
+    try db.exec("PRAGMA foreign_keys = ON")
+    try db.exec("PRAGMA journal_mode = WAL")
+    try db.exec("PRAGMA synchronous = NORMAL")
+    try db.exec("PRAGMA journal_size_limit = 67108864")
+    try db.exec("PRAGMA cache_size = 2000")
 }
 
 // The same, read-only (SQLITE_OPEN_READONLY).
