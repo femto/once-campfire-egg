@@ -28,16 +28,20 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     }
 }
 
-fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
+fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), io: Io, a: Allocator, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
     defer jobs.close()
-    var ctx = app.open(a, cfg, clock, rng, files) catch |e| {
+    var ctx = app.open(a, cfg, clock, rng, files, lock_rx, lock_tx) catch |e| {
         io.eprint("cannot open ", cfg.db_path, ": ", @errorName(e))
         return
     }
     defer ctx.close(a)
     while (jobs.recv()) |c| {
         defer c.close()
-        serve(c, a, &ctx) catch {
+        serve(c, a, &ctx) catch |e| {
+            // A peer closing its connection is no news; anything else is.
+            if (e != error.Closed and e != error.IoFailed) {
+                io.eprint("request failed: ", @errorName(e))
+            }
             continue
         }
     }
@@ -75,6 +79,11 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     defer listener.close()
     io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (cfg.cache) ", caching responses" else "")
 
+    // The database's writers take turns through this one token, rather than
+    // wait on SQLite's lock, which lets some wait for seconds under load.
+    const lock = threads.channel(bool, 1)
+    const lock_tx = lock.sender()
+    lock_tx.send(true)
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty
@@ -82,10 +91,12 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     defer queue.close()      // first: they finish what is queued, and stop
     var i = 0
     while (i < workers) {
-        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, files, cfg) })
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), lock.clone(), lock_tx.clone(), io, a, clock, rng, files, cfg) })
         i = i + 1
     }
     jobs.close()
+    lock.close()
+    lock_tx.close()
     while (true) {
         queue.send(try listener.accept())
     }

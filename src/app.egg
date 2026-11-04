@@ -1,5 +1,5 @@
 // Routing, and what one worker keeps between requests.
-uses alloc, fs, net, rand, time
+uses alloc, fs, net, rand, thread, time
 
 const http = @import("http.egg")
 const sqlite = @import("sqlite.egg")
@@ -41,9 +41,14 @@ const Context = owned struct {
     files: str
     assets: str
     cache: respcache.Cache
+    // The write token: take it, write, hand it back (see main).
+    lock_rx: Receiver(bool)
+    lock_tx: Sender(bool)
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
+        self.lock_rx.close()
+        self.lock_tx.close()
         self.cache.close(a)
         a.free(self.key)
         a.free(self.sid_key)
@@ -53,10 +58,16 @@ const Context = owned struct {
     }
 }
 
-fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs) !Context {
-    const db = try sqlite.open(a, cfg.db_path)
+fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool)) !Context {
+    const db = sqlite.open(a, cfg.db_path) catch |e| {
+        lock_rx.close()
+        lock_tx.close()
+        return e
+    }
     const cache = respcache.open(a, cfg.db_path, cfg.cache) catch |e| {
         db.close()
+        lock_rx.close()
+        lock_tx.close()
         return e
     }
     const secret = cfg.secret
@@ -72,6 +83,8 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs) !Contex
         .files = cfg.files,
         .assets = cfg.assets,
         .cache = cache,
+        .lock_rx = lock_rx,
+        .lock_tx = lock_tx,
     }
 }
 
@@ -277,7 +290,12 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     const user = try session.authenticate(a, ctx.db, email, password) orelse {
         return http.respond(c, a, req, "401 Unauthorized", HTML, SIGN_IN)
     }
-    const token = try session.start(a, ctx.db, ctx.clock, ctx.rng, user)
+    _ = ctx.lock_rx.recv()
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
     defer a.free(token)
     var headers: Buf(u8) = .empty
     defer a.free(headers)
@@ -592,7 +610,12 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     if (codec.form_value(a, req.body, "message[client_message_id]")) |v| {
         a.free(@replace(&client_id, v))
     }
-    const message_id = try model.create_message(a, ctx.db, ctx.clock, ctx.rng, room.id, user_id, has_body, body, client_id)
+    _ = ctx.lock_rx.recv()
+    const message_id = model.create_message(a, ctx.db, ctx.clock, ctx.rng, room.id, user_id, has_body, body, client_id) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
     const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
     defer a.free(others)
     const messages = try model.find_message(a, ctx.db, ctx.sid_key, message_id, others)

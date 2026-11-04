@@ -565,25 +565,28 @@ fn db_now(a: Allocator, inout out: Buf(u8), clock: Clock) i64 {
 }
 
 // room.messages.create!(body:, client_message_id:) by user (has_body false
-// for no body): the message,
-// its body (which touches it) and the room's touch in one transaction;
-// then, as after_commit does, the search index and the other members'
-// unread marks. The new message's id.
+// for no body): the message, its body (which touches it), the room's touch,
+// and what Rails does after the commit (the search index, the other
+// members' unread marks), in one transaction: one turn at the write lock.
+// The new message's id.
 fn create_message(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, room: i64, user: i64, has_body: bool, body: []u8, client_id: []u8) !i64 {
     const client = if (@len(client_id) > 0) a.concat(client_id, "") else uuid(a, rng)
     defer a.free(client)
-    var stamp: Buf(u8) = .empty
-    defer a.free(stamp)
     try db.exec("BEGIN IMMEDIATE")
-    var created: Buf(u8) = .empty
-    defer a.free(created)
-    var plain: Buf(u8) = .empty
-    defer a.free(plain)
-    const id = insert_message(a, db, clock, room, user, has_body, body, client, &created, &plain) catch |e| {
+    const id = write_message(a, db, clock, room, user, has_body, body, client) catch |e| {
         db.exec("ROLLBACK") catch {}
         return e
     }
     try db.exec("COMMIT")
+    return id
+}
+
+fn write_message(a: Allocator, db: sqlite.Db, clock: Clock, room: i64, user: i64, has_body: bool, body: []u8, client: []u8) !i64 {
+    var created: Buf(u8) = .empty
+    defer a.free(created)
+    var plain: Buf(u8) = .empty
+    defer a.free(plain)
+    const id = try insert_message(a, db, clock, room, user, has_body, body, client, &created, &plain)
     var ix = try db.prepare("INSERT INTO message_search_index(rowid, body) VALUES (?, ?)")
     defer ix.finalize()
     try ix.bind_int(1, id)
@@ -594,6 +597,8 @@ fn create_message(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, room: 
     var cutoff: Buf(u8) = .empty
     defer a.free(cutoff)
     tf.db_time(a, &cutoff, now - 60 * tf.NS_PER_SEC)
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
     _ = db_now(a, &stamp, clock)
     var un = try db.prepare("UPDATE memberships SET unread_at = ?, updated_at = ? WHERE room_id = ? AND involvement != 'invisible' AND (connected_at IS NULL OR connected_at < ?) AND user_id != ?")
     defer un.finalize()
