@@ -3,6 +3,7 @@
 // headers Campfire reads.
 uses alloc, net
 
+const gz = @import("gzip.egg")
 const text = @import("std/text")
 
 const MAX_LINE = 8192
@@ -209,4 +210,30 @@ fn write_response(c: TcpConn, a: Allocator, status: str, headers: []u8, body: []
     a.append_str(&head, if (keep) "\r\nConnection: keep-alive\r\n\r\n" else "\r\nConnection: close\r\n\r\n")
     a.append_str(&head, body)
     try c.write(head)
+}
+
+// Whether the Rust app (Rack::Deflater's rules) compresses a body of this
+// type: not images already compressed, audio or video.
+fn compressible(headers: []u8) bool {
+    const types = [_]str{ "Content-Type: image/png", "Content-Type: image/webp", "Content-Type: image/gif", "Content-Type: image/jp", "Content-Type: audio/", "Content-Type: video/" }
+    for (types) |t| {
+        if (text.contains(headers, t)) {
+            return false
+        }
+    }
+    return true
+}
+
+// The response, gzipped when the request accepts it and the body is at
+// least 1 KB of a compressible type.
+fn respond(c: TcpConn, a: Allocator, req: Request, status: str, headers: []u8, body: []u8) !void {
+    if (req.gzip and @len(body) >= 1024 and compressible(headers)) {
+        if (gz.compress(a, body)) |z| {
+            defer a.free(z)
+            const more = a.concat(headers, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
+            defer a.free(more)
+            return write_response(c, a, status, more, z, req.keep)
+        }
+    }
+    return write_response(c, a, status, headers, body, req.keep)
 }

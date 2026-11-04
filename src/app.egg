@@ -71,13 +71,13 @@ const SIGN_IN = "<!DOCTYPE html><html><head><title>Campfire</title></head><body>
 
 fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
     if (req.method == "GET" and req.path == "/up") {
-        return http.write_response(c, a, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>", req.keep)
+        return http.respond(c, a, req, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>")
     }
     if (req.method == "GET" and req.path == "/session/new") {
-        return http.write_response(c, a, "200 OK", HTML, SIGN_IN, req.keep)
+        return http.respond(c, a, req, "200 OK", HTML, SIGN_IN)
     }
     if (req.method == "POST" and !same_origin(a, req)) {
-        return http.write_response(c, a, "422 Unprocessable Content", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.UNPROCESSABLE, req.keep)
+        return http.respond(c, a, req, "422 Unprocessable Content", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.UNPROCESSABLE)
     }
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
@@ -114,7 +114,7 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
 }
 
 fn not_found(c: TcpConn, a: Allocator, req: http.Request) !void {
-    return http.write_response(c, a, "404 Not Found", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.NOT_FOUND, req.keep)
+    return http.respond(c, a, req, "404 Not Found", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.NOT_FOUND)
 }
 
 // A room the user cannot see: back to the start, as the Rust app does.
@@ -125,7 +125,7 @@ fn to_root(c: TcpConn, a: Allocator, req: http.Request) !void {
     a.append_str(&headers, req.host)
     a.append_str(&headers, "/\r\n")
     a.append_str(&headers, HTML)
-    return http.write_response(c, a, "302 Found", headers, "", req.keep)
+    return http.respond(c, a, req, "302 Found", headers, "")
 }
 
 fn to_sign_in(c: TcpConn, a: Allocator, req: http.Request) !void {
@@ -135,7 +135,7 @@ fn to_sign_in(c: TcpConn, a: Allocator, req: http.Request) !void {
     a.append_str(&headers, req.host)
     a.append_str(&headers, "/session/new\r\n")
     a.append_str(&headers, HTML)
-    return http.write_response(c, a, "302 Found", headers, "", req.keep)
+    return http.respond(c, a, req, "302 Found", headers, "")
 }
 
 // Whether the user is an administrator (role 1), and the account's logo
@@ -211,7 +211,7 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
         a.append_str(&headers, "; samesite=lax\r\n")
     }
     a.append_str(&headers, HTML)
-    return http.write_response(c, a, "200 OK", headers, body, req.keep)
+    return http.respond(c, a, req, "200 OK", headers, body)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
@@ -220,7 +220,7 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     const password = codec.form_value(a, req.body, "password") orelse a.concat("", "")
     defer a.free(password)
     const user = try session.authenticate(a, ctx.db, email, password) orelse {
-        return http.write_response(c, a, "401 Unauthorized", HTML, SIGN_IN, req.keep)
+        return http.respond(c, a, req, "401 Unauthorized", HTML, SIGN_IN)
     }
     const token = try session.start(a, ctx.db, ctx.clock, ctx.rng, user)
     defer a.free(token)
@@ -229,7 +229,7 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     a.append_str(&headers, "Location: /\r\n")
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
-    return http.write_response(c, a, "302 Found", headers, "", req.keep)
+    return http.respond(c, a, req, "302 Found", headers, "")
 }
 
 // GET /rooms/:id/messages?before=:message_id: the page before that message,
@@ -256,12 +256,12 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
     const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, before, others)
     defer a.free(messages)
     if (@len(messages) == 0) {
-        return http.write_response(c, a, "204 No Content", "", "", req.keep)
+        return http.respond(c, a, req, "204 No Content", "", "")
     }
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.messages_index(a, &body, messages)
-    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+    return http.respond(c, a, req, "200 OK", HTML, body)
 }
 
 // GET /users/me/sidebar: the room list, as a whole page.
@@ -289,7 +289,7 @@ fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
-    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+    return http.respond(c, a, req, "200 OK", HTML, body)
 }
 
 // Whether the code point is in [[:word:]] (letter, mark, decimal digit or
@@ -394,7 +394,7 @@ fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) 
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin)
-    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+    return http.respond(c, a, req, "200 OK", HTML, body)
 }
 
 // The Content-Type header of a file, by its extension.
@@ -435,7 +435,7 @@ fn asset(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void 
     defer a.free(headers)
     a.append_str(&headers, content_type(name))
     a.append_str(&headers, "Cache-Control: public, max-age=2592000\r\n")
-    return http.write_response(c, a, "200 OK", headers, body, req.keep)
+    return http.respond(c, a, req, "200 OK", headers, body)
 }
 
 // ActiveStorage's digest of the :square variant (resize_to_limit
@@ -448,7 +448,7 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
         return to_sign_in(c, a, req)
     }
     const user = signed_id.verify(a, ctx.sid_key, token, "user/avatar") orelse {
-        return http.write_response(c, a, "404 Not Found", HTML, "", req.keep)
+        return http.respond(c, a, req, "404 Not Found", HTML, "")
     }
     var st = try ctx.db.prepare("SELECT b.key, b.content_type FROM users u JOIN active_storage_attachments ua ON ua.record_type = 'User' AND ua.record_id = u.id AND ua.name = 'avatar' JOIN active_storage_variant_records v ON v.blob_id = ua.blob_id AND v.variation_digest = ? JOIN active_storage_attachments va ON va.record_type = 'ActiveStorage::VariantRecord' AND va.record_id = v.id AND va.name = 'image' JOIN active_storage_blobs b ON b.id = va.blob_id WHERE u.id = ?")
     defer st.finalize()
@@ -480,7 +480,7 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     a.append_str(&headers, "\"; filename*=UTF-8''")
     a.append_str(&headers, key)
     a.append_str(&headers, "\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
-    return http.write_response(c, a, "200 OK", headers, body, req.keep)
+    return http.respond(c, a, req, "200 OK", headers, body)
 }
 
 // verify_authenticity_token as the Rust app does it, by headers instead of
@@ -527,5 +527,5 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     var out: Buf(u8) = .empty
     defer a.free(out)
     views.create_stream(a, &out, room, messages)
-    return http.write_response(c, a, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out, req.keep)
+    return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
 }

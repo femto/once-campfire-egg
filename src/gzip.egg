@@ -1,0 +1,39 @@
+// gzip (RFC 1952) from zlib: compress2's zlib stream without its 2-byte
+// header and Adler-32 trailer is the raw deflate data a gzip member holds,
+// between a 10-byte header and the CRC-32 and length of the input.
+uses alloc
+allow unsafe
+link "z"
+
+extern fn compressBound(n: u64) u64
+extern fn compress2(dest: *u8, dest_len: *u64, source: *u8, source_len: u64, level: i32) i32
+extern fn crc32(crc: u64, buf: *u8, n: u32) u64
+
+// Rack::Deflater's level, and the Rust app's.
+const LEVEL: i32 = 6
+
+fn push_le32(a: Allocator, inout out: Buf(u8), v: u64) void {
+    a.push(&out, @as(u8, v & 0xFF))
+    a.push(&out, @as(u8, (v >> 8) & 0xFF))
+    a.push(&out, @as(u8, (v >> 16) & 0xFF))
+    a.push(&out, @as(u8, (v >> 24) & 0xFF))
+}
+
+// data, gzipped; null if zlib fails.
+fn compress(a: Allocator, data: []u8) ?Buf(u8) {
+    const z: Buf(u8) = a.alloc(@as(i64, compressBound(@as(u64, @len(data)))), 0)
+    defer a.free(z)
+    var n: u64 = @as(u64, @len(z))
+    if (compress2(@bufPtr(z), &n, @strPtr(data), @as(u64, @len(data)), LEVEL) != 0 or n < 6) {
+        return null
+    }
+    var out: Buf(u8) = .empty
+    // ID1 ID2, deflate, no flags, no mtime, no extra flags, Unix.
+    for ([_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 }) |b| {
+        a.push(&out, b)
+    }
+    a.append_str(&out, z[2..@as(i64, n) - 4])
+    push_le32(a, &out, crc32(0, @strPtr(data), @as(u32, @len(data))))
+    push_le32(a, &out, @as(u64, @len(data)) & 0xFFFFFFFF)
+    return out
+}

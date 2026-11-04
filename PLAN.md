@@ -64,7 +64,10 @@ and Rack-escaped on the wire.
 - `POST /rooms/:id/messages`: the same turbo-stream (but for times and
   ids), body, search entry and unread marks as Rust; forgery checked by
   Origin and Sec-Fetch-Site as Rust does (422 page)
-- next: gzip, a Docker image, then the benchmark
+- gzip (zlib, level 6, bodies of 1 KB or more but not compressed images),
+  as the Rust app's Rack::Deflater rules; the Rust app splices fragments it
+  compressed before, so its room page is 24 KB gzipped against Egg's 21 KB
+- next: a Docker image, then the benchmark
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
 checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
