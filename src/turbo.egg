@@ -1,0 +1,38 @@
+// turbo_stream_from's signed stream names (once-campfire-rust's
+// rails_compat/turbo.rs): the streamables joined with ":", a record as its
+// GlobalID param, signed by a MessageVerifier: strict Base64 of the name as a
+// JSON string, then "--" and the hex HMAC-SHA256 of that Base64, under the
+// key derived with the salt "turbo/signed_stream_verifier_key".
+uses alloc
+
+const codec = @import("codec.egg")
+const crypto = @import("crypto.egg")
+
+const SALT = "turbo/signed_stream_verifier_key"
+
+fn key(a: Allocator, secret_key_base: []u8) Buf(u8) {
+    return crypto.derive_key(a, secret_key_base, SALT, 64)
+}
+
+// The signed name of the stream "<the room's GlobalID param>:messages", at
+// the end of out. class is the room's type: "Rooms::Closed" and the rest.
+fn room_messages(a: Allocator, inout out: Buf(u8), k: []u8, class: []u8, room: i64) void {
+    var gid: Buf(u8) = .empty
+    defer a.free(gid)
+    a.append_str(&gid, "gid://campfire/")
+    a.append_str(&gid, class)
+    a.append_str(&gid, "/")
+    a.append_int(&gid, room)
+    // A GlobalID param and ":messages" hold nothing JSON escapes.
+    var name: Buf(u8) = .empty
+    defer a.free(name)
+    a.append_str(&name, "\"")
+    codec.base64url_encode(a, &name, gid)
+    a.append_str(&name, ":messages\"")
+    const start = @len(out)
+    codec.base64_encode(a, &out, name)
+    const mac = crypto.hmac_sha256(a, k, out[start..])
+    defer a.free(mac)
+    a.append_str(&out, "--")
+    codec.hex_encode(a, &out, mac)
+}

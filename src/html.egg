@@ -1,0 +1,27 @@
+// HTML escaping, as ERB's <%= %> (ERB::Util.html_escape) does it: & < > " '.
+uses alloc
+
+fn escape(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    var start = 0
+    var i = 0
+    while (i < @len(s)) {
+        const c = s[i]
+        if (c == '&' or c == '<' or c == '>' or c == '"' or c == '\'') {
+            a.append_str(&out, s[start..i])
+            if (c == '&') {
+                a.append_str(&out, "&amp;")
+            } else if (c == '<') {
+                a.append_str(&out, "&lt;")
+            } else if (c == '>') {
+                a.append_str(&out, "&gt;")
+            } else if (c == '"') {
+                a.append_str(&out, "&quot;")
+            } else {
+                a.append_str(&out, "&#39;")
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    a.append_str(&out, s[start..])
+}

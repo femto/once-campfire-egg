@@ -1,0 +1,38 @@
+uses alloc
+
+const html = @import("html.egg")
+const tf = @import("timefmt.egg")
+const model = @import("model.egg")
+const static_head = @import("static_head.egg")
+
+// The quick boosts of the message menu: the character, then its title.
+const QUICK_BOOSTS = "👍Thumbs up|👏Clapping|👋Waving hand|💪Muscle|❤️Red heart|😂Face with tears of joy|🎉Party popper|🔥Fire"
+
+// Where the item of QUICK_BOOSTS starting at from ends.
+fn bar_at(s: []u8, from: i64) i64 {
+    var i = from
+    while (i < @len(s) and s[i] != '|') {
+        i = i + 1
+    }
+    return i
+}
+
+// Where an item's title starts: its first capital letter.
+fn first_letter(item: []u8) i64 {
+    var i = 0
+    while (i < @len(item) and !(item[i] >= 'A' and item[i] <= 'Z')) {
+        i = i + 1
+    }
+    return i
+}
+
+// The quick boost forms of a message's menu.
+fn quick_boosts(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
+    var at = 0
+    while (at < @len(QUICK_BOOSTS)) {
+        const bar = bar_at(QUICK_BOOSTS, at)
+        const split = at + first_letter(QUICK_BOOSTS[at..bar])
+        quick_boost(a, &out, m, QUICK_BOOSTS[at..split], QUICK_BOOSTS[split..bar])
+        at = bar + 1
+    }
+}

@@ -6,8 +6,11 @@ CC ?= cc
 OPENSSL ?= $(shell test -d /usr/local/opt/openssl@3 && echo /usr/local/opt/openssl@3 || (test -d /opt/homebrew/opt/openssl@3 && echo /opt/homebrew/opt/openssl@3))
 LIBDIRS = -L build $(if $(OPENSSL),-L $(OPENSSL)/lib)
 
-build/campfire: build/libcfbcrypt.a $(wildcard src/*.egg src/*/*.egg)
+build/campfire: build/libcfbcrypt.a src/views.egg $(wildcard src/*.egg src/*/*.egg)
 	$(EGGC) build src/main.egg -o build/campfire $(LIBDIRS)
+
+src/views.egg: script/templates.rb $(wildcard templates/*)
+	ruby script/templates.rb > $@
 
 build/libcfbcrypt.a: vendor/crypt_blowfish/crypt_blowfish.c vendor/crypt_blowfish/bcrypt.c
 	mkdir -p build
@@ -15,7 +18,7 @@ build/libcfbcrypt.a: vendor/crypt_blowfish/crypt_blowfish.c vendor/crypt_blowfis
 	$(CC) -O2 -c vendor/crypt_blowfish/bcrypt.c -o build/bcrypt.o
 	ar rcs $@ build/crypt_blowfish.o build/bcrypt.o
 
-check:
+check: src/views.egg
 	$(EGGC) check src/main.egg
 
 clean:

@@ -3,6 +3,7 @@
 uses alloc, rand, time
 
 const sqlite = @import("sqlite.egg")
+const codec = @import("codec.egg")
 const crypto = @import("crypto.egg")
 const cookie = @import("cookie.egg")
 const tf = @import("timefmt.egg")
@@ -85,7 +86,11 @@ fn set_cookie(a: Allocator, inout out: Buf(u8), key: []u8, clock: Clock, token: 
 }
 
 // The user whose session the Cookie header names, or null.
-fn current_user(a: Allocator, db: sqlite.Db, key: []u8, clock: Clock, raw: []u8) !?i64 {
+fn current_user(a: Allocator, db: sqlite.Db, key: []u8, clock: Clock, header: []u8) !?i64 {
+    const raw = codec.cookie_value(a, header, "session_token") orelse {
+        return null
+    }
+    defer a.free(raw)
     const token = cookie.verify(a, key, "session_token", raw, clock.now()) orelse {
         return null
     }

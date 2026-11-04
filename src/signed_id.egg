@@ -1,0 +1,66 @@
+// ActiveRecord::SignedId, as user.signed_id(purpose: :avatar) makes the
+// token in avatar URLs (once-campfire-rust's rails_compat/signed_id.rs):
+// URL-safe Base64 of {"_rails":{"data":ID,"pur":"user/avatar"}}, then "--"
+// and the hex HMAC-SHA256 of that text, under the key derived with the salt
+// "active_record/signed_id".
+uses alloc
+
+const text = @import("std/text")
+const codec = @import("codec.egg")
+const crypto = @import("crypto.egg")
+
+const SALT = "active_record/signed_id"
+const DIGEST_HEX = 64
+
+fn key(a: Allocator, secret_key_base: []u8) Buf(u8) {
+    return crypto.derive_key(a, secret_key_base, SALT, 64)
+}
+
+// The signed id of the record id for purpose ("user/avatar"), at the end of out.
+fn generate(a: Allocator, inout out: Buf(u8), k: []u8, id: i64, purpose: str) void {
+    var payload: Buf(u8) = .empty
+    defer a.free(payload)
+    a.append_str(&payload, "{\"_rails\":{\"data\":")
+    a.append_int(&payload, id)
+    a.append_str(&payload, ",\"pur\":\"")
+    a.append_str(&payload, purpose)
+    a.append_str(&payload, "\"}}")
+    const start = @len(out)
+    codec.base64url_encode(a, &out, payload)
+    const mac = crypto.hmac_sha256(a, k, out[start..])
+    defer a.free(mac)
+    a.append_str(&out, "--")
+    codec.hex_encode(a, &out, mac)
+}
+
+// The id a signed id for purpose names, or null if it is forged or for
+// another purpose.
+fn verify(a: Allocator, k: []u8, token: []u8, purpose: str) ?i64 {
+    if (@len(token) < DIGEST_HEX + 3) {
+        return null
+    }
+    const cut = @len(token) - DIGEST_HEX - 2
+    if (token[cut..cut + 2] != "--") {
+        return null
+    }
+    const mac = crypto.hmac_sha256(a, k, token[0..cut])
+    defer a.free(mac)
+    var want: Buf(u8) = .empty
+    defer a.free(want)
+    codec.hex_encode(a, &want, mac)
+    if (!codec.same_secret(want, token[cut + 2..])) {
+        return null
+    }
+    var payload: Buf(u8) = .empty
+    defer a.free(payload)
+    if (!codec.base64_decode(a, &payload, token[0..cut])) {
+        return null
+    }
+    const head = "{\"_rails\":{\"data\":"
+    const tail = a.concat(",\"pur\":\"", purpose, "\"}}")
+    defer a.free(tail)
+    if (!text.starts_with(payload, head) or !text.ends_with(payload, tail) or @len(payload) <= @len(head) + @len(tail)) {
+        return null
+    }
+    return text.parse_int(payload[@len(head)..@len(payload) - @len(tail)])
+}

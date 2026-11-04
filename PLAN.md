@@ -50,7 +50,26 @@ and Rack-escaped on the wire.
 - sign-in: `GET /session/new`, `POST /session` (bcrypt, a sessions row with a
   base58 token, a Rails-signed `session_token` cookie that Ruby's OpenSSL
   verifies, 302); `session.current_user` reads the cookie back
-- next: the room page
+- `GET /rooms/:id` and `GET /rooms/:id/messages?before=`: byte for byte
+  what once-campfire-rust serves on the seed (script/compare.sh), from
+  templates/ compiled to src/views.egg by script/templates.rb
+- next: sidebar, search, avatar, CSS, `POST /rooms/:id/messages`, gzip
+
+The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
+checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
+Rust's JS files expect. So the assets to serve are Rust's, not the Rails
+image's (script/assets.sh still copies Rails').
+
+Not yet like Rust on the room page (none of it is in the benchmark's rooms):
+direct rooms' names and "Ping with", the invitation in the first room while
+it has under a page of messages, notification help for a User-Agent (the
+page has the text for none), attachments and rich text rendering (bodies go
+out as stored, which matches every message in the benchmark room), the
+`last_room` cookie. `all_emoji` approximates the Unicode properties with
+code point ranges.
+
+Rust caches whole responses and message fragments (response_cache,
+fragment_cache); the Egg app renders every request.
 
 ## Later
 

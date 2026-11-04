@@ -1,0 +1,8 @@
+<%fn quick_boost(a: Allocator, inout out: Buf(u8), m: model.MessageView, ch: []u8, name: []u8) %>
+
+          <form data-turbo-frame="boosting_message_<%= m.client_id %>" data-action="popup#close" action="/messages/<%d m.id %>/boosts" accept-charset="UTF-8" method="post">
+            <input type="hidden" name="boost[content]" id="boost_content" value="<%- ch %>" />
+            <button name="button" type="submit" title="<%- name %>" class="btn message__action-btn" data-emoji="<%- ch %>">
+              <figure class="margin-none boost-character"><%- ch %></figure>
+              <span class="for-screen-reader"><%- name %></span>
+</button></form>

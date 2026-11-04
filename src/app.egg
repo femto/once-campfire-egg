@@ -6,24 +6,45 @@ const sqlite = @import("sqlite.egg")
 const codec = @import("codec.egg")
 const cookie = @import("cookie.egg")
 const session = @import("session.egg")
+const model = @import("model.egg")
+const views = @import("views.egg")
+const signed_id = @import("signed_id.egg")
+const turbo = @import("turbo.egg")
+const tf = @import("timefmt.egg")
+const text = @import("std/text")
 
 const Context = owned struct {
     db: sqlite.Db
-    // The signed-cookie key, derived from SECRET_KEY_BASE once.
+    // Keys derived from SECRET_KEY_BASE once: signed cookies, signed ids
+    // (avatar URLs) and signed stream names.
     key: Buf(u8)
+    sid_key: Buf(u8)
+    stream_key: Buf(u8)
+    vapid: Buf(u8)
     clock: Clock
     rng: Random
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
         a.free(self.key)
+        a.free(self.sid_key)
+        a.free(self.stream_key)
+        a.free(self.vapid)
         @forget(self)
     }
 }
 
-fn open(a: Allocator, path: str, secret: str, clock: Clock, rng: Random) !Context {
+fn open(a: Allocator, path: str, secret: str, vapid: str, clock: Clock, rng: Random) !Context {
     const db = try sqlite.open(a, path)
-    return Context{ .db = db, .key = cookie.key(a, secret), .clock = clock, .rng = rng }
+    return Context{
+        .db = db,
+        .key = cookie.key(a, secret),
+        .sid_key = signed_id.key(a, secret),
+        .stream_key = turbo.key(a, secret),
+        .vapid = a.concat(vapid, ""),
+        .clock = clock,
+        .rng = rng,
+    }
 }
 
 const HTML = "Content-Type: text/html; charset=utf-8\r\n"
@@ -40,7 +61,80 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
     }
+    if (req.method == "GET" and text.starts_with(req.path, "/rooms/")) {
+        const rest = req.path[@len("/rooms/")..]
+        if (text.parse_int(rest)) |room| {
+            return room_page(c, a, &ctx, req, room)
+        }
+        if (text.ends_with(rest, "/messages")) {
+            if (text.parse_int(rest[0..@len(rest) - @len("/messages")])) |room| {
+                return messages_page(c, a, &ctx, req, room)
+            }
+        }
+    }
+    return not_found(c, a, req)
+}
+
+fn not_found(c: TcpConn, a: Allocator, req: http.Request) !void {
     return http.write_response(c, a, "404 Not Found", HTML, "Not found", req.keep)
+}
+
+fn to_sign_in(c: TcpConn, a: Allocator, req: http.Request) !void {
+    return http.write_response(c, a, "302 Found", "Location: /session/new\r\nContent-Type: text/html; charset=utf-8\r\n", "", req.keep)
+}
+
+// Whether the user is an administrator (role 1), and the account's logo
+// stamp, ?v= of its URL.
+fn administrator(db: sqlite.Db, user: i64) !bool {
+    var st = try db.prepare("SELECT role FROM users WHERE id = ?")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    return try st.next() and st.int(0) == 1
+}
+
+fn logo_stamp(a: Allocator, inout out: Buf(u8), db: sqlite.Db) !void {
+    var st = try db.prepare("SELECT updated_at FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (try st.next()) {
+        const t = st.text(a, 0)
+        defer a.free(t)
+        tf.number_stamp(a, &out, tf.parse_db(t) orelse 0)
+    }
+}
+
+// GET /rooms/:id: the newest page of the room's messages.
+fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const room = try model.room_for(a, ctx.db, user_id, id) orelse {
+        return not_found(c, a, req)
+    }
+    defer room.deinit(a)
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, 0)
+    defer a.free(messages)
+    const admin = try administrator(ctx.db, user_id)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var class: Buf(u8) = .empty
+    defer a.free(class)
+    a.append_str(&class, "Rooms::")
+    a.push(&class, room.kind[0] - 32)
+    a.append_str(&class, room.kind[1..])
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    turbo.room_messages(a, &stream, ctx.stream_key, class, room.id)
+    const base = a.concat("http://", req.host)
+    defer a.free(base)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream)
+    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
@@ -59,4 +153,33 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
     return http.write_response(c, a, "302 Found", headers, "", req.keep)
+}
+
+// GET /rooms/:id/messages?before=:message_id: the page before that message,
+// as bare HTML; 204 when there is none.
+fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const room = try model.room_for(a, ctx.db, user_id, id) orelse {
+        return not_found(c, a, req)
+    }
+    defer room.deinit(a)
+    var before = 0
+    if (codec.form_value(a, req.query, "before")) |b| {
+        defer a.free(b)
+        before = text.parse_int(b) orelse 0
+        if (before <= 0 or !try model.in_room(ctx.db, room.id, before)) {
+            return not_found(c, a, req)
+        }
+    }
+    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, before)
+    defer a.free(messages)
+    if (@len(messages) == 0) {
+        return http.write_response(c, a, "204 No Content", "", "", req.keep)
+    }
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.messages_index(a, &body, messages, room.name)
+    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
 }

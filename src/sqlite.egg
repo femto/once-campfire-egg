@@ -54,6 +54,15 @@ const Db = owned struct {
         return Stmt{ .handle = st }
     }
 
+    // prepare for SQL the program built.
+    fn prepare_text(self: Db, sql: []u8) !Stmt {
+        var st: *u8 = null
+        if (sqlite3_prepare_v3(self.handle, @strPtr(sql), @as(i32, @len(sql)), 0, &st, null) != OK) {
+            return error.Sql
+        }
+        return Stmt{ .handle = st }
+    }
+
     // Run sql that returns no rows (PRAGMA, BEGIN, ...).
     fn exec(self: Db, sql: str) !void {
         var st = try self.prepare(sql)

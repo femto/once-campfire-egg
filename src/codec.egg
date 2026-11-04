@@ -31,6 +31,26 @@ fn base64_encode(a: Allocator, inout out: Buf(u8), s: []u8) void {
     }
 }
 
+// URL-safe Base64 without padding, at the end of out.
+fn base64url_encode(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    const start = @len(out)
+    base64_encode(a, &out, s)
+    var n = @len(out)
+    while (n > start and out[n - 1] == '=') {
+        n = n - 1
+    }
+    a.resize(&out, n, 0)
+    var i = start
+    while (i < n) {
+        if (out[i] == '+') {
+            out[i] = '-'
+        } else if (out[i] == '/') {
+            out[i] = '_'
+        }
+        i = i + 1
+    }
+}
+
 // The value of one Base64 character, either alphabet, or -1.
 fn b64_value(c: u8) i64 {
     if (c >= 'A' and c <= 'Z') {

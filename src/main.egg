@@ -28,9 +28,9 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     }
 }
 
-fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, db_path: str, secret: str) void {
+fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, db_path: str, secret: str, vapid: str) void {
     defer jobs.close()
-    var ctx = app.open(a, db_path, secret, clock, rng) catch |e| {
+    var ctx = app.open(a, db_path, secret, vapid, clock, rng) catch |e| {
         io.eprint("cannot open ", db_path, ": ", @errorName(e))
         return
     }
@@ -59,6 +59,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         io.eprint("SECRET_KEY_BASE is not set")
         return
     }
+    const vapid = args.env("VAPID_PUBLIC_KEY") orelse ""
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
     io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers")
@@ -70,7 +71,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     defer queue.close()      // first: they finish what is queued, and stop
     var i = 0
     while (i < workers) {
-        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, db_path, secret) })
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, db_path, secret, vapid) })
         i = i + 1
     }
     jobs.close()

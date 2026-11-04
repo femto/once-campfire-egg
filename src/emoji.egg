@@ -1,0 +1,84 @@
+// String#all_emoji? (\A(\p{Emoji_Presentation}|\p{Extended_Pictographic}|U+FE0F)+\z),
+// with the Unicode properties approximated by the ranges that hold them.
+
+fn pictographic(c: i64) bool {
+    if ((c >= 0x1F000 and c <= 0x1FAFF) or (c >= 0x1FC00 and c <= 0x1FFFD)) {
+        return true
+    }
+    if ((c >= 0x2600 and c <= 0x27BF) or (c >= 0x25AA and c <= 0x25FE) or (c >= 0x2300 and c <= 0x23FF)) {
+        return true
+    }
+    if ((c >= 0x2B05 and c <= 0x2B55) or (c >= 0x2194 and c <= 0x2199) or c == 0x21A9 or c == 0x21AA) {
+        return true
+    }
+    return c == 0xFE0F or c == 0xA9 or c == 0xAE or c == 0x203C or c == 0x2049 or c == 0x2122 or c == 0x2139 or c == 0x24C2 or c == 0x2934 or c == 0x2935 or c == 0x3030 or c == 0x303D or c == 0x3297 or c == 0x3299
+}
+
+// Whether s is one or more emoji and nothing else.
+fn all_emoji(s: []u8) bool {
+    if (@len(s) == 0) {
+        return false
+    }
+    var i = 0
+    while (i < @len(s)) {
+        const b = @as(i64, s[i])
+        var c = 0
+        var n = 0
+        if (b < 0x80) {
+            return false
+        } else if (b >= 0xF0) {
+            c = b & 0x07
+            n = 3
+        } else if (b >= 0xE0) {
+            c = b & 0x0F
+            n = 2
+        } else {
+            c = b & 0x1F
+            n = 1
+        }
+        if (i + n >= @len(s)) {
+            return false
+        }
+        var k = 1
+        while (k <= n) {
+            c = c * 64 + (@as(i64, s[i + k]) & 0x3F)
+            k = k + 1
+        }
+        if (!pictographic(c)) {
+            return false
+        }
+        i = i + n + 1
+    }
+    return true
+}
+
+// The text of a rich text body without its tags and surrounding space: the
+// plain text all_emoji looks at.
+fn all_emoji_html(s: []u8) bool {
+    var start = 0
+    var end = @len(s)
+    // Only bodies that are one element of text can be all emoji: <p>…</p>,
+    // <div>…</div>, or bare text.
+    while (start < end and (s[start] == ' ' or s[start] == '\n')) {
+        start = start + 1
+    }
+    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\n')) {
+        end = end - 1
+    }
+    if (end - start > 2 and s[start] == '<') {
+        var gt = start
+        while (gt < end and s[gt] != '>') {
+            gt = gt + 1
+        }
+        var lt = end - 1
+        while (lt > gt and s[lt] != '<') {
+            lt = lt - 1
+        }
+        if (gt >= end or lt <= gt) {
+            return false
+        }
+        start = gt + 1
+        end = lt
+    }
+    return all_emoji(s[start..end])
+}

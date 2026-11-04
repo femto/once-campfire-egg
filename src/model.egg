@@ -1,0 +1,210 @@
+// What the pages show, read from SQLite: rooms, a page of messages with
+// their creators, bodies and boosts. Times stay as nanoseconds; text is
+// copied out of SQLite as it is.
+uses alloc
+
+const text = @import("std/text")
+const sqlite = @import("sqlite.egg")
+const tf = @import("timefmt.egg")
+const signed_id = @import("signed_id.egg")
+const emoji = @import("emoji.egg")
+
+const PAGE_SIZE = 40
+
+const UserView = owned struct {
+    id: i64
+    name: Buf(u8)
+    // "Name – bio", or the name: the avatar's and author's title.
+    title: Buf(u8)
+    // /users/<signed id>/avatar?v=<updated_at>
+    avatar: Buf(u8)
+
+    fn deinit(sink self: UserView, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.title)
+        a.free(self.avatar)
+        @forget(self)
+    }
+}
+
+const BoostView = owned struct {
+    id: i64
+    content: Buf(u8)
+    all_emoji: bool
+    booster: UserView
+
+    fn deinit(sink self: BoostView, a: Allocator) void {
+        a.free(self.content)
+        self.booster.deinit(a)
+        @forget(self)
+    }
+}
+
+const MessageView = owned struct {
+    id: i64
+    client_id: Buf(u8)
+    room_id: i64
+    created_ns: i64
+    updated_ns: i64
+    creator: UserView
+    body: Buf(u8)
+    all_emoji: bool
+    boosts: Buf(BoostView)
+
+    fn deinit(sink self: MessageView, a: Allocator) void {
+        a.free(self.client_id)
+        self.creator.deinit(a)
+        a.free(self.body)
+        a.free(self.boosts)
+        @forget(self)
+    }
+}
+
+const RoomView = owned struct {
+    id: i64
+    name: Buf(u8)
+    // "closed", "open" or "direct", from Rooms::Closed and the rest.
+    kind: Buf(u8)
+    updated_ns: i64
+
+    fn deinit(sink self: RoomView, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.kind)
+        @forget(self)
+    }
+}
+
+// A user, from columns i (id), i+1 (name), i+2 (bio), i+3 (updated_at) of st.
+fn user_from(a: Allocator, st: sqlite.Stmt, i: i32, sid_key: []u8) UserView {
+    const id = st.int(i)
+    const name = st.text(a, i + 1)
+    var title: Buf(u8) = .empty
+    a.append_str(&title, name)
+    if (!st.is_null(i + 2)) {
+        const bio = st.text(a, i + 2)
+        defer a.free(bio)
+        if (@len(bio) > 0) {
+            a.append_str(&title, " – ")
+            a.append_str(&title, bio)
+        }
+    }
+    var avatar: Buf(u8) = .empty
+    a.append_str(&avatar, "/users/")
+    signed_id.generate(a, &avatar, sid_key, id, "user/avatar")
+    a.append_str(&avatar, "/avatar?v=")
+    const updated = st.text(a, i + 3)
+    defer a.free(updated)
+    tf.number_stamp(a, &avatar, tf.parse_db(updated) orelse 0)
+    return UserView{ .id = id, .name = name, .title = title, .avatar = avatar }
+}
+
+// The room, if the user is a member of it.
+fn room_for(a: Allocator, db: sqlite.Db, user: i64, room: i64) !?RoomView {
+    var st = try db.prepare("SELECT rooms.id, rooms.name, rooms.type, rooms.updated_at FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    try st.bind_int(2, user)
+    if (!try st.next()) {
+        return null
+    }
+    const kind_text = st.text(a, 2)
+    defer a.free(kind_text)
+    const kind = if (kind_text == "Rooms::Closed") a.concat("closed", "") else if (kind_text == "Rooms::Direct") a.concat("direct", "") else a.concat("open", "")
+    return RoomView{ .id = st.int(0), .name = st.text(a, 1), .kind = kind, .updated_ns = ns_column(a, st, 3) }
+}
+
+fn ns_column(a: Allocator, st: sqlite.Stmt, i: i32) i64 {
+    const t = st.text(a, i)
+    defer a.free(t)
+    return tf.parse_db(t) orelse 0
+}
+
+// The newest PAGE_SIZE messages of the room, or those before the message
+// before (an id, or 0 for none), oldest first.
+fn page(a: Allocator, db: sqlite.Db, sid_key: []u8, room: i64, before: i64) !Buf(MessageView) {
+    const sql = if (before == 0) "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? ORDER BY m.created_at DESC, m.id DESC LIMIT 40" else "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? AND m.created_at < (SELECT created_at FROM messages WHERE id = ?) ORDER BY m.created_at DESC, m.id DESC LIMIT 40"
+    var st = try db.prepare(sql)
+    defer st.finalize()
+    try st.bind_int(1, room)
+    if (before != 0) {
+        try st.bind_int(2, before)
+    }
+    var newest_first: Buf(MessageView) = .empty
+    defer a.free(newest_first)
+    while (try st.next()) {
+        const body = st.text(a, 5)
+        const all_emoji = emoji.all_emoji_html(body)
+        a.push(&newest_first, MessageView{
+            .id = st.int(0),
+            .client_id = st.text(a, 1),
+            .room_id = st.int(2),
+            .created_ns = ns_column(a, st, 3),
+            .updated_ns = ns_column(a, st, 4),
+            .body = body,
+            .all_emoji = all_emoji,
+            .creator = user_from(a, st, 6, sid_key),
+            .boosts = .empty,
+        })
+    }
+    var out: Buf(MessageView) = .empty
+    errdefer a.free(out)
+    while (a.pop(&newest_first)) |m| {
+        a.push(&out, m)
+    }
+    try add_boosts(a, db, sid_key, &out)
+    return out
+}
+
+// Each message's boosts, oldest first, in one query.
+fn add_boosts(a: Allocator, db: sqlite.Db, sid_key: []u8, inout messages: Buf(MessageView)) !void {
+    if (@len(messages) == 0) {
+        return
+    }
+    var sql: Buf(u8) = .empty
+    defer a.free(sql)
+    a.append_str(&sql, "SELECT b.message_id, b.id, b.content, u.id, u.name, u.bio, u.updated_at FROM boosts b JOIN users u ON u.id = b.booster_id WHERE b.message_id IN (")
+    var i = 0
+    while (i < @len(messages)) {
+        if (i > 0) {
+            a.append_str(&sql, ",")
+        }
+        a.append_int(&sql, messages[i].id)
+        i = i + 1
+    }
+    a.append_str(&sql, ") ORDER BY b.created_at, b.id")
+    var st = try db.prepare_text(sql)
+    defer st.finalize()
+    while (try st.next()) {
+        const message = st.int(0)
+        var k = 0
+        while (k < @len(messages)) {
+            if (messages[k].id == message) {
+                const content = st.text(a, 2)
+                const all_emoji = emoji.all_emoji(content)
+                a.push(&messages[k].boosts, BoostView{ .id = st.int(1), .content = content, .all_emoji = all_emoji, .booster = user_from(a, st, 3, sid_key) })
+                k = @len(messages)
+            }
+            k = k + 1
+        }
+    }
+}
+
+// The user, for the page's own meta tags and message template.
+fn find_user(a: Allocator, db: sqlite.Db, sid_key: []u8, id: i64) !?UserView {
+    var st = try db.prepare("SELECT id, name, bio, updated_at FROM users WHERE id = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, id)
+    if (!try st.next()) {
+        return null
+    }
+    return user_from(a, st, 0, sid_key)
+}
+
+// Whether the message is in the room.
+fn in_room(db: sqlite.Db, room: i64, message: i64) !bool {
+    var st = try db.prepare("SELECT 1 FROM messages WHERE id = ? AND room_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, message)
+    try st.bind_int(2, room)
+    return try st.next()
+}
