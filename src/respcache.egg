@@ -1,0 +1,117 @@
+// Whole responses kept per worker, as once-campfire-rust's response_cache
+// keeps them for the process: the room page, a page of messages, the
+// sidebar and search, exactly as sent (gzipped or not), after the request
+// signed in and passed the room's access check.
+//
+// Any commit, by any connection, starts a new generation: a read-only
+// connection of the worker's own watches PRAGMA data_version, which moves
+// when another connection (this worker's writer included) commits. A
+// request takes the generation before it signs in; a lookup or a store for
+// an older one misses or is dropped, so nothing rendered from data older
+// than a commit is kept past it. Entries also expire after 15 s, for what
+// shows the time.
+uses alloc, net
+
+const sqlite = @import("sqlite.egg")
+const http = @import("http.egg")
+
+const TTL_NS = 15000000000
+const MAX_BODY = 1048576
+const MAX_ENTRIES = 64
+
+const Entry = owned struct {
+    key: Buf(u8)
+    // The body's own headers (Content-Type, Content-Encoding, Vary).
+    headers: Buf(u8)
+    body: Buf(u8)
+    expires_ns: i64
+
+    fn deinit(sink self: Entry, a: Allocator) void {
+        a.free(self.key)
+        a.free(self.headers)
+        a.free(self.body)
+        @forget(self)
+    }
+}
+
+const Cache = owned struct {
+    on: bool
+    observer: sqlite.Db
+    version: i64
+    generation: i64
+    entries: Buf(Entry)
+
+    fn close(sink self: Cache, a: Allocator) void {
+        self.observer.close()
+        a.free(self.entries)
+        @forget(self)
+    }
+
+    // The current generation; a new one, with no entries, after a commit.
+    fn generation_now(inout self: Cache, a: Allocator) !i64 {
+        if (!self.on) {
+            return 0
+        }
+        var st = try self.observer.prepare("PRAGMA data_version")
+        defer st.finalize()
+        if (try st.next()) {
+            const v = st.int(0)
+            if (v != self.version) {
+                self.version = v
+                self.generation = self.generation + 1
+                a.free(@replace(&self.entries, .empty))
+            }
+        }
+        return self.generation
+    }
+
+    // Where the entry for key is, if it is of generation gen and fresh; -1
+    // if not.
+    fn find(inout self: Cache, a: Allocator, gen: i64, key: []u8, now_ns: i64) !i64 {
+        if (!self.on or try self.generation_now(a) != gen) {
+            return -1
+        }
+        var i = 0
+        while (i < @len(self.entries)) {
+            if (self.entries[i].key == key) {
+                if (self.entries[i].expires_ns > now_ns) {
+                    return i
+                }
+                return -1
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // Send entry i, after the request's own headers (own).
+    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, own: []u8, keep: bool) !void {
+        return http.write_parts(c, a, "200 OK", own, self.entries[i].headers, self.entries[i].body, keep)
+    }
+
+    // Keep the response for key, if nothing has committed since gen.
+    fn put(inout self: Cache, a: Allocator, gen: i64, key: []u8, headers: []u8, body: []u8, now_ns: i64) !void {
+        if (!self.on or @len(body) > MAX_BODY or try self.generation_now(a) != gen) {
+            return
+        }
+        // In place of the same key's expired entry, or of the first when full.
+        var i = 0
+        while (i < @len(self.entries) and self.entries[i].key != key) {
+            i = i + 1
+        }
+        if (i == @len(self.entries) and @len(self.entries) >= MAX_ENTRIES) {
+            i = 0
+        }
+        if (i < @len(self.entries)) {
+            @swap(&self.entries, i, @len(self.entries) - 1)
+            if (a.pop(&self.entries)) |old| {
+                old.deinit(a)
+            }
+        }
+        a.push(&self.entries, Entry{ .key = a.concat(key, ""), .headers = a.concat(headers, ""), .body = a.concat(body, ""), .expires_ns = now_ns + TTL_NS })
+    }
+}
+
+fn open(a: Allocator, path: []u8, on: bool) !Cache {
+    return Cache{ .on = on, .observer = try sqlite.open_readonly(a, path), .version = -1, .generation = 0, .entries = .empty }
+}

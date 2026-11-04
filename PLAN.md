@@ -134,6 +134,22 @@ The laptop is noisy (runs differ by up to 40%). With gzip the Rust app
 sends fragments it compressed earlier, which is caching; Egg deflates the
 whole page each time, and that is now most of its cost on the big pages.
 
+With CAMPFIRE_CACHE=1 (src/respcache.egg: whole responses per worker,
+invalidated on any commit through PRAGMA data_version on a read-only
+connection, taken before signing in, 15 s TTL, as the Rust app's
+response_cache but not shared between workers):
+
+| route | Rust req/s | Egg cached req/s | Rust p50 ms | Egg p50 ms |
+| --- | ---: | ---: | ---: | ---: |
+| room page | 11154 | 24026 | 1.12 | 0.44 |
+| messages?before= | 9460 | 25677 | 1.22 | 0.42 |
+| sidebar | 11274 | 26406 | 1.10 | 0.40 |
+| search | 10183 | 26275 | 1.16 | 0.41 |
+
+Not yet cached: message fragments and their precompressed pieces (the
+Rust app's fragment_cache and splice deflater), which matter only once
+writes empty the response cache (the mixed profile).
+
 ## Later
 
 Action Cable (WebSocket), the rest of the app, attachments and media, Web Push.

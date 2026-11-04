@@ -213,10 +213,19 @@ const Stmt = owned struct {
 // Open the database at path, read-write, waiting up to 5 s on a lock
 // another connection holds.
 fn open(a: Allocator, path: []u8) !Db {
+    return open_with(a, path, OPEN_FLAGS)
+}
+
+// The same, read-only (SQLITE_OPEN_READONLY).
+fn open_readonly(a: Allocator, path: []u8) !Db {
+    return open_with(a, path, 0x1 | 0x8000)
+}
+
+fn open_with(a: Allocator, path: []u8, flags: i32) !Db {
     const name = a.concat(path, "\0")
     defer a.free(name)
     var h: *u8 = null
-    const rc = sqlite3_open_v2(@strPtr(name), &h, OPEN_FLAGS, null)
+    const rc = sqlite3_open_v2(@strPtr(name), &h, flags, null)
     if (rc != OK) {
         _ = sqlite3_close_v2(h)
         return error.Open

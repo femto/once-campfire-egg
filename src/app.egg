@@ -13,6 +13,7 @@ const turbo = @import("turbo.egg")
 const tf = @import("timefmt.egg")
 const text = @import("std/text")
 const public_pages = @import("public_pages.egg")
+const respcache = @import("respcache.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -22,6 +23,8 @@ const Config = struct {
     // Active Storage's root, and the precompiled assets.
     files: str
     assets: str
+    // Keep whole responses (CAMPFIRE_CACHE=1).
+    cache: bool
 }
 
 const Context = owned struct {
@@ -37,9 +40,11 @@ const Context = owned struct {
     fs: Fs
     files: str
     assets: str
+    cache: respcache.Cache
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
+        self.cache.close(a)
         a.free(self.key)
         a.free(self.sid_key)
         a.free(self.stream_key)
@@ -50,6 +55,10 @@ const Context = owned struct {
 
 fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs) !Context {
     const db = try sqlite.open(a, cfg.db_path)
+    const cache = respcache.open(a, cfg.db_path, cfg.cache) catch |e| {
+        db.close()
+        return e
+    }
     const secret = cfg.secret
     return Context{
         .db = db,
@@ -62,6 +71,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs) !Contex
         .fs = files,
         .files = cfg.files,
         .assets = cfg.assets,
+        .cache = cache,
     }
 }
 
@@ -157,8 +167,48 @@ fn logo_stamp(a: Allocator, inout out: Buf(u8), db: sqlite.Db) !void {
     }
 }
 
+// The cache's key for this response: the route, the user, and all the
+// request carries that a page can depend on (target, host, encoding and
+// cookies, the session's among them).
+fn cache_key(a: Allocator, route: str, user: i64, req: http.Request) Buf(u8) {
+    var k: Buf(u8) = .empty
+    a.append_str(&k, route)
+    a.append_str(&k, "\n")
+    a.append_int(&k, user)
+    a.append_str(&k, "\n")
+    a.append_str(&k, req.path)
+    a.append_str(&k, "?")
+    a.append_str(&k, req.query)
+    a.append_str(&k, "\n")
+    a.append_str(&k, req.host)
+    a.append_str(&k, if (req.gzip) "\ngzip\n" else "\nidentity\n")
+    a.append_str(&k, req.cookie)
+    return k
+}
+
+// Send a cached response for key if there is one of generation gen; own
+// are this request's own headers. Whether it did.
+fn cached(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: i64, key: []u8, own: []u8) !bool {
+    const i = try ctx.cache.find(a, gen, key, ctx.clock.now())
+    if (i < 0) {
+        return false
+    }
+    try ctx.cache.send(c, a, i, own, req.keep)
+    return true
+}
+
+// Send a page as HTML (gzipped if asked), and keep it for key.
+fn page_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: i64, key: []u8, own: []u8, body: []u8) !void {
+    const e = http.encode(a, req, HTML, body)
+    defer e.deinit(a)
+    try http.write_parts(c, a, "200 OK", own, e.headers, e.body, req.keep)
+    try ctx.cache.put(a, gen, key, e.headers, e.body, ctx.clock.now())
+}
+
 // GET /rooms/:id: the newest page of the room's messages.
 fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    // Before signing in: see respcache.
+    const gen = try ctx.cache.generation_now(a)
     const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
         return to_sign_in(c, a, req)
     }
@@ -166,6 +216,30 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
         return to_root(c, a, req)
     }
     defer room.deinit(a)
+    // cookies.permanent[:last_room], when it changes: the request's own,
+    // never cached.
+    var own: Buf(u8) = .empty
+    defer a.free(own)
+    var id_text: Buf(u8) = .empty
+    defer a.free(id_text)
+    a.append_int(&id_text, room.id)
+    var same = false
+    if (codec.cookie_value(a, req.cookie, "last_room")) |v| {
+        same = v == id_text
+        a.free(v)
+    }
+    if (!same) {
+        a.append_str(&own, "Set-Cookie: last_room=")
+        a.append_str(&own, id_text)
+        a.append_str(&own, "; path=/; expires=")
+        tf.http_date(a, &own, tf.add_years(ctx.clock.now(), 20))
+        a.append_str(&own, "; samesite=lax\r\n")
+    }
+    const key = cache_key(a, "rooms#show", user_id, req)
+    defer a.free(key)
+    if (try cached(c, a, &ctx, req, gen, key, own)) {
+        return
+    }
     const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
         return to_sign_in(c, a, req)
     }
@@ -192,26 +266,7 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream)
-    // cookies.permanent[:last_room], when it changes.
-    var headers: Buf(u8) = .empty
-    defer a.free(headers)
-    var id_text: Buf(u8) = .empty
-    defer a.free(id_text)
-    a.append_int(&id_text, room.id)
-    var same = false
-    if (codec.cookie_value(a, req.cookie, "last_room")) |v| {
-        same = v == id_text
-        a.free(v)
-    }
-    if (!same) {
-        a.append_str(&headers, "Set-Cookie: last_room=")
-        a.append_str(&headers, id_text)
-        a.append_str(&headers, "; path=/; expires=")
-        tf.http_date(a, &headers, tf.add_years(ctx.clock.now(), 20))
-        a.append_str(&headers, "; samesite=lax\r\n")
-    }
-    a.append_str(&headers, HTML)
-    return http.respond(c, a, req, "200 OK", headers, body)
+    return page_out(c, a, &ctx, req, gen, key, own, body)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
@@ -235,6 +290,7 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
 // GET /rooms/:id/messages?before=:message_id: the page before that message,
 // as bare HTML; 204 when there is none.
 fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const gen = try ctx.cache.generation_now(a)
     const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
         return to_sign_in(c, a, req)
     }
@@ -242,6 +298,11 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
         return not_found(c, a, req)
     }
     defer room.deinit(a)
+    const key = cache_key(a, "messages#index", user_id, req)
+    defer a.free(key)
+    if (try cached(c, a, &ctx, req, gen, key, "")) {
+        return
+    }
     var before = 0
     if (codec.form_value(a, req.query, "before")) |b| {
         defer a.free(b)
@@ -261,13 +322,19 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.messages_index(a, &body, messages)
-    return http.respond(c, a, req, "200 OK", HTML, body)
+    return page_out(c, a, &ctx, req, gen, key, "", body)
 }
 
 // GET /users/me/sidebar: the room list, as a whole page.
 fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const gen = try ctx.cache.generation_now(a)
     const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
         return to_sign_in(c, a, req)
+    }
+    const key = cache_key(a, "users/sidebars#show", user_id, req)
+    defer a.free(key)
+    if (try cached(c, a, &ctx, req, gen, key, "")) {
+        return
     }
     const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
         return to_sign_in(c, a, req)
@@ -289,7 +356,7 @@ fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
-    return http.respond(c, a, req, "200 OK", HTML, body)
+    return page_out(c, a, &ctx, req, gen, key, "", body)
 }
 
 // Whether the code point is in [[:word:]] (letter, mark, decimal digit or
@@ -353,8 +420,14 @@ fn sanitize_query(a: Allocator, q: []u8) Buf(u8) {
 
 // GET /searches?q=: the user's messages matching q, and recent searches.
 fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const gen = try ctx.cache.generation_now(a)
     const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
         return to_sign_in(c, a, req)
+    }
+    const key = cache_key(a, "searches#index", user_id, req)
+    defer a.free(key)
+    if (try cached(c, a, &ctx, req, gen, key, "")) {
+        return
     }
     const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
         return to_sign_in(c, a, req)
@@ -394,7 +467,7 @@ fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) 
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin)
-    return http.respond(c, a, req, "200 OK", HTML, body)
+    return page_out(c, a, &ctx, req, gen, key, "", body)
 }
 
 // The Content-Type header of a file, by its extension.

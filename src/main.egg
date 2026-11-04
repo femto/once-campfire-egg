@@ -69,10 +69,11 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .vapid = args.env("VAPID_PUBLIC_KEY") orelse "",
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
+        .cache = (args.env("CAMPFIRE_CACHE") orelse "0") == "1",
     }
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
-    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers")
+    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (cfg.cache) ", caching responses" else "")
 
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()

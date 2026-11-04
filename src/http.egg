@@ -199,11 +199,18 @@ fn read_request(c: TcpConn, a: Allocator, served: i64) !?Request {
 
 // A response: the status line, headers (each ending in \r\n), and the body.
 fn write_response(c: TcpConn, a: Allocator, status: str, headers: []u8, body: []u8, keep: bool) !void {
+    return write_parts(c, a, status, "", headers, body, keep)
+}
+
+// A response whose headers come in two parts: those of this request
+// (Set-Cookie) and those of its body, which a cache keeps with it.
+fn write_parts(c: TcpConn, a: Allocator, status: str, own: []u8, headers: []u8, body: []u8, keep: bool) !void {
     var head: Buf(u8) = .empty
     defer a.free(head)
     a.append_str(&head, "HTTP/1.1 ")
     a.append_str(&head, status)
     a.append_str(&head, "\r\n")
+    a.append_str(&head, own)
     a.append_str(&head, headers)
     a.append_str(&head, "Content-Length: ")
     a.append_int(&head, @len(body))
@@ -224,16 +231,31 @@ fn compressible(headers: []u8) bool {
     return true
 }
 
-// The response, gzipped when the request accepts it and the body is at
-// least 1 KB of a compressible type.
-fn respond(c: TcpConn, a: Allocator, req: Request, status: str, headers: []u8, body: []u8) !void {
+// A body as it goes out, with the headers that describe it.
+const Encoded = owned struct {
+    headers: Buf(u8)
+    body: Buf(u8)
+
+    fn deinit(sink self: Encoded, a: Allocator) void {
+        a.free(self.headers)
+        a.free(self.body)
+        @forget(self)
+    }
+}
+
+// The body, gzipped when the request accepts it and it is at least 1 KB of
+// a compressible type.
+fn encode(a: Allocator, req: Request, headers: []u8, body: []u8) Encoded {
     if (req.gzip and @len(body) >= 1024 and compressible(headers)) {
         if (gz.compress(a, body)) |z| {
-            defer a.free(z)
-            const more = a.concat(headers, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
-            defer a.free(more)
-            return write_response(c, a, status, more, z, req.keep)
+            return Encoded{ .headers = a.concat(headers, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"), .body = z }
         }
     }
-    return write_response(c, a, status, headers, body, req.keep)
+    return Encoded{ .headers = a.concat(headers, ""), .body = a.concat(body, "") }
+}
+
+fn respond(c: TcpConn, a: Allocator, req: Request, status: str, headers: []u8, body: []u8) !void {
+    const e = encode(a, req, headers, body)
+    defer e.deinit(a)
+    return write_response(c, a, status, e.headers, e.body, req.keep)
 }
