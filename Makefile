@@ -4,7 +4,8 @@ EGGC ?= ruby -I$(EGG_DIR)/lib $(EGG_DIR)/bin/eggc
 CC ?= cc
 # OpenSSL's libcrypto: Homebrew's on macOS, the system's elsewhere.
 OPENSSL ?= $(shell test -d /usr/local/opt/openssl@3 && echo /usr/local/opt/openssl@3 || (test -d /opt/homebrew/opt/openssl@3 && echo /opt/homebrew/opt/openssl@3))
-LIBDIRS = -L build $(if $(OPENSSL),-L $(OPENSSL)/lib)
+# EXTRA_LIBDIRS: another zlib, say (the Docker image links zlib-ng).
+LIBDIRS = -L build $(EXTRA_LIBDIRS) $(if $(OPENSSL),-L $(OPENSSL)/lib)
 
 build/campfire: build/libcfbcrypt.a src/views.egg $(wildcard src/*.egg src/*/*.egg)
 	$(EGGC) build src/main.egg -o build/campfire $(LIBDIRS)

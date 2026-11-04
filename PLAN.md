@@ -119,6 +119,21 @@ same either way (11995 against 2417), so its gap is per request: every
 query is prepared afresh (no statement cache yet) and the Rust app's
 answer comes from its cache.
 
+After keeping prepared statements and linking zlib-ng (as fast as the
+Rust app's zlib-rs), same setup:
+
+| route | Rust req/s | Egg req/s | Egg, no gzip | Rust, no gzip |
+| --- | ---: | ---: | ---: | ---: |
+| room page | 10400 | 1387 | 2575 | 3231 |
+| messages?before= | 5926 | 1953 | 2434 | 3383 |
+| sidebar | 11206 | 7654 | 11679 | 8979 |
+| search | 9707 | 4234 | | |
+| avatar | 20177 | 9738 | | |
+
+The laptop is noisy (runs differ by up to 40%). With gzip the Rust app
+sends fragments it compressed earlier, which is caching; Egg deflates the
+whole page each time, and that is now most of its cost on the big pages.
+
 ## Later
 
 Action Cable (WebSocket), the rest of the app, attachments and media, Web Push.
