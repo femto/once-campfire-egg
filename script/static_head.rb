@@ -2,6 +2,8 @@
 # assets decide (stylesheet links, the import map, module preloads), taken
 # from a page the reference Rails app served. Usage:
 #   ruby script/static_head.rb PAGE.html > src/static_head.egg
+# Templates and pages are UTF-8 whatever the locale (Debian's is ASCII).
+Encoding.default_external = Encoding::UTF_8
 html = File.read(ARGV[0])
 from = html.index('<link rel="stylesheet"') or abort "no stylesheet link"
 to = html.index('<script type="module">import "application"</script>') or abort "no import"

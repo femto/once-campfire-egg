@@ -14,6 +14,8 @@
 # A line holding only a <% code %> tag adds no text: neither the tag's
 # indentation nor its line ending. templates/_head.egg goes first: the
 # module's uses line and imports.
+# Templates and pages are UTF-8 whatever the locale (Debian's is ASCII).
+Encoding.default_external = Encoding::UTF_8
 dir = File.expand_path("../templates", __dir__)
 
 def literal(s)

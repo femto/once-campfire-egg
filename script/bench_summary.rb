@@ -1,6 +1,8 @@
 # A Markdown table of a once-campfire-verification benchmark's results:
 # the median req/s of each route over the rounds, per app.
 #   ruby script/bench_summary.rb RESULTS_DIR
+# Templates and pages are UTF-8 whatever the locale (Debian's is ASCII).
+Encoding.default_external = Encoding::UTF_8
 require "json"
 dir = ARGV.fetch(0)
 rows = Dir[File.join(dir, "*-[0-9]*.json")].map { |f| JSON.parse(File.read(f)) }.select { |r| r["http"] }
