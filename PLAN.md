@@ -96,6 +96,29 @@ code point ranges.
 Rust caches whole responses and message fragments (response_cache,
 fragment_cache); the Egg app renders every request.
 
+## Measurements
+
+2026-11-04, rough: both images under Docker (OrbStack) on one macOS laptop,
+no CPU pinning, the verification loadgen on the same machine, 16
+connections for 4 s, gzip, signed in as David. Egg renders every request;
+the Rust app answers most reads from its response cache.
+
+| route | Rust req/s | Egg req/s | Rust p50 ms | Egg p50 ms |
+| --- | ---: | ---: | ---: | ---: |
+| room page | 10042 | 1030 | 1.19 | 11.49 |
+| messages?before= | 10409 | 1826 | 1.18 | 7.01 |
+| sidebar | 11294 | 2427 | 1.11 | 5.70 |
+| search | 10901 | 2001 | 1.10 | 6.73 |
+| avatar | 19015 | 5536 | 0.59 | 2.27 |
+| CSS | 21917 | 25662 | 0.54 | 0.43 |
+| /up | 15640 | 31960 | 0.76 | 0.31 |
+
+Without gzip the room page is 3428 (Rust) against 1879 (Egg): gzip of the
+whole 416 KB page is about half of Egg's time there. The sidebar is the
+same either way (11995 against 2417), so its gap is per request: every
+query is prepared afresh (no statement cache yet) and the Rust app's
+answer comes from its cache.
+
 ## Later
 
 Action Cable (WebSocket), the rest of the app, attachments and media, Web Push.
