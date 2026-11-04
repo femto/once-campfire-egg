@@ -100,6 +100,10 @@ fragment_cache); the Egg app renders every request.
 
 ## Measurements
 
+The benchmark's own results are in docs/benchmark.md. The tables below are
+earlier rough local checks (Docker on macOS through port forwarding), kept
+for the before and after of each change, not for comparing apps.
+
 2026-11-04, rough: both images under Docker (OrbStack) on one macOS laptop,
 no CPU pinning, the verification loadgen on the same machine, 16
 connections for 4 s, gzip, signed in as David. Egg renders every request;
