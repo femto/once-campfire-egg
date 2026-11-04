@@ -1,0 +1,109 @@
+# once-campfire-verification's benchmark (femto's fork, which knows the Egg
+# port) of this app against once-campfire-rust's published image, on one
+# runner: every app runs the same contracts on the same seed, in alternating
+# rounds. A standard runner has 4 CPUs, so the app gets 2 and the load
+# generator 2: the numbers compare the apps with each other, not with the
+# published ones (4 + 4 dedicated cores).
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: Apps, in order (rust, egg, egg-cache)
+        default: rust,egg,egg-cache
+      routes:
+        description: Routes
+        default: room_show,messages_page,sidebar,search,avatar,static_css,up,post_message
+      rounds:
+        description: Rounds (at least 2)
+        default: "2"
+      duration:
+        description: Seconds per sample
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: once-campfire-egg
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: femto/once-campfire-verification
+          ref: egg
+          path: once-campfire-verification
+          persist-credentials: false
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ruby ruby-minitest sqlite3 ffmpeg
+          rustup toolchain install 1.98.1 --profile minimal
+          nproc
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            once-campfire-verification/loadgen/target
+          key: loadgen-${{ hashFiles('once-campfire-verification/loadgen/Cargo.lock') }}
+
+      - name: Build the load generator
+        working-directory: once-campfire-verification
+        run: cargo +1.98.1 build --release --locked --manifest-path loadgen/Cargo.toml
+
+      - name: Pull the Rust app, and check out its source at the same revision
+        run: |
+          docker pull ghcr.io/basecamp/once-campfire-rust:main
+          docker tag ghcr.io/basecamp/once-campfire-rust:main campfire-rust:app
+          revision=$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' campfire-rust:app)
+          echo "Rust image revision: ${revision:-unknown}"
+          git clone --quiet https://github.com/basecamp/once-campfire-rust.git once-campfire-rust
+          if [ -n "$revision" ]; then git -C once-campfire-rust checkout --quiet "$revision"; fi
+
+      - name: Build the seed (the Rails reference image builds it)
+        working-directory: once-campfire-verification
+        run: bin/seed
+
+      - name: Build the Egg image
+        working-directory: once-campfire-egg
+        run: |
+          script/assets.sh build/assets
+          docker build -t once-campfire-egg:app .
+
+      - name: Benchmark
+        working-directory: once-campfire-verification
+        env:
+          APPS: ${{ inputs.apps }}
+          ROUTES: ${{ inputs.routes }}
+          ROUNDS: ${{ inputs.rounds }}
+          DURATION: ${{ inputs.duration }}
+        run: |
+          bin/benchmark --apps "$APPS" --routes "$ROUTES" --rounds "$ROUNDS" --duration "$DURATION" \
+            --cpus 0-1 --client-cpus 2-3 --output "$RUNNER_TEMP/results"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/results" ]; then
+            {
+              echo "## Benchmark on ubuntu-latest (2 app CPUs, 2 load generator CPUs)"
+              echo
+              ruby once-campfire-egg/script/bench_summary.rb "$RUNNER_TEMP/results"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore

@@ -2,7 +2,7 @@
 # once-campfire-verification: /rails as the working directory, the seed
 # mounted at /rails/storage/db and /rails/storage/files, port HTTP_PORT.
 # The assets come from the build context: run script/assets.sh build/assets
-# RUST_URL first.
+# first.
 ARG DEBIAN_RELEASE=trixie
 # egg main with #74-#77 (FFI bytes, args.env, constants, time and rand).
 ARG EGG_REF=f5fba8f
