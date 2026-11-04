@@ -18,7 +18,7 @@ for side in egg rust; do
 done
 room=$(label rooms.watercooler)
 status=0
-for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)" /users/me/sidebar; do
+for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)" "/rooms/$(label rooms.david_and_jason)" "/rooms/$(label rooms.group_direct)" "/rooms/$(label rooms.david_and_kevin)" /users/me/sidebar "/searches?q=coffee" /searches "/searches?q=" "/searches?q=zzzqqq" "/searches?q=coffee%21%20%22pizza%22" "/searches?q=%E2%80%9Ccoffee%E2%80%9D"; do
   curl -s -H 'User-Agent:' -b "$tmp/egg.jar" "$egg$path" | sed "s#$egg#$rust#g" > "$tmp/egg.html"
   curl -s -H 'User-Agent:' -b "$tmp/rust.jar" "$rust$path" > "$tmp/rust.html"
   if cmp -s "$tmp/egg.html" "$tmp/rust.html"; then

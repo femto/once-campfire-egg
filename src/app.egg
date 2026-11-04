@@ -62,6 +62,9 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
     }
+    if (req.method == "GET" and req.path == "/searches") {
+        return search_page(c, a, &ctx, req)
+    }
     if (req.method == "GET" and req.path == "/users/me/sidebar") {
         return sidebar_page(c, a, &ctx, req)
     }
@@ -130,7 +133,10 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
         return to_sign_in(c, a, req)
     }
     defer user.deinit(a)
-    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, 0)
+    // Messages name their room as anyone sees it.
+    const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
+    defer a.free(others)
+    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, 0, others)
     defer a.free(messages)
     const admin = try administrator(ctx.db, user_id)
     var logo: Buf(u8) = .empty
@@ -149,7 +155,26 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream)
-    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+    // cookies.permanent[:last_room], when it changes.
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    var id_text: Buf(u8) = .empty
+    defer a.free(id_text)
+    a.append_int(&id_text, room.id)
+    var same = false
+    if (codec.cookie_value(a, req.cookie, "last_room")) |v| {
+        same = v == id_text
+        a.free(v)
+    }
+    if (!same) {
+        a.append_str(&headers, "Set-Cookie: last_room=")
+        a.append_str(&headers, id_text)
+        a.append_str(&headers, "; path=/; expires=")
+        tf.http_date(a, &headers, tf.add_years(ctx.clock.now(), 20))
+        a.append_str(&headers, "; samesite=lax\r\n")
+    }
+    a.append_str(&headers, HTML)
+    return http.write_response(c, a, "200 OK", headers, body, req.keep)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
@@ -188,14 +213,17 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
             return not_found(c, a, req)
         }
     }
-    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, before)
+    // Messages name their room as anyone sees it.
+    const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
+    defer a.free(others)
+    const messages = try model.page(a, ctx.db, ctx.sid_key, room.id, before, others)
     defer a.free(messages)
     if (@len(messages) == 0) {
         return http.write_response(c, a, "204 No Content", "", "", req.keep)
     }
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.messages_index(a, &body, messages, room.name)
+    views.messages_index(a, &body, messages)
     return http.write_response(c, a, "200 OK", HTML, body, req.keep)
 }
 
@@ -224,5 +252,110 @@ fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
+    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+}
+
+// Whether the code point is in [[:word:]] (letter, mark, decimal digit or
+// connector punctuation), approximately outside ASCII: Latin-1's symbols,
+// general and CJK punctuation, arrows, symbols and emoji are not.
+fn word_char(c: i64) bool {
+    if (c < 0x80) {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+    }
+    if (c < 0xC0) {
+        return c == 0xAA or c == 0xB5 or c == 0xBA
+    }
+    if (c == 0xD7 or c == 0xF7) {
+        return false
+    }
+    if (c >= 0x2000 and c <= 0x2BFF) {
+        return c == 0x203F or c == 0x2040 or c == 0x2054 or (c >= 0x2070 and c <= 0x209F and c != 0x207A and c != 0x207B and c != 0x207C and c != 0x207D and c != 0x207E and c != 0x208A and c != 0x208B and c != 0x208C and c != 0x208D and c != 0x208E) or (c >= 0x20D0 and c <= 0x20FF) or (c >= 0x2100 and c <= 0x214F and (c == 0x2102 or c == 0x2107 or (c >= 0x210A and c <= 0x2113) or c == 0x2115 or (c >= 0x2119 and c <= 0x211D) or c == 0x2124 or c == 0x2126 or c == 0x2128 or (c >= 0x212A and c <= 0x212D) or (c >= 0x212F and c <= 0x2139) or (c >= 0x213C and c <= 0x213F) or (c >= 0x2145 and c <= 0x2149) or c == 0x214E))
+    }
+    if ((c >= 0x3000 and c <= 0x3004) or (c >= 0x3008 and c <= 0x3020) or c == 0x3030 or (c >= 0xFF01 and c <= 0xFF0F) or (c >= 0xFF1A and c <= 0xFF20)) {
+        return false
+    }
+    return !(c >= 0x1F000 and c <= 0x1FAFF)
+}
+
+// params[:q]&.gsub(/[^[:word:]]/, " "): each character outside [[:word:]]
+// becomes one space.
+fn sanitize_query(a: Allocator, q: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    var i = 0
+    while (i < @len(q)) {
+        const b = @as(i64, q[i])
+        var n = 1
+        var c = b
+        if (b >= 0xF0) {
+            n = 4
+            c = b & 0x07
+        } else if (b >= 0xE0) {
+            n = 3
+            c = b & 0x0F
+        } else if (b >= 0xC0) {
+            n = 2
+            c = b & 0x1F
+        }
+        if (i + n > @len(q)) {
+            n = @len(q) - i
+        }
+        var k = 1
+        while (k < n) {
+            c = c * 64 + (@as(i64, q[i + k]) & 0x3F)
+            k = k + 1
+        }
+        if (word_char(c)) {
+            a.append_str(&out, q[i..i + n])
+        } else {
+            a.push(&out, ' ')
+        }
+        i = i + n
+    }
+    return out
+}
+
+// GET /searches?q=: the user's messages matching q, and recent searches.
+fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    var has_q = false
+    var q: Buf(u8) = .empty
+    defer a.free(q)
+    if (codec.form_value(a, req.query, "q")) |v| {
+        has_q = true
+        a.free(@replace(&q, v))
+    }
+    const query = sanitize_query(a, q)
+    defer a.free(query)
+    const blank = text.trim(a, query)
+    defer a.free(blank)
+    const has_query = has_q and @len(blank) > 0
+    var messages: Buf(model.MessageView) = .empty
+    defer a.free(messages)
+    if (has_query) {
+        a.free(@replace(&messages, try model.search(a, ctx.db, ctx.sid_key, user_id, query)))
+    }
+    const recent = try model.recent_searches(a, ctx.db, user_id)
+    defer a.free(recent)
+    var last_room = 0
+    if (codec.cookie_value(a, req.cookie, "last_room")) |v| {
+        last_room = text.parse_int(v) orelse 0
+        a.free(v)
+    }
+    const back = try model.return_room(ctx.db, user_id, last_room)
+    const admin = try administrator(ctx.db, user_id)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    const base = a.concat("http://", req.host)
+    defer a.free(base)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin)
     return http.write_response(c, a, "200 OK", HTML, body, req.keep)
 }

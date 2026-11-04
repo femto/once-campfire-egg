@@ -1,0 +1,10 @@
+<%fn recents(a: Allocator, inout out: Buf(u8), recent: Buf(Buf(u8)), base: []u8) %>
+<% for (recent) |r| { %>
+
+      <a class="align-center gap room btn txt-nowrap" href="/searches?q=<% search_query(a, &out, r) %>">
+        <span class="overflow-ellipsis">“<%= r %>”</span>
+</a><% } %><% if (@len(recent) > 0) { %>
+      <form class="button_to" method="post" action="<%- base %>/searches/clear"><input type="hidden" name="_method" value="delete" /><button class="btn searches__btn" data-turbo-confirm="Are you sure you want to clear your recent searches?" type="submit">
+        <img aria-hidden="true" src="/assets/broom-13d30a95.svg" />
+        <span class="for-screen-reader">Clear recent searches</span>
+</button></form><% } %>

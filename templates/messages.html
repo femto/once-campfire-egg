@@ -1,2 +1,2 @@
-<%fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView), room_name: []u8) %>
-<% for (messages) |m| { %><%- "\n" %><% message(a, &out, m, room_name) %><% } %>
+<%fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView)) %>
+<% for (messages) |m| { %><%- "\n" %><% message(a, &out, m) %><% } %>

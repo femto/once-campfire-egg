@@ -1,5 +1,5 @@
 <%fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8) %>
-<% layout_top(a, &out, room.name, user, vapid, logo_v) %>
+<% layout_top(a, &out, room.display, user, vapid, logo_v) %>
 
 
 
@@ -13,9 +13,10 @@
 
 
   <span class="btn btn--reversed btn--faux room--current">
-    <h1 class="room__contents txt-medium overflow-ellipsis">
+    <h1 class="room__contents txt-medium overflow-ellipsis"><% if (room.kind == "direct") { %>
+        <span class="for-screen-reader">Ping with</span><% } %>
 
-      <%= room.name %>
+      <%= room.display %>
     </h1>
 </span>
 
@@ -135,7 +136,7 @@
   </div>
 </script>
 
-  <div id="messages_rooms_<%- room.kind %>_<%d room.id %>" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="<%d loaded_ms %>" data-refresh-room-url-value="<%- base %>/rooms/<%d room.id %>/refresh"><% for (messages) |m| { %><%- "\n    " %><% message(a, &out, m, room.name) %><% } %>
+  <div id="messages_rooms_<%- room.kind %>_<%d room.id %>" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="<%d loaded_ms %>" data-refresh-room-url-value="<%- base %>/rooms/<%d room.id %>/refresh"><% for (messages) |m| { %><%- "\n    " %><% message(a, &out, m) %><% } %>
   </div>
 
   <turbo-cable-stream-source channel="RoomMessagesChannel" signed-stream-name="<%- stream %>"></turbo-cable-stream-source>

@@ -49,12 +49,15 @@ const MessageView = owned struct {
     creator: UserView
     body: Buf(u8)
     all_emoji: bool
+    // Its room's name, as anyone sees it.
+    room_name: Buf(u8)
     boosts: Buf(BoostView)
 
     fn deinit(sink self: MessageView, a: Allocator) void {
         a.free(self.client_id)
         self.creator.deinit(a)
         a.free(self.body)
+        a.free(self.room_name)
         a.free(self.boosts)
         @forget(self)
     }
@@ -65,10 +68,13 @@ const RoomView = owned struct {
     name: Buf(u8)
     // "closed", "open" or "direct", from Rooms::Closed and the rest.
     kind: Buf(u8)
+    // The name, or for a direct room its other members' names.
+    display: Buf(u8)
     updated_ns: i64
 
     fn deinit(sink self: RoomView, a: Allocator) void {
         a.free(self.name)
+        a.free(self.display)
         a.free(self.kind)
         @forget(self)
     }
@@ -110,7 +116,11 @@ fn room_for(a: Allocator, db: sqlite.Db, user: i64, room: i64) !?RoomView {
     const kind_text = st.text(a, 2)
     defer a.free(kind_text)
     const kind = if (kind_text == "Rooms::Closed") a.concat("closed", "") else if (kind_text == "Rooms::Direct") a.concat("direct", "") else a.concat("open", "")
-    return RoomView{ .id = st.int(0), .name = st.text(a, 1), .kind = kind, .updated_ns = ns_column(a, st, 3) }
+    errdefer a.free(kind)
+    const name = if (st.is_null(1)) a.concat("", "") else st.text(a, 1)
+    errdefer a.free(name)
+    const display = try display_name(a, db, st.int(0), kind == "direct", name, user)
+    return RoomView{ .id = st.int(0), .name = name, .kind = kind, .display = display, .updated_ns = ns_column(a, st, 3) }
 }
 
 fn ns_column(a: Allocator, st: sqlite.Stmt, i: i32) i64 {
@@ -121,14 +131,10 @@ fn ns_column(a: Allocator, st: sqlite.Stmt, i: i32) i64 {
 
 // The newest PAGE_SIZE messages of the room, or those before the message
 // before (an id, or 0 for none), oldest first.
-fn page(a: Allocator, db: sqlite.Db, sid_key: []u8, room: i64, before: i64) !Buf(MessageView) {
-    const sql = if (before == 0) "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? ORDER BY m.created_at DESC, m.id DESC LIMIT 40" else "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? AND m.created_at < (SELECT created_at FROM messages WHERE id = ?) ORDER BY m.created_at DESC, m.id DESC LIMIT 40"
-    var st = try db.prepare(sql)
-    defer st.finalize()
-    try st.bind_int(1, room)
-    if (before != 0) {
-        try st.bind_int(2, before)
-    }
+// The messages st finds (m.id, m.client_message_id, m.room_id, m.created_at,
+// m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at; newest first), oldest first, with
+// their boosts. room_name is each one's room's name, or empty to look them up.
+fn read_messages(a: Allocator, db: sqlite.Db, sid_key: []u8, inout st: sqlite.Stmt, room_name: []u8) !Buf(MessageView) {
     var newest_first: Buf(MessageView) = .empty
     defer a.free(newest_first)
     while (try st.next()) {
@@ -142,6 +148,7 @@ fn page(a: Allocator, db: sqlite.Db, sid_key: []u8, room: i64, before: i64) !Buf
             .updated_ns = ns_column(a, st, 4),
             .body = body,
             .all_emoji = all_emoji,
+            .room_name = a.concat(room_name, ""),
             .creator = user_from(a, st, 6, sid_key),
             .boosts = .empty,
         })
@@ -153,6 +160,118 @@ fn page(a: Allocator, db: sqlite.Db, sid_key: []u8, room: i64, before: i64) !Buf
     }
     try add_boosts(a, db, sid_key, &out)
     return out
+}
+
+// The newest PAGE_SIZE messages of the room, or those before the message
+// before (an id, or 0 for none), oldest first.
+fn page(a: Allocator, db: sqlite.Db, sid_key: []u8, room: i64, before: i64, room_name: []u8) !Buf(MessageView) {
+    const sql = if (before == 0) "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? ORDER BY m.created_at DESC, m.id DESC LIMIT 40" else "SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE m.room_id = ? AND m.created_at < (SELECT created_at FROM messages WHERE id = ?) ORDER BY m.created_at DESC, m.id DESC LIMIT 40"
+    var st = try db.prepare(sql)
+    defer st.finalize()
+    try st.bind_int(1, room)
+    if (before != 0) {
+        try st.bind_int(2, before)
+    }
+    return read_messages(a, db, sid_key, &st, room_name)
+}
+
+// The newest 100 messages in the user's rooms matching the words of query
+// (each an FTS5 string, so none is read as syntax), oldest first.
+fn search(a: Allocator, db: sqlite.Db, sid_key: []u8, user: i64, query: []u8) !Buf(MessageView) {
+    var terms: Buf(u8) = .empty
+    defer a.free(terms)
+    var i = 0
+    while (i < @len(query)) {
+        while (i < @len(query) and text.is_space(query[i])) {
+            i = i + 1
+        }
+        var end = i
+        while (end < @len(query) and !text.is_space(query[end])) {
+            end = end + 1
+        }
+        if (end > i) {
+            if (@len(terms) > 0) {
+                a.push(&terms, ' ')
+            }
+            a.push(&terms, '"')
+            for (query[i..end]) |c| {
+                if (c == '"') {
+                    a.push(&terms, '"')
+                }
+                a.push(&terms, c)
+            }
+            a.push(&terms, '"')
+        }
+        i = end
+    }
+    if (@len(terms) == 0) {
+        return .empty
+    }
+    var st = try db.prepare("SELECT m.id, m.client_message_id, m.room_id, m.created_at, m.updated_at, t.body, u.id, u.name, u.bio, u.updated_at FROM messages m INNER JOIN rooms r ON m.room_id = r.id INNER JOIN memberships mm ON r.id = mm.room_id JOIN message_search_index idx ON m.id = idx.rowid JOIN users u ON u.id = m.creator_id LEFT JOIN action_text_rich_texts t ON t.record_type = 'Message' AND t.record_id = m.id AND t.name = 'body' WHERE mm.user_id = ? AND (idx.body MATCH ?) ORDER BY m.id DESC LIMIT 100")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    try st.bind(2, terms)
+    var out = try read_messages(a, db, sid_key, &st, "")
+    errdefer a.free(out)
+    // Each room's name, looked up once.
+    var k = 0
+    while (k < @len(out)) {
+        var j = 0
+        while (j < k and out[j].room_id != out[k].room_id) {
+            j = j + 1
+        }
+        if (j < k) {
+            const copy = a.concat(out[j].room_name[0..], "")
+            a.free(@replace(&out[k].room_name, copy))
+        } else {
+            var rs = try db.prepare("SELECT type = 'Rooms::Direct', name FROM rooms WHERE id = ?")
+            defer rs.finalize()
+            try rs.bind_int(1, out[k].room_id)
+            if (try rs.next()) {
+                const name = if (rs.is_null(1)) a.concat("", "") else rs.text(a, 1)
+                defer a.free(name)
+                const display = try display_name(a, db, out[k].room_id, rs.int(0) != 0, name, 0)
+                defer a.free(display)
+                a.append_str(&out[k].room_name, display)
+            }
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// The user's recent searches, newest first.
+fn recent_searches(a: Allocator, db: sqlite.Db, user: i64) !Buf(Buf(u8)) {
+    var out: Buf(Buf(u8)) = .empty
+    errdefer a.free(out)
+    var st = try db.prepare("SELECT query FROM searches WHERE user_id = ? ORDER BY updated_at DESC")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    while (try st.next()) {
+        a.push(&out, st.text(a, 0))
+    }
+    return out
+}
+
+// Where the search page's exit goes: the last room visited, if the user is
+// still in it, else the user's first room; 0 if none.
+fn return_room(db: sqlite.Db, user: i64, last_room: i64) !i64 {
+    if (last_room > 0) {
+        var st = try db.prepare("SELECT rooms.id FROM rooms INNER JOIN memberships ON rooms.id = memberships.room_id WHERE memberships.user_id = ? AND rooms.id = ? LIMIT 1")
+        defer st.finalize()
+        try st.bind_int(1, user)
+        try st.bind_int(2, last_room)
+        if (try st.next()) {
+            return st.int(0)
+        }
+    }
+    var st = try db.prepare("SELECT rooms.id FROM rooms INNER JOIN memberships ON rooms.id = memberships.room_id WHERE memberships.user_id = ? ORDER BY rooms.created_at ASC LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    if (try st.next()) {
+        return st.int(0)
+    }
+    return 0
 }
 
 // Each message's boosts, oldest first, in one query.
@@ -367,4 +486,50 @@ fn rooms_restricted(a: Allocator, db: sqlite.Db) !bool {
     const settings = st.text(a, 0)
     defer a.free(settings)
     return text.contains(settings, "\"restrict_room_creation_to_administrators\":true")
+}
+
+// room_display_name: a room's name, or for a direct room the names of its
+// members but for_user (0 for none) as a sentence ("A and B", "A, B, and C"),
+// or for_user's own name when it is alone.
+fn display_name(a: Allocator, db: sqlite.Db, room: i64, direct: bool, name: []u8, for_user: i64) !Buf(u8) {
+    var out: Buf(u8) = .empty
+    if (!direct) {
+        a.append_str(&out, name)
+        return out
+    }
+    errdefer a.free(out)
+    var names: Buf(Buf(u8)) = .empty
+    defer a.free(names)
+    var own: Buf(u8) = .empty
+    defer a.free(own)
+    var st = try db.prepare("SELECT users.id, users.name FROM users INNER JOIN memberships ON users.id = memberships.user_id WHERE memberships.room_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    while (try st.next()) {
+        if (st.int(0) == for_user) {
+            a.free(@replace(&own, st.text(a, 1)))
+        } else {
+            a.push(&names, st.text(a, 1))
+        }
+    }
+    var i = 0
+    while (i < @len(names)) {
+        if (i > 0) {
+            if (@len(names) == 2) {
+                a.append_str(&out, " and ")
+            } else if (i == @len(names) - 1) {
+                a.append_str(&out, ", and ")
+            } else {
+                a.append_str(&out, ", ")
+            }
+        }
+        a.append_str(&out, names[i])
+        i = i + 1
+    }
+    const blank = text.trim(a, out)
+    defer a.free(blank)
+    if (@len(blank) == 0) {
+        a.free(@replace(&out, a.concat(own, "")))
+    }
+    return out
 }

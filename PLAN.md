@@ -56,21 +56,23 @@ and Rack-escaped on the wire.
 - `GET /users/me/sidebar`: the same, for David, Kevin, JZ and Lonely Lou
   (`CAMPFIRE_USER=kevin script/compare.sh ...`); rooms a user is not in
   redirect to / and their message pages are Rails' 404 page, as in Rust
-- next: search, avatar, CSS, `POST /rooms/:id/messages`, gzip
+- `GET /searches?q=`: the same, with blank, empty, punctuated and
+  no-match queries; direct rooms' pages too (names, "Ping with")
+- next: avatar, CSS, `POST /rooms/:id/messages`, gzip
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
 checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
 Rust's JS files expect. So the assets to serve are Rust's, not the Rails
 image's (script/assets.sh still copies Rails').
 
-Not yet like Rust on the room page (none of it is in the benchmark's rooms):
-direct rooms' names and "Ping with", the invitation in the first room while
+Not yet like Rust (none of it is in the benchmark's rooms): the invitation in the first room while
 it has under a page of messages, notification help for a User-Agent (the
 page has the text for none), attachments and rich text rendering (bodies go
 out as stored, which matches every message in the benchmark room), the
 `last_room` cookie, the account's custom styles. The sidebar is always a
 whole page (Rust sends only the frame to a Turbo-Frame request), and
-initials upper-case ASCII only. Sign-in has no rate limit yet (Rails and
+initials upper-case ASCII only. Search's [[:word:]] is approximated with
+ranges outside ASCII. Sign-in has no rate limit yet (Rails and
 Rust allow 10 tries in 3 minutes). `all_emoji` approximates the Unicode properties with
 code point ranges.
 

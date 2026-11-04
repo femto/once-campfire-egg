@@ -1,0 +1,65 @@
+<%fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool) %>
+<% layout_top(a, &out, "Search", user, vapid, logo_v) %>
+
+
+  </head>
+
+  <body class="sidebar searches<% if (admin) { %> admin<% } %>" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+
+    <nav id="nav">
+<% if (has_query) { %>
+
+    <div class="searches__query flex align-center gap pad-block-start-half">
+      <div class="btn btn--reversed btn--faux align-center gap txt-nowrap">
+        <span class="overflow-ellipsis">“<%= query %>”</span>
+        <span class="flex-item-no-shrink"><%d @len(messages) %></span>
+</div>    </div><% } %>
+
+  <div class="searches__recents align-center gap pad-block-half overflow-y overflow-hide-scrollbar">
+    <%: recents(a, &out, recent, base) %>
+  </div>    </nav>
+
+
+    <main id="main-content">
+
+<div id="message-area" class="message-area">
+  <div class="message-area--empty min-width center">
+    <figure class="center pad">
+      <img aria-hidden="true" class="colorize--black translucent" src="/assets/search-5f29565f.svg" />
+    </figure>
+  </div>
+
+  <div id="search-results" class="messages searches__results" data-controller="search-results" data-search-results-target="messages" data-search-results-me-class="message--me" data-search-results-threaded-class="message--threaded" data-search-results-mentioned-class="message--mentioned" data-search-results-formatted-class="message--formatted"><% for (messages) |m| { %><%- "\n    " %><% message(a, &out, m) %><% } %>
+  </div></div>
+      <footer id="footer">
+
+  <div class="composer flex align-end gap">
+    <a class="btn flex-item-no-shrink margin-block-end" style="view-transition-name: input-switcher; --btn-border-radius: 0.5em" href="/rooms/<%d return_room %>">
+      <img aria-hidden="true" src="/assets/arrow-left-abe40556.svg" />
+      <span class="for-screen-reader">Exit search </span>
+</a>
+    <form class="margin-block flex-item-grow contain flex align-center gap" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/searches" accept-charset="UTF-8" method="post">
+      <div class="composer__input flex align-center flex-item-grow gap full-width input input--actor min-width">
+        <img aria-hidden="true" class="composer__input-hint colorize--black" style="view-transition-name: input-btn;" src="/assets/search-5f29565f.svg" width="20" height="20" />
+
+        <input<% if (has_q) { %> value="<%= q %>"<% } %> class="searches__input input flex-item-grow" role="searchbox" aria-label="search" autofocus="autofocus" required="required" type="text" name="q" id="q" />
+
+        <a data-form-target="cancel" role="button" class="searches__reset" href="/searches">
+          <img aria-hidden="true" class="colorize--black" src="/assets/remove-0e7a045d.svg" width="14" height="14" />
+          <span class="for-screen-reader">Clear search field</span>
+</a>
+        <button name="button" type="submit" class="btn btn--reversed flex-item-no-shrink txt-small" style="--btn-border-radius: 0.5em">
+          <img aria-hidden="true" src="/assets/arrow-up-f96b3895.svg" />
+          <span class="for-screen-reader">Search</span>
+</button>      </div>
+</form>  </div>      </footer>
+    </main>
+
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+
+  <div class="rooms position-relative flex flex-column gap overflow-y overflow-hide-scrollbar">
+    <%: recents(a, &out, recent, base) %>
+  </div>    </aside>
+
+<% layout_bottom(a, &out) %>

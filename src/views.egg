@@ -2,6 +2,7 @@
 uses alloc
 
 const html = @import("html.egg")
+const codec = @import("codec.egg")
 const tf = @import("timefmt.egg")
 const model = @import("model.egg")
 const static_head = @import("static_head.egg")
@@ -92,6 +93,14 @@ fn initials(a: Allocator, inout out: Buf(u8), members: Buf(model.UserView)) void
     }
 }
 
+// A search as the q of a URL, HTML-escaped: to_query's escaping.
+fn search_query(a: Allocator, inout out: Buf(u8), q: []u8) void {
+    var e: Buf(u8) = .empty
+    defer a.free(e)
+    codec.escape(a, &e, q)
+    html.escape(a, &out, e)
+}
+
 // boost.html
 fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) void {
     a.append_str(&out, "\n      <div id=\"boost_")
@@ -145,7 +154,7 @@ fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserVie
 }
 
 // message.html
-fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView, room_name: []u8) void {
+fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
     a.append_str(&out, "\n  <div id=\"message_")
     html.escape(a, &out, m.client_id)
     a.append_str(&out, "\" class=\"message ")
@@ -187,7 +196,7 @@ fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView, room_name: []
     a.append_str(&out, "/@")
     a.append_int(&out, m.id)
     a.append_str(&out, "\">")
-    html.escape(a, &out, room_name)
+    html.escape(a, &out, m.room_name)
     a.append_str(&out, "</a>\n              </span>\n            </h3>\n            <div class=\"message__actions\" data-controller=\"soft-keyboard\">\n  <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\">\n    <summary class=\"btn message__action-btn message__options-btn\">\n      <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/menu-dots-horizontal-f6a5d793.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Message options</span>\n    </summary>\n\n    <div class=\"message__actions-menu border shadow\" data-popup-target=\"menu\">\n      <div class=\"quick-boosts\">")
     quick_boosts(a, &out, m)
     a.append_str(&out, "\n\n        <a class=\"btn message__action-btn message__boost-btn\" data-turbo-frame=\"new_boost_message_")
@@ -224,10 +233,10 @@ fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView, room_name: []
 }
 
 // messages.html
-fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView), room_name: []u8) void {
+fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView)) void {
     for (messages) |m| {
     a.append_str(&out, "\n")
-    message(a, &out, m, room_name)
+    message(a, &out, m)
     }
 }
 
@@ -250,17 +259,37 @@ fn quick_boost(a: Allocator, inout out: Buf(u8), m: model.MessageView, ch: []u8,
     a.append_str(&out, "</span>\n</button></form>")
 }
 
+// recents.html
+fn recents(a: Allocator, inout out: Buf(u8), recent: Buf(Buf(u8)), base: []u8) void {
+    for (recent) |r| {
+    a.append_str(&out, "\n      <a class=\"align-center gap room btn txt-nowrap\" href=\"/searches?q=")
+    search_query(a, &out, r)
+    a.append_str(&out, "\">\n        <span class=\"overflow-ellipsis\">“")
+    html.escape(a, &out, r)
+    a.append_str(&out, "”</span>\n</a>")
+    }
+    if (@len(recent) > 0) {
+    a.append_str(&out, "\n      <form class=\"button_to\" method=\"post\" action=\"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/searches/clear\"><input type=\"hidden\" name=\"_method\" value=\"delete\" /><button class=\"btn searches__btn\" data-turbo-confirm=\"Are you sure you want to clear your recent searches?\" type=\"submit\">\n        <img aria-hidden=\"true\" src=\"/assets/broom-13d30a95.svg\" />\n        <span class=\"for-screen-reader\">Clear recent searches</span>\n</button></form>")
+    }
+}
+
 // room.html
 fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8) void {
-    layout_top(a, &out, room.name, user, vapid, logo_v)
+    layout_top(a, &out, room.display, user, vapid, logo_v)
     a.append_str(&out, "\n\n\n  <meta name=\"turbo-cache-control\" content=\"no-preview\">\n  <meta name=\"current-room-id\" content=\"")
     a.append_int(&out, room.id)
     a.append_str(&out, "\">  </head>\n\n  <body class=\"sidebar")
     if (admin) {
     a.append_str(&out, " admin")
     }
-    a.append_str(&out, "\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n\n\n  <span class=\"btn btn--reversed btn--faux room--current\">\n    <h1 class=\"room__contents txt-medium overflow-ellipsis\">\n\n      ")
-    html.escape(a, &out, room.name)
+    a.append_str(&out, "\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n\n\n  <span class=\"btn btn--reversed btn--faux room--current\">\n    <h1 class=\"room__contents txt-medium overflow-ellipsis\">")
+    if (room.kind == "direct") {
+    a.append_str(&out, "\n        <span class=\"for-screen-reader\">Ping with</span>")
+    }
+    a.append_str(&out, "\n\n      ")
+    html.escape(a, &out, room.display)
     a.append_str(&out, "\n    </h1>\n</span>\n\n  <a class=\"btn\" style=\"view-transition-name: edit-room-")
     a.append_int(&out, room.id)
     a.append_str(&out, "\" data-room-id=\"")
@@ -316,7 +345,7 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     a.append_str(&out, "/refresh\">")
     for (messages) |m| {
     a.append_str(&out, "\n    ")
-    message(a, &out, m, room.name)
+    message(a, &out, m)
     }
     a.append_str(&out, "\n  </div>\n\n  <turbo-cable-stream-source channel=\"RoomMessagesChannel\" signed-stream-name=\"")
     a.append_str(&out, stream)
@@ -331,6 +360,42 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     a.append_str(&out, "/rails/active_storage/blobs/redirect/:signed_id/:filename\" id=\"message_body\" input=\"message_body_trix_input_message\" name=\"message[body]\">\n                    <lexxy-prompt trigger=\"@\" name=\"mention\" src=\"/autocompletable/users?room_id=")
     a.append_int(&out, room.id)
     a.append_str(&out, "\" remote-filtering=\"true\" empty-results=\"No matches\"></lexxy-prompt>\n</lexxy-editor>                </div>\n\n                <label class=\"btn btn--borderless txt-small flex-item-no-shrink composer__attachment-btn input--file\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/attachment-8bcccab0.svg\" width=\"22\" height=\"22\" />\n                  <input type=\"file\" data-action=\"composer#filePicked\" multiple />\n                  <span class=\"for-screen-reader\">Attach a file</span>\n                </label>\n\n                <button class=\"btn btn--borderless txt-small flex-item-no-shrink composer__rich-text-btn\" type=\"button\" data-action=\"composer#toggleToolbar\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/text-options-055e0d16.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Rich text</span>\n                </button>\n\n                <button name=\"send\" type=\"submit\" data-action=\"composer#submit\" class=\"btn btn--reversed flex-item-no-shrink txt-small\">\n                  <img aria-hidden=\"true\" src=\"/assets/arrow-up-f96b3895.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Send Message</span>\n</button>              </div>\n            </div>\n          </div>\n        </fieldset>\n\n        <div class=\"typing-indicator gap txt-small align-center flex-inline\" data-typing-notifications-target=\"indicator\">\n          <div class=\"typing-indicator__author spinner\" data-typing-notifications-target=\"author\"></div>\n        </div>\n\n        <input data-composer-target=\"clientid\" type=\"hidden\" name=\"message[client_message_id]\" id=\"message_client_message_id\" />\n</form>    </turbo-frame>\n  </div>      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n<turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload\" id=\"user_sidebar\" src=\"/users/me/sidebar\" target=\"_top\"></turbo-frame>    </aside>\n\n")
+    layout_bottom(a, &out)
+}
+
+// search.html
+fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool) void {
+    layout_top(a, &out, "Search", user, vapid, logo_v)
+    a.append_str(&out, "\n\n  </head>\n\n  <body class=\"sidebar searches")
+    if (admin) {
+    a.append_str(&out, " admin")
+    }
+    a.append_str(&out, "\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n")
+    if (has_query) {
+    a.append_str(&out, "\n    <div class=\"searches__query flex align-center gap pad-block-start-half\">\n      <div class=\"btn btn--reversed btn--faux align-center gap txt-nowrap\">\n        <span class=\"overflow-ellipsis\">“")
+    html.escape(a, &out, query)
+    a.append_str(&out, "”</span>\n        <span class=\"flex-item-no-shrink\">")
+    a.append_int(&out, @len(messages))
+    a.append_str(&out, "</span>\n</div>    </div>")
+    }
+    a.append_str(&out, "\n\n  <div class=\"searches__recents align-center gap pad-block-half overflow-y overflow-hide-scrollbar\">\n    ")
+    recents(a, &out, recent, base)
+    a.append_str(&out, "\n  </div>    </nav>\n\n\n    <main id=\"main-content\">\n\n<div id=\"message-area\" class=\"message-area\">\n  <div class=\"message-area--empty min-width center\">\n    <figure class=\"center pad\">\n      <img aria-hidden=\"true\" class=\"colorize--black translucent\" src=\"/assets/search-5f29565f.svg\" />\n    </figure>\n  </div>\n\n  <div id=\"search-results\" class=\"messages searches__results\" data-controller=\"search-results\" data-search-results-target=\"messages\" data-search-results-me-class=\"message--me\" data-search-results-threaded-class=\"message--threaded\" data-search-results-mentioned-class=\"message--mentioned\" data-search-results-formatted-class=\"message--formatted\">")
+    for (messages) |m| {
+    a.append_str(&out, "\n    ")
+    message(a, &out, m)
+    }
+    a.append_str(&out, "\n  </div></div>\n      <footer id=\"footer\">\n\n  <div class=\"composer flex align-end gap\">\n    <a class=\"btn flex-item-no-shrink margin-block-end\" style=\"view-transition-name: input-switcher; --btn-border-radius: 0.5em\" href=\"/rooms/")
+    a.append_int(&out, return_room)
+    a.append_str(&out, "\">\n      <img aria-hidden=\"true\" src=\"/assets/arrow-left-abe40556.svg\" />\n      <span class=\"for-screen-reader\">Exit search </span>\n</a>\n    <form class=\"margin-block flex-item-grow contain flex align-center gap\" data-controller=\"form\" data-action=\"keydown.esc-&gt;form#cancel\" action=\"/searches\" accept-charset=\"UTF-8\" method=\"post\">\n      <div class=\"composer__input flex align-center flex-item-grow gap full-width input input--actor min-width\">\n        <img aria-hidden=\"true\" class=\"composer__input-hint colorize--black\" style=\"view-transition-name: input-btn;\" src=\"/assets/search-5f29565f.svg\" width=\"20\" height=\"20\" />\n\n        <input")
+    if (has_q) {
+    a.append_str(&out, " value=\"")
+    html.escape(a, &out, q)
+    a.append_str(&out, "\"")
+    }
+    a.append_str(&out, " class=\"searches__input input flex-item-grow\" role=\"searchbox\" aria-label=\"search\" autofocus=\"autofocus\" required=\"required\" type=\"text\" name=\"q\" id=\"q\" />\n\n        <a data-form-target=\"cancel\" role=\"button\" class=\"searches__reset\" href=\"/searches\">\n          <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/remove-0e7a045d.svg\" width=\"14\" height=\"14\" />\n          <span class=\"for-screen-reader\">Clear search field</span>\n</a>\n        <button name=\"button\" type=\"submit\" class=\"btn btn--reversed flex-item-no-shrink txt-small\" style=\"--btn-border-radius: 0.5em\">\n          <img aria-hidden=\"true\" src=\"/assets/arrow-up-f96b3895.svg\" />\n          <span class=\"for-screen-reader\">Search</span>\n</button>      </div>\n</form>  </div>      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n\n  <div class=\"rooms position-relative flex flex-column gap overflow-y overflow-hide-scrollbar\">\n    ")
+    recents(a, &out, recent, base)
+    a.append_str(&out, "\n  </div>    </aside>\n\n")
     layout_bottom(a, &out)
 }
 

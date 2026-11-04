@@ -1,6 +1,7 @@
 uses alloc
 
 const html = @import("html.egg")
+const codec = @import("codec.egg")
 const tf = @import("timefmt.egg")
 const model = @import("model.egg")
 const static_head = @import("static_head.egg")
@@ -89,4 +90,12 @@ fn initials(a: Allocator, inout out: Buf(u8), members: Buf(model.UserView)) void
         }
         i = i + 1
     }
+}
+
+// A search as the q of a URL, HTML-escaped: to_query's escaping.
+fn search_query(a: Allocator, inout out: Buf(u8), q: []u8) void {
+    var e: Buf(u8) = .empty
+    defer a.free(e)
+    codec.escape(a, &e, q)
+    html.escape(a, &out, e)
 }
