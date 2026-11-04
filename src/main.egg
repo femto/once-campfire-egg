@@ -1,7 +1,7 @@
 // ONCE Campfire in Egg. A fixed pool of worker threads takes connections
 // from a queue; each worker has its own SQLite connection, since threads
 // share nothing.
-uses alloc, args, net, rand, thread, time, io
+uses alloc, args, fs, net, rand, thread, time, io
 
 const text = @import("std/text")
 const http = @import("http.egg")
@@ -28,10 +28,10 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     }
 }
 
-fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, db_path: str, secret: str, vapid: str) void {
+fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
     defer jobs.close()
-    var ctx = app.open(a, db_path, secret, vapid, clock, rng) catch |e| {
-        io.eprint("cannot open ", db_path, ": ", @errorName(e))
+    var ctx = app.open(a, cfg, clock, rng, files) catch |e| {
+        io.eprint("cannot open ", cfg.db_path, ": ", @errorName(e))
         return
     }
     defer ctx.close(a)
@@ -43,7 +43,7 @@ fn work(sink jobs: Receiver(TcpConn), io: Io, a: Allocator, clock: Clock, rng: R
     }
 }
 
-fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random) !void {
+fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs) !void {
     const port_text = args.env("HTTP_PORT") orelse "3000"
     const port = text.parse_int(port_text) orelse -1
     if (port < 0 or port > 65535) {
@@ -59,7 +59,17 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         io.eprint("SECRET_KEY_BASE is not set")
         return
     }
-    const vapid = args.env("VAPID_PUBLIC_KEY") orelse ""
+    // Active Storage's files, as the benchmark mounts them beside the db.
+    const default_files = a.concat(storage, "/files")
+    const files_dir = args.env("CAMPFIRE_FILES_PATH") orelse a.leak(default_files)
+    a.free(default_files)
+    const cfg = app.Config{
+        .db_path = db_path,
+        .secret = secret,
+        .vapid = args.env("VAPID_PUBLIC_KEY") orelse "",
+        .files = files_dir,
+        .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
+    }
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
     io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers")
@@ -71,7 +81,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     defer queue.close()      // first: they finish what is queued, and stop
     var i = 0
     while (i < workers) {
-        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, db_path, secret, vapid) })
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), io, a, clock, rng, files, cfg) })
         i = i + 1
     }
     jobs.close()

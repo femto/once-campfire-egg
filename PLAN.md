@@ -58,7 +58,10 @@ and Rack-escaped on the wire.
   redirect to / and their message pages are Rails' 404 page, as in Rust
 - `GET /searches?q=`: the same, with blank, empty, punctuated and
   no-match queries; direct rooms' pages too (names, "Ping with")
-- next: avatar, CSS, `POST /rooms/:id/messages`, gzip
+- `GET /users/:signed_id/avatar` (a processed :square variant) and
+  `GET /assets/*`: the same bytes; script/assets.sh adds Rust's four
+  overridden JS files to the Rails assets
+- next: `POST /rooms/:id/messages`, gzip, a Docker image
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
 checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
@@ -72,7 +75,8 @@ out as stored, which matches every message in the benchmark room), the
 `last_room` cookie, the account's custom styles. The sidebar is always a
 whole page (Rust sends only the frame to a Turbo-Frame request), and
 initials upper-case ASCII only. Search's [[:word:]] is approximated with
-ranges outside ASCII. Sign-in has no rate limit yet (Rails and
+ranges outside ASCII. Avatars without a processed variant (initials and bot SVGs) are 404s.
+No ETag or 304s yet. Sign-in has no rate limit yet (Rails and
 Rust allow 10 tries in 3 minutes). `all_emoji` approximates the Unicode properties with
 code point ranges.
 

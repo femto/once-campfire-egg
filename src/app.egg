@@ -1,5 +1,5 @@
 // Routing, and what one worker keeps between requests.
-uses alloc, net, rand, time
+uses alloc, fs, net, rand, time
 
 const http = @import("http.egg")
 const sqlite = @import("sqlite.egg")
@@ -14,6 +14,16 @@ const tf = @import("timefmt.egg")
 const text = @import("std/text")
 const public_pages = @import("public_pages.egg")
 
+// What main reads from the environment for the workers.
+const Config = struct {
+    db_path: str
+    secret: str
+    vapid: str
+    // Active Storage's root, and the precompiled assets.
+    files: str
+    assets: str
+}
+
 const Context = owned struct {
     db: sqlite.Db
     // Keys derived from SECRET_KEY_BASE once: signed cookies, signed ids
@@ -24,6 +34,9 @@ const Context = owned struct {
     vapid: Buf(u8)
     clock: Clock
     rng: Random
+    fs: Fs
+    files: str
+    assets: str
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
@@ -35,16 +48,20 @@ const Context = owned struct {
     }
 }
 
-fn open(a: Allocator, path: str, secret: str, vapid: str, clock: Clock, rng: Random) !Context {
-    const db = try sqlite.open(a, path)
+fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs) !Context {
+    const db = try sqlite.open(a, cfg.db_path)
+    const secret = cfg.secret
     return Context{
         .db = db,
         .key = cookie.key(a, secret),
         .sid_key = signed_id.key(a, secret),
         .stream_key = turbo.key(a, secret),
-        .vapid = a.concat(vapid, ""),
+        .vapid = a.concat(cfg.vapid, ""),
         .clock = clock,
         .rng = rng,
+        .fs = files,
+        .files = cfg.files,
+        .assets = cfg.assets,
     }
 }
 
@@ -61,6 +78,12 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
     }
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
+    }
+    if (req.method == "GET" and text.starts_with(req.path, "/assets/")) {
+        return asset(c, a, &ctx, req)
+    }
+    if (req.method == "GET" and text.starts_with(req.path, "/users/") and text.ends_with(req.path, "/avatar")) {
+        return avatar(c, a, &ctx, req, req.path[@len("/users/")..@len(req.path) - @len("/avatar")])
     }
     if (req.method == "GET" and req.path == "/searches") {
         return search_page(c, a, &ctx, req)
@@ -98,7 +121,13 @@ fn to_root(c: TcpConn, a: Allocator, req: http.Request) !void {
 }
 
 fn to_sign_in(c: TcpConn, a: Allocator, req: http.Request) !void {
-    return http.write_response(c, a, "302 Found", "Location: /session/new\r\nContent-Type: text/html; charset=utf-8\r\n", "", req.keep)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: http://")
+    a.append_str(&headers, req.host)
+    a.append_str(&headers, "/session/new\r\n")
+    a.append_str(&headers, HTML)
+    return http.write_response(c, a, "302 Found", headers, "", req.keep)
 }
 
 // Whether the user is an administrator (role 1), and the account's logo
@@ -358,4 +387,90 @@ fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) 
     defer a.free(body)
     views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin)
     return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+}
+
+// The Content-Type header of a file, by its extension.
+fn content_type(path: []u8) str {
+    if (text.ends_with(path, ".css")) {
+        return "Content-Type: text/css\r\n"
+    } else if (text.ends_with(path, ".js")) {
+        return "Content-Type: text/javascript\r\n"
+    } else if (text.ends_with(path, ".svg")) {
+        return "Content-Type: image/svg+xml\r\n"
+    } else if (text.ends_with(path, ".png")) {
+        return "Content-Type: image/png\r\n"
+    } else if (text.ends_with(path, ".gif")) {
+        return "Content-Type: image/gif\r\n"
+    } else if (text.ends_with(path, ".webp")) {
+        return "Content-Type: image/webp\r\n"
+    } else if (text.ends_with(path, ".mp3")) {
+        return "Content-Type: audio/mpeg\r\n"
+    } else if (text.ends_with(path, ".json") or text.ends_with(path, ".map")) {
+        return "Content-Type: application/json\r\n"
+    }
+    return "Content-Type: application/octet-stream\r\n"
+}
+
+// GET /assets/<digested path>: a precompiled asset, cached for 30 days.
+fn asset(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const name = req.path[@len("/assets/")..]
+    if (@len(name) == 0 or text.contains(name, "..") or text.contains(name, "//")) {
+        return not_found(c, a, req)
+    }
+    const path = a.concat(ctx.assets, "/", name)
+    defer a.free(path)
+    const body = ctx.fs.read(a, path) catch {
+        return not_found(c, a, req)
+    }
+    defer a.free(body)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, content_type(name))
+    a.append_str(&headers, "Cache-Control: public, max-age=2592000\r\n")
+    return http.write_response(c, a, "200 OK", headers, body, req.keep)
+}
+
+// ActiveStorage's digest of the :square variant (resize_to_limit
+// [512, 512], format :webp).
+const SQUARE = "6gwfjNKv9eUy9jNUtEZvQFLU0hQ="
+
+// GET /users/<signed id>/avatar: the avatar's processed :square variant.
+fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token: []u8) !void {
+    _ = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const user = signed_id.verify(a, ctx.sid_key, token, "user/avatar") orelse {
+        return http.write_response(c, a, "404 Not Found", HTML, "", req.keep)
+    }
+    var st = try ctx.db.prepare("SELECT b.key, b.content_type FROM users u JOIN active_storage_attachments ua ON ua.record_type = 'User' AND ua.record_id = u.id AND ua.name = 'avatar' JOIN active_storage_variant_records v ON v.blob_id = ua.blob_id AND v.variation_digest = ? JOIN active_storage_attachments va ON va.record_type = 'ActiveStorage::VariantRecord' AND va.record_id = v.id AND va.name = 'image' JOIN active_storage_blobs b ON b.id = va.blob_id WHERE u.id = ?")
+    defer st.finalize()
+    try st.bind(1, SQUARE)
+    try st.bind_int(2, user)
+    if (!try st.next()) {
+        // No processed variant: initials and bot avatars are not drawn yet.
+        return not_found(c, a, req)
+    }
+    const key = st.text(a, 0)
+    defer a.free(key)
+    if (@len(key) < 4) {
+        return not_found(c, a, req)
+    }
+    const kind = st.text(a, 1)
+    defer a.free(kind)
+    const path = a.concat(ctx.files, "/", key[0..2], "/", key[2..4], "/", key)
+    defer a.free(path)
+    const body = ctx.fs.read(a, path) catch {
+        return not_found(c, a, req)
+    }
+    defer a.free(body)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Content-Type: ")
+    a.append_str(&headers, kind)
+    a.append_str(&headers, "\r\nContent-Disposition: inline; filename=\"")
+    a.append_str(&headers, key)
+    a.append_str(&headers, "\"; filename*=UTF-8''")
+    a.append_str(&headers, key)
+    a.append_str(&headers, "\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
+    return http.write_response(c, a, "200 OK", headers, body, req.keep)
 }

@@ -6,6 +6,8 @@
 #   script/compare.sh EGG_URL RUST_URL STORAGE
 # STORAGE is the seed (labels.json, reference.env).
 set -eu
+# Bodies may be binary (avatars).
+export LC_ALL=C
 egg=$1 rust=$2 storage=$3
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -18,7 +20,7 @@ for side in egg rust; do
 done
 room=$(label rooms.watercooler)
 status=0
-for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)" "/rooms/$(label rooms.david_and_jason)" "/rooms/$(label rooms.group_direct)" "/rooms/$(label rooms.david_and_kevin)" /users/me/sidebar "/searches?q=coffee" /searches "/searches?q=" "/searches?q=zzzqqq" "/searches?q=coffee%21%20%22pizza%22" "/searches?q=%E2%80%9Ccoffee%E2%80%9D"; do
+for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)" "/rooms/$(label rooms.david_and_jason)" "/rooms/$(label rooms.group_direct)" "/rooms/$(label rooms.david_and_kevin)" /users/me/sidebar "/searches?q=coffee" /searches "/searches?q=" "/searches?q=zzzqqq" "/searches?q=coffee%21%20%22pizza%22" "/searches?q=%E2%80%9Ccoffee%E2%80%9D" "/users/$(label avatar_tokens.jason)/avatar" /assets/_reset-9c3efd7b.css /assets/controllers/copy_to_clipboard_controller-a4928c72.js; do
   curl -s -H 'User-Agent:' -b "$tmp/egg.jar" "$egg$path" | sed "s#$egg#$rust#g" > "$tmp/egg.html"
   curl -s -H 'User-Agent:' -b "$tmp/rust.jar" "$rust$path" > "$tmp/rust.html"
   if cmp -s "$tmp/egg.html" "$tmp/rust.html"; then
