@@ -37,21 +37,65 @@ const OPEN_FLAGS: i32 = 0x2 | 0x8000
 // SQLITE_PREPARE_PERSISTENT: the statement is kept for many runs.
 const PREPARE_PERSISTENT: u32 = 0x1
 
+// A statement prepare made, kept for the next time the same text comes:
+// the program's SQL is string literals, so their addresses name them. The
+// entries live as long as the connection's thread (a.create memory is not
+// freed); there is one per literal.
+const Entry = struct {
+    key: i64
+    len: i64
+    stmt: *u8
+    // In use by a Stmt not yet finalized; the same SQL run inside its own
+    // loop then gets a statement of its own.
+    busy: bool
+    next: *Entry
+}
+
+const Cache = struct {
+    a: Allocator
+    first: *Entry
+}
+
 const Db = owned struct {
     handle: *u8
+    cache: *Cache
 
     fn close(sink self: Db) void {
+        var e = self.cache.*.first
+        while (e != null) {
+            _ = sqlite3_finalize(e.*.stmt)
+            e = e.*.next
+        }
         _ = sqlite3_close_v2(self.handle)
         @forget(self)
     }
 
-    // A statement for sql, to bind, step, reset and run again.
+    // A statement for sql, to bind and step; finalize hands it back, reset,
+    // for the next prepare of the same text.
     fn prepare(self: Db, sql: str) !Stmt {
+        const key = @as(i64, @intFromPtr(@strPtr(sql)))
+        var e = self.cache.*.first
+        while (e != null) {
+            if (e.*.key == key and e.*.len == @len(sql)) {
+                if (e.*.busy) {
+                    break
+                }
+                e.*.busy = true
+                return Stmt{ .handle = e.*.stmt, .entry = e }
+            }
+            e = e.*.next
+        }
         var st: *u8 = null
         if (sqlite3_prepare_v3(self.handle, @strPtr(sql), @as(i32, @len(sql)), PREPARE_PERSISTENT, &st, null) != OK) {
             return error.Sql
         }
-        return Stmt{ .handle = st }
+        if (e != null) {
+            // Already in use: this one is finalized when done.
+            return Stmt{ .handle = st, .entry = null }
+        }
+        const fresh = self.cache.*.a.create(Entry{ .key = key, .len = @len(sql), .stmt = st, .busy = true, .next = self.cache.*.first })
+        self.cache.*.first = fresh
+        return Stmt{ .handle = st, .entry = fresh }
     }
 
     // prepare for SQL the program built.
@@ -60,7 +104,7 @@ const Db = owned struct {
         if (sqlite3_prepare_v3(self.handle, @strPtr(sql), @as(i32, @len(sql)), 0, &st, null) != OK) {
             return error.Sql
         }
-        return Stmt{ .handle = st }
+        return Stmt{ .handle = st, .entry = null }
     }
 
     // Run sql that returns no rows (PRAGMA, BEGIN, ...).
@@ -86,6 +130,8 @@ const Db = owned struct {
 
 const Stmt = owned struct {
     handle: *u8
+    // The cache's entry, or null for a statement of its own.
+    entry: *Entry
 
     // Bind text to parameter i (from 1). SQLite copies it
     // (SQLITE_TRANSIENT, the destructor -1).
@@ -153,7 +199,13 @@ const Stmt = owned struct {
     }
 
     fn finalize(sink self: Stmt) void {
-        _ = sqlite3_finalize(self.handle)
+        if (self.entry != null) {
+            _ = sqlite3_reset(self.handle)
+            _ = sqlite3_clear_bindings(self.handle)
+            self.entry.*.busy = false
+        } else {
+            _ = sqlite3_finalize(self.handle)
+        }
         @forget(self)
     }
 }
@@ -170,5 +222,5 @@ fn open(a: Allocator, path: []u8) !Db {
         return error.Open
     }
     _ = sqlite3_busy_timeout(h, 5000)
-    return Db{ .handle = h }
+    return Db{ .handle = h, .cache = a.create(Cache{ .a = a, .first = null }) }
 }
