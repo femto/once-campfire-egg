@@ -1,5 +1,5 @@
-# eggc from an egg checkout; egg-dev carries changes not yet merged.
-EGG_DIR ?= $(HOME)/git/egg-dev
+# eggc from an egg checkout at main.
+EGG_DIR ?= $(HOME)/crystal-project/egg
 EGGC ?= ruby -I$(EGG_DIR)/lib $(EGG_DIR)/bin/eggc
 CC ?= cc
 # OpenSSL's libcrypto: Homebrew's on macOS, the system's elsewhere.

@@ -66,5 +66,4 @@ Recorded as they come up; each becomes an egg issue or PR.
 - no top-level value constants: egg #76 (`const MAX = 8192`)
 - no wall clock, no random bytes: egg #77 (`uses time` Clock, `uses rand` Random)
 
-Until those merge, `make` builds with ~/git/egg-dev, a checkout of egg main
-with the branches merged.
+All four are merged; `make` builds with egg main.
