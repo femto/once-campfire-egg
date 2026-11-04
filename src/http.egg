@@ -14,6 +14,9 @@ const Request = owned struct {
     query: Buf(u8)
     cookie: Buf(u8)
     host: Buf(u8)
+    // Origin and Sec-Fetch-Site, for forgery protection; empty if absent.
+    origin: Buf(u8)
+    fetch_site: Buf(u8)
     content_type: Buf(u8)
     body: Buf(u8)
     gzip: bool
@@ -25,6 +28,8 @@ const Request = owned struct {
         a.free(self.query)
         a.free(self.cookie)
         a.free(self.host)
+        a.free(self.origin)
+        a.free(self.fetch_site)
         a.free(self.content_type)
         a.free(self.body)
         @forget(self)
@@ -116,6 +121,10 @@ fn read_request(c: TcpConn, a: Allocator, served: i64) !?Request {
     errdefer a.free(content_type)
     var host: Buf(u8) = .empty
     errdefer a.free(host)
+    var origin: Buf(u8) = .empty
+    errdefer a.free(origin)
+    var fetch_site: Buf(u8) = .empty
+    errdefer a.free(fetch_site)
     var length = 0
     var close = false
     var ask_keep = false
@@ -132,6 +141,10 @@ fn read_request(c: TcpConn, a: Allocator, served: i64) !?Request {
             a.free(@replace(&cookie, value(a, header, "Cookie")))
         } else if (is_header(header, "Host")) {
             a.free(@replace(&host, value(a, header, "Host")))
+        } else if (is_header(header, "Origin")) {
+            a.free(@replace(&origin, value(a, header, "Origin")))
+        } else if (is_header(header, "Sec-Fetch-Site")) {
+            a.free(@replace(&fetch_site, value(a, header, "Sec-Fetch-Site")))
         } else if (is_header(header, "Content-Type")) {
             a.free(@replace(&content_type, value(a, header, "Content-Type")))
         } else if (is_header(header, "Connection")) {
@@ -174,6 +187,8 @@ fn read_request(c: TcpConn, a: Allocator, served: i64) !?Request {
         .query = if (q < end) a.concat(line[q + 1..end], "") else a.concat("", ""),
         .cookie = cookie,
         .host = host,
+        .origin = origin,
+        .fetch_site = fetch_site,
         .content_type = content_type,
         .body = body,
         .gzip = gzip,

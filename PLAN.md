@@ -61,7 +61,10 @@ and Rack-escaped on the wire.
 - `GET /users/:signed_id/avatar` (a processed :square variant) and
   `GET /assets/*`: the same bytes; script/assets.sh adds Rust's four
   overridden JS files to the Rails assets
-- next: `POST /rooms/:id/messages`, gzip, a Docker image
+- `POST /rooms/:id/messages`: the same turbo-stream (but for times and
+  ids), body, search entry and unread marks as Rust; forgery checked by
+  Origin and Sec-Fetch-Site as Rust does (422 page)
+- next: gzip, a Docker image, then the benchmark
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust
 checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
@@ -76,7 +79,10 @@ out as stored, which matches every message in the benchmark room), the
 whole page (Rust sends only the frame to a Turbo-Frame request), and
 initials upper-case ASCII only. Search's [[:word:]] is approximated with
 ranges outside ASCII. Avatars without a processed variant (initials and bot SVGs) are 404s.
-No ETag or 304s yet. Sign-in has no rate limit yet (Rails and
+No ETag or 304s yet. Posting a message does not broadcast it over Action
+Cable, send Web Push or call bots' webhooks (Rust does all three after the
+response), and a body with HTML tags is stored as it came rather than
+re-serialized as Nokogiri would. Sign-in has no rate limit yet (Rails and
 Rust allow 10 tries in 3 minutes). `all_emoji` approximates the Unicode properties with
 code point ranges.
 

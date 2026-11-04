@@ -130,6 +130,19 @@ fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) 
     a.append_str(&out, "\"><input type=\"hidden\" name=\"_method\" value=\"delete\" /><button data-action=\"boost-delete#perform\" data-boost-delete-target=\"button\" class=\"btn btn--negative flex-item-justify-end boost__delete\" type=\"submit\">\n      <img aria-hidden=\"true\" src=\"/assets/minus-b31a1093.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Delete this boost</span>\n</button></form>  </div>\n  <span id=\"delete_boost_accessible_label\" class=\"for-screen-reader\">Press enter to delete this boost</span>")
 }
 
+// create_stream.html
+fn create_stream(a: Allocator, inout out: Buf(u8), room: model.RoomView, messages: Buf(model.MessageView)) void {
+    a.append_str(&out, "<turbo-stream action=\"append\" target=\"messages_rooms_")
+    a.append_str(&out, room.kind)
+    a.append_str(&out, "_")
+    a.append_int(&out, room.id)
+    a.append_str(&out, "\"><template>")
+    for (messages) |m| {
+    message(a, &out, m)
+    }
+    a.append_str(&out, "</template></turbo-stream>")
+}
+
 // layout_bottom.html
 fn layout_bottom(a: Allocator, inout out: Buf(u8)) void {
     a.append_str(&out, "    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n")

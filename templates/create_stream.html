@@ -1,0 +1,2 @@
+<%fn create_stream(a: Allocator, inout out: Buf(u8), room: model.RoomView, messages: Buf(model.MessageView)) %>
+<turbo-stream action="append" target="messages_rooms_<%- room.kind %>_<%d room.id %>"><template><% for (messages) |m| { %><% message(a, &out, m) %><% } %></template></turbo-stream>

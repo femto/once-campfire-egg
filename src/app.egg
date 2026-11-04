@@ -76,8 +76,16 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
     if (req.method == "GET" and req.path == "/session/new") {
         return http.write_response(c, a, "200 OK", HTML, SIGN_IN, req.keep)
     }
+    if (req.method == "POST" and !same_origin(a, req)) {
+        return http.write_response(c, a, "422 Unprocessable Content", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.UNPROCESSABLE, req.keep)
+    }
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
+    }
+    if (req.method == "POST" and text.starts_with(req.path, "/rooms/") and text.ends_with(req.path, "/messages")) {
+        if (text.parse_int(req.path[@len("/rooms/")..@len(req.path) - @len("/messages")])) |room| {
+            return create_message(c, a, &ctx, req, room)
+        }
     }
     if (req.method == "GET" and text.starts_with(req.path, "/assets/")) {
         return asset(c, a, &ctx, req)
@@ -473,4 +481,51 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     a.append_str(&headers, key)
     a.append_str(&headers, "\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
     return http.write_response(c, a, "200 OK", headers, body, req.keep)
+}
+
+// verify_authenticity_token as the Rust app does it, by headers instead of
+// tokens: an Origin must be this app's, and Sec-Fetch-Site same-origin or
+// same-site, or absent (this is plain HTTP).
+fn same_origin(a: Allocator, req: http.Request) bool {
+    if (@len(req.origin) > 0) {
+        const base = a.concat("http://", req.host)
+        defer a.free(base)
+        if (req.origin != base) {
+            return false
+        }
+    }
+    return @len(req.fetch_site) == 0 or req.fetch_site == "same-origin" or req.fetch_site == "same-site"
+}
+
+// POST /rooms/:id/messages: the message, and a turbo-stream appending it to
+// the room's messages.
+fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const room = try model.room_for(a, ctx.db, user_id, id) orelse {
+        return not_found(c, a, req)
+    }
+    defer room.deinit(a)
+    var has_body = false
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    if (codec.form_value(a, req.body, "message[body]")) |v| {
+        has_body = true
+        a.free(@replace(&body, v))
+    }
+    var client_id: Buf(u8) = .empty
+    defer a.free(client_id)
+    if (codec.form_value(a, req.body, "message[client_message_id]")) |v| {
+        a.free(@replace(&client_id, v))
+    }
+    const message_id = try model.create_message(a, ctx.db, ctx.clock, ctx.rng, room.id, user_id, has_body, body, client_id)
+    const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
+    defer a.free(others)
+    const messages = try model.find_message(a, ctx.db, ctx.sid_key, message_id, others)
+    defer a.free(messages)
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    views.create_stream(a, &out, room, messages)
+    return http.write_response(c, a, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out, req.keep)
 }

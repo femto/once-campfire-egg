@@ -1,0 +1,94 @@
+// What Action Text does to a message body, for bodies of text: assigning a
+// string stores ActionText::Content.new(body, canonicalize: true).to_html,
+// and the search index holds its plain text. A body with tags is stored as
+// it came and its plain text is the text between them; parsing and
+// re-serializing HTML as Nokogiri does is not done yet.
+uses alloc
+
+// The character an entity at s[i..] stands for and its length, of the
+// ones HTML text commonly holds; 0 if none.
+fn entity(s: []u8, i: i64) i64 {
+    const rest = s[i..]
+    if (@len(rest) >= 5 and rest[0..5] == "&amp;") {
+        return 5
+    } else if (@len(rest) >= 4 and (rest[0..4] == "&lt;" or rest[0..4] == "&gt;")) {
+        return 4
+    } else if (@len(rest) >= 6 and rest[0..6] == "&quot;") {
+        return 6
+    } else if (@len(rest) >= 5 and rest[0..5] == "&#39;") {
+        return 5
+    }
+    return 0
+}
+
+fn entity_char(s: []u8, i: i64) u8 {
+    if (s[i + 1] == 'a') {
+        return '&'
+    } else if (s[i + 1] == 'l') {
+        return '<'
+    } else if (s[i + 1] == 'g') {
+        return '>'
+    } else if (s[i + 1] == 'q') {
+        return '"'
+    }
+    return '\''
+}
+
+// The text with its entities decoded, at the end of out.
+fn decode(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    var i = 0
+    while (i < @len(s)) {
+        const n = if (s[i] == '&') entity(s, i) else 0
+        if (n > 0) {
+            a.push(&out, entity_char(s, i))
+            i = i + n
+        } else {
+            a.push(&out, s[i])
+            i = i + 1
+        }
+    }
+}
+
+// The body as Action Text stores it.
+fn canonical(a: Allocator, body: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    for (body) |c| {
+        if (c == '<') {
+            a.free(out)
+            return a.concat(body, "")
+        }
+    }
+    // Text only: parsed (entities decoded) and serialized (& < > escaped).
+    var text: Buf(u8) = .empty
+    defer a.free(text)
+    decode(a, &text, body)
+    for (text) |c| {
+        if (c == '&') {
+            a.append_str(&out, "&amp;")
+        } else if (c == '>') {
+            a.append_str(&out, "&gt;")
+        } else {
+            a.push(&out, c)
+        }
+    }
+    return out
+}
+
+// The stored body's plain text: without tags, entities decoded.
+fn plain_text(a: Allocator, html: []u8) Buf(u8) {
+    var text: Buf(u8) = .empty
+    defer a.free(text)
+    var in_tag = false
+    for (html) |c| {
+        if (c == '<') {
+            in_tag = true
+        } else if (c == '>' and in_tag) {
+            in_tag = false
+        } else if (!in_tag) {
+            a.push(&text, c)
+        }
+    }
+    var out: Buf(u8) = .empty
+    decode(a, &out, text)
+    return out
+}
