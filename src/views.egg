@@ -38,6 +38,60 @@ fn quick_boosts(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
     }
 }
 
+// The first word of a name (name.split(' ')[0]), HTML-escaped.
+fn first_name(a: Allocator, inout out: Buf(u8), name: []u8) void {
+    var start = 0
+    while (start < @len(name) and name[start] == ' ') {
+        start = start + 1
+    }
+    var end = start
+    while (end < @len(name) and name[end] != ' ') {
+        end = end + 1
+    }
+    html.escape(a, &out, name[start..end])
+}
+
+// Each member's initials, from the first three words of the name, as a
+// sentence ("J+K", "J, K, and J").
+fn initials(a: Allocator, inout out: Buf(u8), members: Buf(model.UserView)) void {
+    var i = 0
+    while (i < @len(members)) {
+        if (i > 0) {
+            if (@len(members) == 2) {
+                a.append_str(&out, "+")
+            } else if (i == @len(members) - 1) {
+                a.append_str(&out, ", and ")
+            } else {
+                a.append_str(&out, ", ")
+            }
+        }
+        const name = members[i].name[0..]
+        var words = 0
+        var k = 0
+        while (k < @len(name) and words < 3) {
+            if (name[k] != ' ' and (k == 0 or name[k - 1] == ' ')) {
+                var c = name[k]
+                if (c >= 'a' and c <= 'z') {
+                    c = c - 32
+                }
+                // The first character: a whole UTF-8 sequence.
+                var end = k + 1
+                while (end < @len(name) and name[end] >= 0x80 and name[end] < 0xC0) {
+                    end = end + 1
+                }
+                var one: Buf(u8) = .empty
+                defer a.free(one)
+                a.push(&one, c)
+                a.append_str(&one, name[k + 1..end])
+                html.escape(a, &out, one)
+                words = words + 1
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+}
+
 // boost.html
 fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) void {
     a.append_str(&out, "\n      <div id=\"boost_")
@@ -65,6 +119,29 @@ fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) 
     a.append_str(&out, "/boosts/")
     a.append_int(&out, b.id)
     a.append_str(&out, "\"><input type=\"hidden\" name=\"_method\" value=\"delete\" /><button data-action=\"boost-delete#perform\" data-boost-delete-target=\"button\" class=\"btn btn--negative flex-item-justify-end boost__delete\" type=\"submit\">\n      <img aria-hidden=\"true\" src=\"/assets/minus-b31a1093.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Delete this boost</span>\n</button></form>  </div>\n  <span id=\"delete_boost_accessible_label\" class=\"for-screen-reader\">Press enter to delete this boost</span>")
+}
+
+// layout_bottom.html
+fn layout_bottom(a: Allocator, inout out: Buf(u8)) void {
+    a.append_str(&out, "    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n")
+}
+
+// layout_top.html
+fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8) void {
+    a.append_str(&out, "<!DOCTYPE html>\n<html>\n  <head>\n    <title>")
+    html.escape(a, &out, title)
+    a.append_str(&out, "</title>\n\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content\">\n    <meta name=\"view-transition\" content=\"same-origin\">\n    <meta name=\"color-scheme\" content=\"light dark\">\n    <meta name=\"theme-color\" content=\"#ffffff\" media=\"(prefers-color-scheme: light)\">\n    <meta name=\"theme-color\" content=\"#000000\" media=\"(prefers-color-scheme: dark)\">\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n    <meta name=\"current-user-id\" content=\"")
+    a.append_int(&out, user.id)
+    a.append_str(&out, "\" /><meta name=\"current-user-name\" content=\"")
+    html.escape(a, &out, user.name)
+    a.append_str(&out, "\" />\n    <meta name=\"action-cable-url\" content=\"/cable\">\n\n    <meta name=\"vapid-public-key\" content=\"")
+    html.escape(a, &out, vapid)
+    a.append_str(&out, "\">\n    <meta name=\"turbo-prefetch\" content=\"true\">\n\n    <link rel=\"manifest\" href=\"/webmanifest.json\">\n    <link rel=\"icon\" href=\"/account/logo?v=")
+    a.append_str(&out, logo_v)
+    a.append_str(&out, "\" type=\"image/png\">\n    <link rel=\"apple-touch-icon\" href=\"/account/logo?v=")
+    a.append_str(&out, logo_v)
+    a.append_str(&out, "\">\n\n    ")
+    a.append_str(&out, static_head.ASSETS)
 }
 
 // message.html
@@ -175,20 +252,7 @@ fn quick_boost(a: Allocator, inout out: Buf(u8), m: model.MessageView, ch: []u8,
 
 // room.html
 fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8) void {
-    a.append_str(&out, "<!DOCTYPE html>\n<html>\n  <head>\n    <title>")
-    html.escape(a, &out, room.name)
-    a.append_str(&out, "</title>\n\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content\">\n    <meta name=\"view-transition\" content=\"same-origin\">\n    <meta name=\"color-scheme\" content=\"light dark\">\n    <meta name=\"theme-color\" content=\"#ffffff\" media=\"(prefers-color-scheme: light)\">\n    <meta name=\"theme-color\" content=\"#000000\" media=\"(prefers-color-scheme: dark)\">\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n    <meta name=\"current-user-id\" content=\"")
-    a.append_int(&out, user.id)
-    a.append_str(&out, "\" /><meta name=\"current-user-name\" content=\"")
-    html.escape(a, &out, user.name)
-    a.append_str(&out, "\" />\n    <meta name=\"action-cable-url\" content=\"/cable\">\n\n    <meta name=\"vapid-public-key\" content=\"")
-    html.escape(a, &out, vapid)
-    a.append_str(&out, "\">\n    <meta name=\"turbo-prefetch\" content=\"true\">\n\n    <link rel=\"manifest\" href=\"/webmanifest.json\">\n    <link rel=\"icon\" href=\"/account/logo?v=")
-    a.append_str(&out, logo_v)
-    a.append_str(&out, "\" type=\"image/png\">\n    <link rel=\"apple-touch-icon\" href=\"/account/logo?v=")
-    a.append_str(&out, logo_v)
-    a.append_str(&out, "\">\n\n    ")
-    a.append_str(&out, static_head.ASSETS)
+    layout_top(a, &out, room.name, user, vapid, logo_v)
     a.append_str(&out, "\n\n\n  <meta name=\"turbo-cache-control\" content=\"no-preview\">\n  <meta name=\"current-room-id\" content=\"")
     a.append_int(&out, room.id)
     a.append_str(&out, "\">  </head>\n\n  <body class=\"sidebar")
@@ -266,5 +330,118 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     a.append_str(&out, base)
     a.append_str(&out, "/rails/active_storage/blobs/redirect/:signed_id/:filename\" id=\"message_body\" input=\"message_body_trix_input_message\" name=\"message[body]\">\n                    <lexxy-prompt trigger=\"@\" name=\"mention\" src=\"/autocompletable/users?room_id=")
     a.append_int(&out, room.id)
-    a.append_str(&out, "\" remote-filtering=\"true\" empty-results=\"No matches\"></lexxy-prompt>\n</lexxy-editor>                </div>\n\n                <label class=\"btn btn--borderless txt-small flex-item-no-shrink composer__attachment-btn input--file\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/attachment-8bcccab0.svg\" width=\"22\" height=\"22\" />\n                  <input type=\"file\" data-action=\"composer#filePicked\" multiple />\n                  <span class=\"for-screen-reader\">Attach a file</span>\n                </label>\n\n                <button class=\"btn btn--borderless txt-small flex-item-no-shrink composer__rich-text-btn\" type=\"button\" data-action=\"composer#toggleToolbar\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/text-options-055e0d16.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Rich text</span>\n                </button>\n\n                <button name=\"send\" type=\"submit\" data-action=\"composer#submit\" class=\"btn btn--reversed flex-item-no-shrink txt-small\">\n                  <img aria-hidden=\"true\" src=\"/assets/arrow-up-f96b3895.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Send Message</span>\n</button>              </div>\n            </div>\n          </div>\n        </fieldset>\n\n        <div class=\"typing-indicator gap txt-small align-center flex-inline\" data-typing-notifications-target=\"indicator\">\n          <div class=\"typing-indicator__author spinner\" data-typing-notifications-target=\"author\"></div>\n        </div>\n\n        <input data-composer-target=\"clientid\" type=\"hidden\" name=\"message[client_message_id]\" id=\"message_client_message_id\" />\n</form>    </turbo-frame>\n  </div>      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n<turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload\" id=\"user_sidebar\" src=\"/users/me/sidebar\" target=\"_top\"></turbo-frame>    </aside>\n\n    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n")
+    a.append_str(&out, "\" remote-filtering=\"true\" empty-results=\"No matches\"></lexxy-prompt>\n</lexxy-editor>                </div>\n\n                <label class=\"btn btn--borderless txt-small flex-item-no-shrink composer__attachment-btn input--file\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/attachment-8bcccab0.svg\" width=\"22\" height=\"22\" />\n                  <input type=\"file\" data-action=\"composer#filePicked\" multiple />\n                  <span class=\"for-screen-reader\">Attach a file</span>\n                </label>\n\n                <button class=\"btn btn--borderless txt-small flex-item-no-shrink composer__rich-text-btn\" type=\"button\" data-action=\"composer#toggleToolbar\">\n                  <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/text-options-055e0d16.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Rich text</span>\n                </button>\n\n                <button name=\"send\" type=\"submit\" data-action=\"composer#submit\" class=\"btn btn--reversed flex-item-no-shrink txt-small\">\n                  <img aria-hidden=\"true\" src=\"/assets/arrow-up-f96b3895.svg\" width=\"20\" height=\"20\" />\n                  <span class=\"for-screen-reader\">Send Message</span>\n</button>              </div>\n            </div>\n          </div>\n        </fieldset>\n\n        <div class=\"typing-indicator gap txt-small align-center flex-inline\" data-typing-notifications-target=\"indicator\">\n          <div class=\"typing-indicator__author spinner\" data-typing-notifications-target=\"author\"></div>\n        </div>\n\n        <input data-composer-target=\"clientid\" type=\"hidden\" name=\"message[client_message_id]\" id=\"message_client_message_id\" />\n</form>    </turbo-frame>\n  </div>      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n<turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload\" id=\"user_sidebar\" src=\"/users/me/sidebar\" target=\"_top\"></turbo-frame>    </aside>\n\n")
+    layout_bottom(a, &out)
+}
+
+// sidebar.html
+fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) void {
+    layout_top(a, &out, "Campfire", user, vapid, logo_v)
+    a.append_str(&out, "\n\n  </head>\n\n  <body class=\"")
+    if (admin) {
+    a.append_str(&out, "admin")
+    }
+    a.append_str(&out, "\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n    </nav>\n\n\n    <main id=\"main-content\">\n<turbo-frame data-turbo-permanent=\"true\" data-controller=\"rooms-list read-rooms turbo-frame\" data-rooms-list-unread-class=\"unread\" data-action=\"presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload\" id=\"user_sidebar\" target=\"_top\">\n  <turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
+    a.append_str(&out, rooms_stream)
+    a.append_str(&out, "\"></turbo-cable-stream-source>\n  <turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\"")
+    a.append_str(&out, user_stream)
+    a.append_str(&out, "\"></turbo-cable-stream-source>\n\n  <div class=\"sidebar__container overflow-y overflow-hide-scrollbar\"\n      data-controller=\"badge-dot\"\n      data-badge-dot-unread-class=\"unread\"\n      data-action=\"rooms-list:unread@window->badge-dot#update rooms-list:read@window->badge-dot#update turbo:submit-start->turbo-frame#unpermanize\">\n    <turbo-frame id=\"direct_rooms_control\" target=\"_top\">\n      <div class=\"directs gap overflow-x overflow-hide-scrollbar\">\n        <a class=\"direct direct__new\" data-turbo-frame=\"_self\" href=\"/rooms/directs/new\">\n          <span class=\"avatar avatar--icon\">\n            <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/messages-add-d229e6c2.svg\" width=\"20\" height=\"20\" />\n          </span>\n\n          <span class=\"direct__author flex max-width min-width border-radius pad-inline-half\">\n            <span class=\"for-screen-reader\">New</span>\n            <span class=\"txt-small overflow-clip\">Ping</span>\n          </span>\n</a>\n        <div id=\"direct_rooms\" contents data-controller=\"sorted-list\" data-action=\"rooms-list:unread@window->sorted-list#updateItem\">\n          ")
+    for (sb.directs) |d| {
+    sidebar_direct(a, &out, d)
+    }
+    a.append_str(&out, "        </div>\n\n        <div contents>\n          ")
+    for (sb.placeholders) |u| {
+    sidebar_placeholder(a, &out, u)
+    }
+    a.append_str(&out, "        </div>\n      </div>\n    </turbo-frame>\n\n    <div class=\"rooms position-relative flex flex-column gap\">\n      <div id=\"shared_rooms\" contents data-controller=\"sorted-list\">\n")
+    for (sb.rooms) |r| {
+    sidebar_room(a, &out, r)
+    }
+    a.append_str(&out, "      </div>\n\n")
+    if (can_create_rooms) {
+    a.append_str(&out, "        <a class=\"rooms__new-btn btn room align-center gap txt-reversed\" aria-label=\"New Chat Room\" href=\"/rooms/opens/new\">\n          <img aria-hidden=\"true\" style=\"view-transition-name: new-room\" src=\"/assets/add-f232d8a6.svg\" width=\"20\" height=\"20\" />\n</a>")
+    }
+    a.append_str(&out, "    </div>\n\n    <button class=\"btn sidebar__toggle\" data-action=\"toggle-class#toggle\">\n      <img aria-hidden=\"true\" src=\"/assets/menu-5462dfd3.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Open menu</span>\n    </button>\n  </div>\n\n  <div class=\"flex align-end sidebar__tools gap justify-end\">\n    <a class=\"btn avatar flex-item-no-shrink sidebar__tool\" href=\"/users/me/profile\">\n      <img aria-hidden=\"true\" style=\"view-transition-name: avatar-")
+    a.append_int(&out, user.id)
+    a.append_str(&out, "\" src=\"")
+    html.escape(a, &out, user.avatar)
+    a.append_str(&out, "\" width=\"48\" height=\"48\" />\n      <span class=\"for-screen-reader\">My Settings</span>\n</a>\n    <a class=\"btn align-center gap txt-reversed sidebar__tool\" href=\"/account/edit\">\n      <img aria-hidden=\"true\" style=\"view-transition-name: account-settings\" src=\"/assets/settings-aee56972.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Account Settings</span>\n</a>  </div>\n</turbo-frame>\n      <footer id=\"footer\">\n      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n    </aside>\n\n")
+    layout_bottom(a, &out)
+}
+
+// sidebar_direct.html
+fn sidebar_direct(a: Allocator, inout out: Buf(u8), d: model.SidebarDirect) void {
+    a.append_str(&out, "\n  <a class=\"direct")
+    if (d.unread) {
+    a.append_str(&out, " unread")
+    }
+    a.append_str(&out, "\" id=\"list_rooms_direct_")
+    a.append_int(&out, d.room_id)
+    a.append_str(&out, "\" data-rooms-list-target=\"room\" data-room-id=\"")
+    a.append_int(&out, d.room_id)
+    a.append_str(&out, "\" data-badge-dot-target=\"unread\" data-sorted-list-target=\"item\" data-sorted-list-number=\"")
+    a.append_int(&out, tf.epoch_ms(d.updated_ns))
+    a.append_str(&out, "\" href=\"/rooms/")
+    a.append_int(&out, d.room_id)
+    a.append_str(&out, "\">\n")
+    if (@len(d.members) > 1) {
+    a.append_str(&out, "      <div class=\"avatar__group\">\n")
+    var shown = 0
+    for (d.members) |m| {
+    if (shown < 4) {
+    a.append_str(&out, "          <span class=\"avatar\">\n            <img aria-hidden=\"true\" src=\"")
+    html.escape(a, &out, m.avatar)
+    a.append_str(&out, "\" width=\"20\" height=\"20\" />\n          </span>\n")
+    }
+    shown = shown + 1
+    }
+    a.append_str(&out, "      </div>\n")
+    } else {
+    a.append_str(&out, "      <span class=\"avatar\">\n        <img aria-hidden=\"true\" src=\"")
+    html.escape(a, &out, d.members[0].avatar)
+    a.append_str(&out, "\" width=\"48\" height=\"48\" />\n      </span>\n")
+    }
+    a.append_str(&out, "\n    <span class=\"direct__author flex align-center gap max-width min-width border-radius txt-small\">\n      <span class=\"txt-nowrap overflow-ellipsis\">\n        <span class=\"for-screen-reader\">Ping with</span>\n")
+    if (@len(d.members) > 1) {
+    a.append_str(&out, "          ")
+    initials(a, &out, d.members)
+    a.append_str(&out, "\n")
+    } else {
+    a.append_str(&out, "          ")
+    first_name(a, &out, d.members[0].name)
+    a.append_str(&out, "\n")
+    }
+    a.append_str(&out, "      </span>\n    </span>\n</a>")
+}
+
+// sidebar_placeholder.html
+fn sidebar_placeholder(a: Allocator, inout out: Buf(u8), u: model.UserView) void {
+    a.append_str(&out, "<form class=\"button_to\" method=\"post\" action=\"/rooms/directs?user_ids%5B%5D=")
+    a.append_int(&out, u.id)
+    a.append_str(&out, "\"><button class=\"direct borderless fill-transparent unpad\" type=\"submit\">\n  <span class=\"avatar\">\n    <img aria-hidden=\"true\" src=\"")
+    html.escape(a, &out, u.avatar)
+    a.append_str(&out, "\" />\n  </span>\n\n  <span class=\"direct__author flex align-center gap max-width min-width border-radius txt-small\">\n    <span class=\"txt-nowrap overflow-ellipsis\">\n      <span class=\"for-screen-reader\">Start a ping with</span>\n      ")
+    first_name(a, &out, u.name)
+    a.append_str(&out, "\n    </span>\n  </span>\n</button></form>")
+}
+
+// sidebar_room.html
+fn sidebar_room(a: Allocator, inout out: Buf(u8), r: model.SidebarRoom) void {
+    a.append_str(&out, "          <a id=\"list_rooms_")
+    a.append_str(&out, r.kind)
+    a.append_str(&out, "_")
+    a.append_int(&out, r.id)
+    a.append_str(&out, "\" data-rooms-list-target=\"room\" data-room-id=\"")
+    a.append_int(&out, r.id)
+    a.append_str(&out, "\" data-badge-dot-target=\"unread\" data-sorted-list-target=\"item\" data-sorted-list-name=\"")
+    html.escape(a, &out, r.name)
+    a.append_str(&out, "\" style=\"--column-gap: 0.5em\" class=\"align-center gap room btn txt-nowrap")
+    if (r.unread) {
+    a.append_str(&out, " unread")
+    }
+    a.append_str(&out, "\" href=\"/rooms/")
+    a.append_int(&out, r.id)
+    a.append_str(&out, "\">\n  <span class=\"overflow-ellipsis\">")
+    html.escape(a, &out, r.name)
+    a.append_str(&out, "</span>\n</a>")
 }

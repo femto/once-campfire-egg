@@ -14,25 +14,37 @@ fn key(a: Allocator, secret_key_base: []u8) Buf(u8) {
     return crypto.derive_key(a, secret_key_base, SALT, 64)
 }
 
-// The signed name of the stream "<the room's GlobalID param>:messages", at
-// the end of out. class is the room's type: "Rooms::Closed" and the rest.
-fn room_messages(a: Allocator, inout out: Buf(u8), k: []u8, class: []u8, room: i64) void {
-    var gid: Buf(u8) = .empty
-    defer a.free(gid)
-    a.append_str(&gid, "gid://campfire/")
-    a.append_str(&gid, class)
-    a.append_str(&gid, "/")
-    a.append_int(&gid, room)
-    // A GlobalID param and ":messages" hold nothing JSON escapes.
-    var name: Buf(u8) = .empty
-    defer a.free(name)
-    a.append_str(&name, "\"")
-    codec.base64url_encode(a, &name, gid)
-    a.append_str(&name, ":messages\"")
+// The GlobalID param of a record: URL-safe Base64 of
+// "gid://campfire/<class>/<id>", at the end of out.
+fn gid(a: Allocator, inout out: Buf(u8), class: []u8, id: i64) void {
+    var g: Buf(u8) = .empty
+    defer a.free(g)
+    a.append_str(&g, "gid://campfire/")
+    a.append_str(&g, class)
+    a.append_str(&g, "/")
+    a.append_int(&g, id)
+    codec.base64url_encode(a, &out, g)
+}
+
+// The signed form of the stream name, at the end of out. The name must need
+// no JSON escaping, as GlobalID params and ":rooms" do not.
+fn sign(a: Allocator, inout out: Buf(u8), k: []u8, name: []u8) void {
+    const json = a.concat("\"", name, "\"")
+    defer a.free(json)
     const start = @len(out)
-    codec.base64_encode(a, &out, name)
+    codec.base64_encode(a, &out, json)
     const mac = crypto.hmac_sha256(a, k, out[start..])
     defer a.free(mac)
     a.append_str(&out, "--")
     codec.hex_encode(a, &out, mac)
+}
+
+// turbo_stream_from record, :suffix: the record's GlobalID param, ":", suffix.
+fn record_stream(a: Allocator, inout out: Buf(u8), k: []u8, class: []u8, id: i64, suffix: str) void {
+    var name: Buf(u8) = .empty
+    defer a.free(name)
+    gid(a, &name, class, id)
+    a.append_str(&name, ":")
+    a.append_str(&name, suffix)
+    sign(a, &out, k, name)
 }

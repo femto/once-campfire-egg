@@ -208,3 +208,163 @@ fn in_room(db: sqlite.Db, room: i64, message: i64) !bool {
     try st.bind_int(2, room)
     return try st.next()
 }
+
+// A direct room in the sidebar: its members but the user (or the user, if
+// alone), newest room first.
+const SidebarDirect = owned struct {
+    room_id: i64
+    unread: bool
+    updated_ns: i64
+    members: Buf(UserView)
+
+    fn deinit(sink self: SidebarDirect, a: Allocator) void {
+        a.free(self.members)
+        @forget(self)
+    }
+}
+
+// An open or closed room in the sidebar.
+const SidebarRoom = owned struct {
+    id: i64
+    // "open" or "closed"
+    kind: Buf(u8)
+    name: Buf(u8)
+    unread: bool
+
+    fn deinit(sink self: SidebarRoom, a: Allocator) void {
+        a.free(self.kind)
+        a.free(self.name)
+        @forget(self)
+    }
+}
+
+const Sidebar = owned struct {
+    directs: Buf(SidebarDirect)
+    rooms: Buf(SidebarRoom)
+    // Users to start a direct room with.
+    placeholders: Buf(UserView)
+
+    fn deinit(sink self: Sidebar, a: Allocator) void {
+        a.free(self.directs)
+        a.free(self.rooms)
+        a.free(self.placeholders)
+        @forget(self)
+    }
+}
+
+const DIRECT_PLACEHOLDERS = 20
+
+// The user's visible rooms, as Users::SidebarsController#show finds them.
+fn sidebar(a: Allocator, db: sqlite.Db, sid_key: []u8, user: i64) !Sidebar {
+    var directs: Buf(SidebarDirect) = .empty
+    errdefer a.free(directs)
+    var rooms: Buf(SidebarRoom) = .empty
+    errdefer a.free(rooms)
+    var st = try db.prepare("SELECT memberships.unread_at IS NOT NULL, rooms.id, rooms.name, rooms.type, rooms.updated_at FROM memberships INNER JOIN rooms ON rooms.id = memberships.room_id WHERE memberships.user_id = ? AND memberships.involvement != 'invisible' ORDER BY LOWER(rooms.name)")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    while (try st.next()) {
+        const kind = st.text(a, 3)
+        defer a.free(kind)
+        if (kind == "Rooms::Direct") {
+            a.push(&directs, SidebarDirect{ .room_id = st.int(1), .unread = st.int(0) != 0, .updated_ns = ns_column(a, st, 4), .members = .empty })
+        } else {
+            const short = if (kind == "Rooms::Closed") a.concat("closed", "") else a.concat("open", "")
+            a.push(&rooms, SidebarRoom{ .id = st.int(1), .kind = short, .name = if (st.is_null(2)) a.concat("", "") else st.text(a, 2), .unread = st.int(0) != 0 })
+        }
+    }
+    // sort_by updated_at, then reverse: stable, so rooms updated together
+    // come out in the reverse of the name order.
+    var i = 1
+    while (i < @len(directs)) {
+        var k = i
+        while (k > 0 and directs[k - 1].updated_ns > directs[k].updated_ns) {
+            @swap(&directs, k - 1, k)
+            k = k - 1
+        }
+        i = i + 1
+    }
+    var lo = 0
+    var hi = @len(directs) - 1
+    while (lo < hi) {
+        @swap(&directs, lo, hi)
+        lo = lo + 1
+        hi = hi - 1
+    }
+    var m = 0
+    while (m < @len(directs)) {
+        try add_members(a, db, sid_key, user, &directs[m])
+        m = m + 1
+    }
+    const placeholders = try direct_placeholders(a, db, sid_key, user)
+    return Sidebar{ .directs = directs, .rooms = rooms, .placeholders = placeholders }
+}
+
+// room.users.without(user).presence || [ user ], in the order SQLite gives.
+fn add_members(a: Allocator, db: sqlite.Db, sid_key: []u8, user: i64, inout d: SidebarDirect) !void {
+    var st = try db.prepare("SELECT users.id, users.name, users.bio, users.updated_at FROM users INNER JOIN memberships ON users.id = memberships.user_id WHERE memberships.room_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, d.room_id)
+    while (try st.next()) {
+        if (st.int(0) != user) {
+            a.push(&d.members, user_from(a, st, 0, sid_key))
+        }
+    }
+    if (@len(d.members) == 0) {
+        if (try find_user(a, db, sid_key, user)) |u| {
+            a.push(&d.members, u)
+        }
+    }
+}
+
+// find_direct_placeholder_users: active users in no direct room with the
+// user, oldest first, DIRECT_PLACEHOLDERS less those left out (the user
+// counted twice, as Rails' `including` does).
+fn direct_placeholders(a: Allocator, db: sqlite.Db, sid_key: []u8, user: i64) !Buf(UserView) {
+    var exclude: Buf(i64) = .empty
+    defer a.free(exclude)
+    var st = try db.prepare("SELECT DISTINCT m2.user_id FROM memberships m1 JOIN rooms r ON r.id = m1.room_id AND r.type = 'Rooms::Direct' JOIN memberships m2 ON m2.room_id = r.id WHERE m1.user_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    while (try st.next()) {
+        a.push(&exclude, st.int(0))
+    }
+    a.push(&exclude, user)
+    var out: Buf(UserView) = .empty
+    errdefer a.free(out)
+    const limit = DIRECT_PLACEHOLDERS - @len(exclude)
+    if (limit <= 0) {
+        return out
+    }
+    var sql: Buf(u8) = .empty
+    defer a.free(sql)
+    a.append_str(&sql, "SELECT id, name, bio, updated_at FROM users WHERE status = 0 AND id NOT IN (")
+    var i = 0
+    while (i < @len(exclude)) {
+        if (i > 0) {
+            a.append_str(&sql, ",")
+        }
+        a.append_int(&sql, exclude[i])
+        i = i + 1
+    }
+    a.append_str(&sql, ") ORDER BY created_at ASC LIMIT ")
+    a.append_int(&sql, limit)
+    var us = try db.prepare_text(sql)
+    defer us.finalize()
+    while (try us.next()) {
+        a.push(&out, user_from(a, us, 0, sid_key))
+    }
+    return out
+}
+
+// Whether the account lets only administrators create rooms.
+fn rooms_restricted(a: Allocator, db: sqlite.Db) !bool {
+    var st = try db.prepare("SELECT settings FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (!try st.next() or st.is_null(0)) {
+        return false
+    }
+    const settings = st.text(a, 0)
+    defer a.free(settings)
+    return text.contains(settings, "\"restrict_room_creation_to_administrators\":true")
+}

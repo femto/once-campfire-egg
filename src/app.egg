@@ -12,6 +12,7 @@ const signed_id = @import("signed_id.egg")
 const turbo = @import("turbo.egg")
 const tf = @import("timefmt.egg")
 const text = @import("std/text")
+const public_pages = @import("public_pages.egg")
 
 const Context = owned struct {
     db: sqlite.Db
@@ -61,6 +62,9 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
     }
+    if (req.method == "GET" and req.path == "/users/me/sidebar") {
+        return sidebar_page(c, a, &ctx, req)
+    }
     if (req.method == "GET" and text.starts_with(req.path, "/rooms/")) {
         const rest = req.path[@len("/rooms/")..]
         if (text.parse_int(rest)) |room| {
@@ -76,7 +80,18 @@ fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void
 }
 
 fn not_found(c: TcpConn, a: Allocator, req: http.Request) !void {
-    return http.write_response(c, a, "404 Not Found", HTML, "Not found", req.keep)
+    return http.write_response(c, a, "404 Not Found", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.NOT_FOUND, req.keep)
+}
+
+// A room the user cannot see: back to the start, as the Rust app does.
+fn to_root(c: TcpConn, a: Allocator, req: http.Request) !void {
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: http://")
+    a.append_str(&headers, req.host)
+    a.append_str(&headers, "/\r\n")
+    a.append_str(&headers, HTML)
+    return http.write_response(c, a, "302 Found", headers, "", req.keep)
 }
 
 fn to_sign_in(c: TcpConn, a: Allocator, req: http.Request) !void {
@@ -108,7 +123,7 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
         return to_sign_in(c, a, req)
     }
     const room = try model.room_for(a, ctx.db, user_id, id) orelse {
-        return not_found(c, a, req)
+        return to_root(c, a, req)
     }
     defer room.deinit(a)
     const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
@@ -128,7 +143,7 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     a.append_str(&class, room.kind[1..])
     var stream: Buf(u8) = .empty
     defer a.free(stream)
-    turbo.room_messages(a, &stream, ctx.stream_key, class, room.id)
+    turbo.record_stream(a, &stream, ctx.stream_key, class, room.id, "messages")
     const base = a.concat("http://", req.host)
     defer a.free(base)
     var body: Buf(u8) = .empty
@@ -181,5 +196,33 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.messages_index(a, &body, messages, room.name)
+    return http.write_response(c, a, "200 OK", HTML, body, req.keep)
+}
+
+// GET /users/me/sidebar: the room list, as a whole page.
+fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    const sb = try model.sidebar(a, ctx.db, ctx.sid_key, user_id)
+    defer sb.deinit(a)
+    const admin = try administrator(ctx.db, user_id)
+    const can_create = admin or !try model.rooms_restricted(a, ctx.db)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var rooms_stream: Buf(u8) = .empty
+    defer a.free(rooms_stream)
+    turbo.sign(a, &rooms_stream, ctx.stream_key, "rooms")
+    var user_stream: Buf(u8) = .empty
+    defer a.free(user_stream)
+    turbo.record_stream(a, &user_stream, ctx.stream_key, "User", user_id, "rooms")
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
     return http.write_response(c, a, "200 OK", HTML, body, req.keep)
 }

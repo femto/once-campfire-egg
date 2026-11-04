@@ -1,0 +1,23 @@
+<%fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8) %>
+<!DOCTYPE html>
+<html>
+  <head>
+    <title><%= title %></title>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content">
+    <meta name="view-transition" content="same-origin">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="current-user-id" content="<%d user.id %>" /><meta name="current-user-name" content="<%= user.name %>" />
+    <meta name="action-cable-url" content="/cable">
+
+    <meta name="vapid-public-key" content="<%= vapid %>">
+    <meta name="turbo-prefetch" content="true">
+
+    <link rel="manifest" href="/webmanifest.json">
+    <link rel="icon" href="/account/logo?v=<%- logo_v %>" type="image/png">
+    <link rel="apple-touch-icon" href="/account/logo?v=<%- logo_v %>">
+
+    <%- static_head.ASSETS %>

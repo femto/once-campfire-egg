@@ -1,0 +1,4 @@
+<%fn sidebar_room(a: Allocator, inout out: Buf(u8), r: model.SidebarRoom) %>
+          <a id="list_rooms_<%- r.kind %>_<%d r.id %>" data-rooms-list-target="room" data-room-id="<%d r.id %>" data-badge-dot-target="unread" data-sorted-list-target="item" data-sorted-list-name="<%= r.name %>" style="--column-gap: 0.5em" class="align-center gap room btn txt-nowrap<% if (r.unread) { %> unread<% } %>" href="/rooms/<%d r.id %>">
+  <span class="overflow-ellipsis"><%= r.name %></span>
+</a>

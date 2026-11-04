@@ -36,3 +36,57 @@ fn quick_boosts(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
         at = bar + 1
     }
 }
+
+// The first word of a name (name.split(' ')[0]), HTML-escaped.
+fn first_name(a: Allocator, inout out: Buf(u8), name: []u8) void {
+    var start = 0
+    while (start < @len(name) and name[start] == ' ') {
+        start = start + 1
+    }
+    var end = start
+    while (end < @len(name) and name[end] != ' ') {
+        end = end + 1
+    }
+    html.escape(a, &out, name[start..end])
+}
+
+// Each member's initials, from the first three words of the name, as a
+// sentence ("J+K", "J, K, and J").
+fn initials(a: Allocator, inout out: Buf(u8), members: Buf(model.UserView)) void {
+    var i = 0
+    while (i < @len(members)) {
+        if (i > 0) {
+            if (@len(members) == 2) {
+                a.append_str(&out, "+")
+            } else if (i == @len(members) - 1) {
+                a.append_str(&out, ", and ")
+            } else {
+                a.append_str(&out, ", ")
+            }
+        }
+        const name = members[i].name[0..]
+        var words = 0
+        var k = 0
+        while (k < @len(name) and words < 3) {
+            if (name[k] != ' ' and (k == 0 or name[k - 1] == ' ')) {
+                var c = name[k]
+                if (c >= 'a' and c <= 'z') {
+                    c = c - 32
+                }
+                // The first character: a whole UTF-8 sequence.
+                var end = k + 1
+                while (end < @len(name) and name[end] >= 0x80 and name[end] < 0xC0) {
+                    end = end + 1
+                }
+                var one: Buf(u8) = .empty
+                defer a.free(one)
+                a.push(&one, c)
+                a.append_str(&one, name[k + 1..end])
+                html.escape(a, &out, one)
+                words = words + 1
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+}

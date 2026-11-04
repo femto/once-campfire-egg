@@ -10,6 +10,7 @@
 #   <%- expr %>   text, as it is (already HTML)
 #   <%d expr %>   an integer
 #   <% code %>    Egg statements: if/for/while lines, calls, consts
+#   <%: code %>   the same, but its line is kept even when the tag is alone on it
 # A line holding only a <% code %> tag adds no text: neither the tag's
 # indentation nor its line ending. templates/_head.egg goes first: the
 # module's uses line and imports.
@@ -30,9 +31,9 @@ def compile(path)
     pending = +""
   end
   # Code-only lines vanish entirely.
-  body = body.gsub(/^[ \t]*(<%[^=\-d#].*?%>)[ \t]*\n/) { $1 }
+  body = body.gsub(/^[ \t]*(<%[^=\-d#:].*?%>)[ \t]*\n/) { $1 }
   pos = 0
-  body.scan(/<%([=\-d#]?)(.*?)%>/m) do
+  body.scan(/<%([=\-d#:]?)(.*?)%>/m) do
     m = Regexp.last_match
     pending << body[pos...m.begin(0)]
     pos = m.end(0)

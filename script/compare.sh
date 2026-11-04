@@ -11,14 +11,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 password=$(grep ^VERIFICATION_PASSWORD= "$storage/reference.env" | cut -d= -f2-)
 label() { ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0])).fetch(ARGV[1])' "$storage/labels.json" "$1"; }
-email=$(label emails.david)
+email=$(label "emails.${CAMPFIRE_USER:-david}")
 for side in egg rust; do
   eval base=\$$side
   curl -s -H 'User-Agent:' -c "$tmp/$side.jar" -o /dev/null --data-urlencode "email_address=$email" --data-urlencode "password=$password" "$base/session"
 done
 room=$(label rooms.watercooler)
 status=0
-for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)"; do
+for path in "/rooms/$room" "/rooms/$room/messages?before=$(label messages.busy_060)" "/rooms/$room/messages" "/rooms/$(label rooms.hq)" /users/me/sidebar; do
   curl -s -H 'User-Agent:' -b "$tmp/egg.jar" "$egg$path" | sed "s#$egg#$rust#g" > "$tmp/egg.html"
   curl -s -H 'User-Agent:' -b "$tmp/rust.jar" "$rust$path" > "$tmp/rust.html"
   if cmp -s "$tmp/egg.html" "$tmp/rust.html"; then
