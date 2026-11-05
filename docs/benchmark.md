@@ -41,6 +41,38 @@ Median requests/second over 2 rounds:
 | /up | 16177 | 112253 | 111849 |
 | post a message | 1818 | 1963 | 1771 |
 
+## Local: OrbStack Linux VM, 4 + 4 cores
+
+2026-11-04, commit `b7c7d16` (before src/filecache.egg, so Egg still read
+and gzipped the CSS and read the avatar on every request), `~/bench/run.sh`
+in an OrbStack Ubuntu machine on an Intel i7-9700K (8 cores, 2018) Mac: the
+apps on CPUs 0-3, the load generator on 4-7, as the published comparison
+splits its cores, with host networking inside the VM. macOS cannot reserve
+the cores, so other work on the Mac shares them: rounds differ by up to
+about 20%.
+
+Median requests/second over 3 rounds:
+
+| route | Rust | Egg | Egg, cached |
+| --- | ---: | ---: | ---: |
+| room page | 13121 | 1410 | 59800 |
+| messages page | 12075 | 1864 | 59695 |
+| sidebar | 14627 | 7704 | 64253 |
+| search | 13758 | 3518 | 56033 |
+| avatar | 44806 | 60067 | 63582 |
+| static CSS | 56112 | 63956 | 63633 |
+| /up | 23429 | 113103 | 127918 |
+| post a message | 1677 | 1703 | 1519 |
+
+To run it again (in the VM, with this repo, the fork's `egg` branch and
+once-campfire-rust under `~/bench`):
+
+```sh
+cd ~/bench/once-campfire-egg && git pull
+~/bench/run.sh > ~/bench/run.log 2>&1   # APPS, ROUNDS, DURATION to change them
+tail -16 ~/bench/run.log
+```
+
 ## Reading them
 
 - Uncached, Egg renders and gzips every page: the room page is 416 KB of
