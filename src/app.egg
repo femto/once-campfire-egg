@@ -19,6 +19,7 @@ const fragcache = @import("fragcache.egg")
 const splice = @import("splice.egg")
 const ws = @import("ws.egg")
 const cable = @import("cable.egg")
+const json = @import("json.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -54,14 +55,17 @@ const Context = owned struct {
     // The write token: take it, write, hand it back (see main).
     lock_rx: Receiver(bool)
     lock_tx: Sender(bool)
-    // Where a WebSocket goes once signed in (see cable).
+    // Where a WebSocket goes once signed in, and what is broadcast to
+    // them (see cable).
     cable: Sender(cable.Upgrade)
+    hub: Sender(cable.Cmd)
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
         self.lock_rx.close()
         self.lock_tx.close()
         self.cable.close()
+        self.hub.close()
         self.cache.close(a)
         self.files_sent.close(a)
         self.frags.close(a)
@@ -74,11 +78,12 @@ const Context = owned struct {
     }
 }
 
-fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade)) !Context {
+fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade), sink hub_tx: Sender(cable.Cmd)) !Context {
     const db = sqlite.open(a, cfg.db_path) catch |e| {
         lock_rx.close()
         lock_tx.close()
         cable_tx.close()
+        hub_tx.close()
         return e
     }
     const cache = respcache.open(a, cfg.db_path, cfg.cache, cfg.cache and cfg.response_cache) catch |e| {
@@ -86,6 +91,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         lock_rx.close()
         lock_tx.close()
         cable_tx.close()
+        hub_tx.close()
         return e
     }
     const secret = cfg.secret
@@ -107,6 +113,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         .lock_rx = lock_rx,
         .lock_tx = lock_tx,
         .cable = cable_tx,
+        .hub = hub_tx,
     }
 }
 
@@ -761,5 +768,25 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     var out: Buf(u8) = .empty
     defer a.free(out)
     views.create_stream(a, &out, room, messages)
+    // message.broadcast_create: the same turbo-stream, appended for everyone
+    // on the room's messages stream.
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    turbo.gid(a, &stream, room_class(room.kind), room.id)
+    a.append_str(&stream, ":messages")
+    var message: Buf(u8) = .empty
+    defer a.free(message)
+    json.encode_string(a, &message, out)
+    cable.broadcast(a, ctx.hub, stream, message)
     return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
+}
+
+// A room's class, for its GlobalID, from its kind.
+fn room_class(kind: []u8) str {
+    if (kind == "closed") {
+        return "Rooms::Closed"
+    } else if (kind == "direct") {
+        return "Rooms::Direct"
+    }
+    return "Rooms::Open"
 }

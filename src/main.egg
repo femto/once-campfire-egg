@@ -29,9 +29,9 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     }
 }
 
-fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade), io: Io, a: Allocator, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
+fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade), sink hub_tx: Sender(cable.Cmd), io: Io, a: Allocator, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
     defer jobs.close()
-    var ctx = app.open(a, cfg, clock, rng, files, lock_rx, lock_tx, cable_tx) catch |e| {
+    var ctx = app.open(a, cfg, clock, rng, files, lock_rx, lock_tx, cable_tx, hub_tx) catch |e| {
         io.eprint("cannot open ", cfg.db_path, ": ", @errorName(e))
         return
     }
@@ -49,8 +49,12 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
 }
 
 // cable.run, as spawn takes only this file's functions for now.
-fn run_cable(sink ups: Receiver(cable.Upgrade), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
-    cable.run(ups, key, io, a, threads, clock, db_path)
+fn run_cable(sink ups: Receiver(cable.Upgrade), sink to_hub: Sender(cable.Cmd), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
+    cable.run(ups, to_hub, key, io, a, threads, clock, db_path)
+}
+
+fn run_hub(sink cmds: Receiver(cable.Cmd), a: Allocator) void {
+    cable.hub(cmds, a)
 }
 
 fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs) !void {
@@ -95,7 +99,10 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     // threads for each.
     const upgrades = threads.channel(cable.Upgrade, 64)
     const cable_tx = upgrades.sender()
-    threads.spawn(run_cable, upgrades, turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
+    const cmds = threads.channel(cable.Cmd, 1024)
+    const hub_tx = cmds.sender()
+    threads.spawn(run_hub, cmds, a).detach()
+    threads.spawn(run_cable, upgrades, hub_tx.clone(), turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty
@@ -103,13 +110,14 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     defer queue.close()      // first: they finish what is queued, and stop
     var i = 0
     while (i < workers) {
-        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), lock.clone(), lock_tx.clone(), cable_tx.clone(), io, a, clock, rng, files, cfg) })
+        a.push(&pool, Worker{ .t = threads.spawn(work, jobs.clone(), lock.clone(), lock_tx.clone(), cable_tx.clone(), hub_tx.clone(), io, a, clock, rng, files, cfg) })
         i = i + 1
     }
     jobs.close()
     lock.close()
     lock_tx.close()
     cable_tx.close()
+    hub_tx.close()
     while (true) {
         queue.send(try listener.accept())
     }
