@@ -2,6 +2,7 @@
 uses alloc, fs, net, rand, thread, time
 
 const http = @import("http.egg")
+const html = @import("html.egg")
 const sqlite = @import("sqlite.egg")
 const codec = @import("codec.egg")
 const cookie = @import("cookie.egg")
@@ -233,6 +234,11 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
         if (text.ends_with(rest, "/messages")) {
             if (text.parse_int(rest[0..@len(rest) - @len("/messages")])) |room| {
                 return messages_page(c, a, &ctx, req, room)
+            }
+        }
+        if (text.ends_with(rest, "/refresh")) {
+            if (text.parse_int(rest[0..@len(rest) - @len("/refresh")])) |room| {
+                return room_refresh(c, a, &ctx, req, room)
             }
         }
     }
@@ -778,6 +784,83 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     defer a.free(message)
     json.encode_string(a, &message, out)
     cable.broadcast(a, ctx.hub, stream, message)
+    return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
+}
+
+// String#to_i: an optional sign and the digits that follow, else 0; held
+// within what a time in nanoseconds can hold (about 1677 to 2262), which
+// keeps a crafted value from overflowing and finds the same messages.
+fn to_i_ms(s: []u8) i64 {
+    var i = 0
+    while (i < @len(s) and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n')) {
+        i = i + 1
+    }
+    var negative = false
+    if (i < @len(s) and (s[i] == '-' or s[i] == '+')) {
+        negative = s[i] == '-'
+        i = i + 1
+    }
+    const limit = 9000000000000
+    var n = 0
+    while (i < @len(s) and s[i] >= '0' and s[i] <= '9') {
+        if (n < limit) {
+            n = n * 10 + @as(i64, s[i] - '0')
+        }
+        i = i + 1
+    }
+    if (n > limit) {
+        n = limit
+    }
+    return if (negative) -n else n
+}
+
+// GET /rooms/:id/refresh?since=<ms>: what changed in the room since the
+// page loaded (Rooms::RefreshesController), for a page that was away: the
+// messages made since, appended, and those changed since, each replaced.
+fn room_refresh(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const room = try model.room_for(a, ctx.db, user_id, id) orelse {
+        return not_found(c, a, req)
+    }
+    defer room.deinit(a)
+    var since_ms = 0
+    if (codec.form_value(a, req.query, "since")) |v| {
+        since_ms = to_i_ms(v)
+        a.free(v)
+    }
+    var since: Buf(u8) = .empty
+    defer a.free(since)
+    tf.db_time(a, &since, since_ms * 1000000)
+    const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
+    defer a.free(others)
+    const created = try model.page_created_since(a, ctx.db, ctx.sid_key, room.id, since, others)
+    defer a.free(created)
+    const updated = try model.page_updated_since(a, ctx.db, ctx.sid_key, room.id, since, others)
+    defer a.free(updated)
+    // rooms/refreshes/show.turbo_stream.erb, as Erubi renders it.
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    if (@len(created) > 0) {
+        a.append_str(&out, "<turbo-stream action=\"append\" target=\"messages_rooms_")
+        a.append_str(&out, room.kind)
+        a.append_str(&out, "_")
+        a.append_int(&out, room.id)
+        a.append_str(&out, "\"><template>\n  ")
+        for (created) |m| {
+            views.message(a, &out, m)
+        }
+        a.append_str(&out, "\n</template></turbo-stream>")
+    }
+    a.append_str(&out, "\n")
+    for (updated) |m| {
+        a.append_str(&out, "  <turbo-stream action=\"replace\" target=\"message_")
+        html.escape(a, &out, m.client_id)
+        a.append_str(&out, "\"><template>")
+        views.message(a, &out, m)
+        a.append_str(&out, "</template></turbo-stream>\n")
+    }
     return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
 }
 
