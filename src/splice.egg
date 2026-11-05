@@ -1,0 +1,250 @@
+// gzip for pages made mostly of messages, without deflating the whole page
+// on every request (once-campfire-rust's deflater/splice.rs).
+//
+// The page is split into parts: each message's HTML (with the few bytes of
+// text before it, when it follows another message) and the text around
+// them. Each part is deflated once, with the part before it as a preset
+// dictionary, and ends on a sync flush, so the pieces join into one stream:
+// a piece is valid wherever the same part comes right before it. Deflating
+// each part alone would lose what consecutive messages share; chained like
+// this the page is about as small as deflated whole. A request finds its
+// parts' pieces, joins them, and combines their CRCs.
+//
+// A piece is kept per worker with the part's bytes, and found by them and
+// by the piece before it, so a stored piece is used only after exactly the
+// bytes it was deflated against.
+uses alloc
+allow unsafe
+link "z"
+
+extern fn zlibVersion() *u8
+extern fn deflateInit2_(strm: *u64, level: i32, method: i32, window_bits: i32, mem_level: i32, strategy: i32, version: *u8, stream_size: i32) i32
+extern fn deflateReset(strm: *u64) i32
+extern fn deflateSetDictionary(strm: *u64, dictionary: *u8, n: u32) i32
+extern fn deflate(strm: *u64, flush: i32) i32
+extern fn deflateEnd(strm: *u64) i32
+extern fn compressBound(n: u64) u64
+extern fn crc32(crc: u64, buf: *u8, n: u32) u64
+extern fn crc32_combine(crc1: u64, crc2: u64, len2: i64) u64
+
+// Rack::Deflater's level, raw deflate (no zlib header), zlib's defaults.
+const LEVEL: i32 = 6
+const RAW_WINDOW_BITS: i32 = -15
+const MEM_LEVEL: i32 = 8
+const Z_SYNC_FLUSH: i32 = 2
+// z_stream on a 64-bit machine: 112 bytes. Words 0 and 1 are next_in and
+// avail_in, 3 and 4 next_out and avail_out.
+const STREAM_WORDS = 14
+// Deflate's window: a dictionary longer than this is used from its end.
+const WINDOW = 32768
+
+// Smaller messages stay in the text around them.
+const MIN_FRAGMENT = 1024
+// At most this much text between two messages travels with the second.
+const MAX_GLUE = 256
+// What a worker keeps, parts' bytes and pieces together; a larger part is
+// deflated on every request.
+const MAX_BYTES = 8388608
+const MAX_PART = 262144
+
+const Piece = owned struct {
+    // The message's id, or 0 for text.
+    id: i64
+    // This piece's stamp, and the stamp of the piece it was deflated after
+    // (0: at the start of the page).
+    stamp: i64
+    after: i64
+    part: Buf(u8)
+    deflated: Buf(u8)
+    crc: u64
+
+    fn deinit(sink self: Piece, a: Allocator) void {
+        a.free(self.part)
+        a.free(self.deflated)
+        @forget(self)
+    }
+}
+
+const Store = owned struct {
+    on: bool
+    // A raw deflate stream, made once and reset for each part; null until
+    // the first.
+    stream: Buf(u64)
+    ready: bool
+    pieces: Buf(Piece)
+    bytes: i64
+    stamps: i64
+
+    fn close(sink self: Store, a: Allocator) void {
+        if (self.ready) {
+            _ = deflateEnd(@bufPtr(self.stream))
+        }
+        a.free(self.stream)
+        a.free(self.pieces)
+        @forget(self)
+    }
+
+    // The stored piece for part after the piece stamped after; -1 if none.
+    fn find(self: Store, id: i64, after: i64, part: []u8) i64 {
+        var i = 0
+        while (i < @len(self.pieces)) {
+            if (self.pieces[i].id == id and self.pieces[i].after == after and @len(self.pieces[i].part) == @len(part) and self.pieces[i].part == part) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // part as raw deflate with dictionary preset, ending on a sync flush;
+    // null if zlib fails.
+    fn deflate_part(inout self: Store, a: Allocator, dictionary: []u8, part: []u8) ?Buf(u8) {
+        if (!self.ready) {
+            a.free(@replace(&self.stream, a.alloc(STREAM_WORDS, 0)))
+            if (deflateInit2_(@bufPtr(self.stream), LEVEL, 8, RAW_WINDOW_BITS, MEM_LEVEL, 0, zlibVersion(), 112) != 0) {
+                a.free(@replace(&self.stream, .empty))
+                return null
+            }
+            self.ready = true
+        }
+        const s = @bufPtr(self.stream)
+        if (deflateReset(s) != 0) {
+            return null
+        }
+        if (@len(dictionary) > 0) {
+            const from = if (@len(dictionary) > WINDOW) @len(dictionary) - WINDOW else 0
+            if (deflateSetDictionary(s, @strPtr(dictionary[from..]), @as(u32, @len(dictionary) - from)) != 0) {
+                return null
+            }
+        }
+        // Room for the worst case and the flush's empty stored block.
+        const out: Buf(u8) = a.alloc(@as(i64, compressBound(@as(u64, @len(part)))) + 64, 0)
+        @ptrAdd(s, 0).* = @as(u64, @intFromPtr(@strPtr(part)))
+        @ptrAdd(s, 1).* = @as(u64, @len(part))
+        @ptrAdd(s, 3).* = @as(u64, @intFromPtr(@bufPtr(out)))
+        @ptrAdd(s, 4).* = @as(u64, @len(out))
+        const status = deflate(s, Z_SYNC_FLUSH)
+        const left_in = @ptrAdd(s, 1).* & 0xFFFFFFFF
+        const left_out = @as(i64, @ptrAdd(s, 4).* & 0xFFFFFFFF)
+        if (status != 0 or left_in != 0 or left_out == 0) {
+            a.free(out)
+            return null
+        }
+        const n = @len(out) - left_out
+        const fitted = a.concat(out[0..n], "")
+        a.free(out)
+        return fitted
+    }
+
+    // Keep a piece, dropping the oldest past MAX_BYTES; its stamp.
+    fn keep(inout self: Store, a: Allocator, id: i64, after: i64, part: []u8, sink deflated: Buf(u8), crc: u64) i64 {
+        self.stamps = self.stamps + 1
+        const stamp = self.stamps
+        const size = @len(part) + @len(deflated)
+        if (!self.on or @len(part) > MAX_PART) {
+            a.free(deflated)
+            return stamp
+        }
+        while (@len(self.pieces) > 0 and self.bytes + size > MAX_BYTES) {
+            var i = 0
+            while (i + 1 < @len(self.pieces)) {
+                @swap(&self.pieces, i, i + 1)
+                i = i + 1
+            }
+            if (a.pop(&self.pieces)) |old| {
+                self.bytes = self.bytes - @len(old.part) - @len(old.deflated)
+                old.deinit(a)
+            }
+        }
+        self.bytes = self.bytes + size
+        a.push(&self.pieces, Piece{ .id = id, .stamp = stamp, .after = after, .part = a.concat(part, ""), .deflated = deflated, .crc = crc })
+        return stamp
+    }
+}
+
+fn open(on: bool) Store {
+    return Store{ .on = on, .stream = .empty, .ready = false, .pieces = .empty, .bytes = 0, .stamps = 0 }
+}
+
+fn push_le32(a: Allocator, inout out: Buf(u8), v: u64) void {
+    a.push(&out, @as(u8, v & 0xFF))
+    a.push(&out, @as(u8, (v >> 8) & 0xFF))
+    a.push(&out, @as(u8, (v >> 16) & 0xFF))
+    a.push(&out, @as(u8, (v >> 24) & 0xFF))
+}
+
+// Where body's parts end, and each part's message id (0 for text), from
+// cuts: a start, an end and an id for each message, in order.
+fn split(a: Allocator, inout ends: Buf(i64), inout ids: Buf(i64), body: []u8, cuts: Buf(i64)) void {
+    var pos = 0
+    var after_message = false
+    var k = 0
+    while (k + 2 < @len(cuts)) {
+        const start = cuts[k]
+        const end = cuts[k + 1]
+        const id = cuts[k + 2]
+        k = k + 3
+        if (end - start < MIN_FRAGMENT) {
+            continue
+        }
+        if (!(after_message and start - pos <= MAX_GLUE) and start > pos) {
+            a.push(&ends, start)
+            a.push(&ids, 0)
+        }
+        a.push(&ends, end)
+        a.push(&ids, id)
+        pos = end
+        after_message = true
+    }
+    if (pos < @len(body)) {
+        a.push(&ends, @len(body))
+        a.push(&ids, 0)
+    }
+}
+
+// body gzipped from its parts' pieces, deflating and keeping the parts
+// not stored yet; null if zlib fails.
+fn gzip(a: Allocator, inout store: Store, body: []u8, cuts: Buf(i64)) ?Buf(u8) {
+    var ends: Buf(i64) = .empty
+    defer a.free(ends)
+    var ids: Buf(i64) = .empty
+    defer a.free(ids)
+    split(a, &ends, &ids, body, cuts)
+    var out: Buf(u8) = .empty
+    // ID1 ID2, deflate, no flags, no mtime, no extra flags, Unix.
+    for ([_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 }) |b| {
+        a.push(&out, b)
+    }
+    var crc: u64 = 0
+    var after = 0
+    var start = 0
+    var prev = 0
+    var j = 0
+    while (j < @len(ends)) {
+        const part = body[start..ends[j]]
+        const i = store.find(ids[j], after, part)
+        if (i >= 0) {
+            a.append_str(&out, store.pieces[i].deflated)
+            crc = crc32_combine(crc, store.pieces[i].crc, @len(part))
+            after = store.pieces[i].stamp
+        } else {
+            const deflated = store.deflate_part(a, body[prev..start], part) orelse {
+                a.free(out)
+                return null
+            }
+            const part_crc = crc32(0, @strPtr(part), @as(u32, @len(part)))
+            a.append_str(&out, deflated)
+            crc = crc32_combine(crc, part_crc, @len(part))
+            after = store.keep(a, ids[j], after, part, deflated, part_crc)
+        }
+        prev = start
+        start = ends[j]
+        j = j + 1
+    }
+    // The final block, empty (fixed Huffman), after the pieces' sync flushes.
+    a.push(&out, 0x03)
+    a.push(&out, 0x00)
+    push_le32(a, &out, crc)
+    push_le32(a, &out, @as(u64, @len(body)) & 0xFFFFFFFF)
+    return out
+}

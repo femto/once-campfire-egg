@@ -28,8 +28,10 @@ avatars, and the rest of the app. PLAN.md has the status and the gaps.
 
 ## Performance
 
-Uncached, Egg renders and gzips every page; with `CAMPFIRE_CACHE=1` each
-worker keeps whole responses until the next commit, as the Rust app does.
+Uncached, Egg renders and gzips every page. With `CAMPFIRE_CACHE=1` each
+worker keeps, as the Rust app does for the process, whole responses until
+the next commit, messages' HTML, and each page's gzip in pieces it splices
+together (src/respcache.egg, src/fragcache.egg, src/splice.egg).
 On GitHub's ubuntu-latest, requests a second:
 
 | route | Rust | Egg | Egg, cached |
@@ -65,7 +67,8 @@ runs (Debian, zlib-ng).
 | `CAMPFIRE_DATABASE_PATH` | `<storage>/db/production.sqlite3` |
 | `CAMPFIRE_FILES_PATH` | `<storage>/files` (Active Storage) |
 | `CAMPFIRE_ASSETS_PATH` | `build/assets` |
-| `CAMPFIRE_CACHE` | `0`; `1` keeps whole responses |
+| `CAMPFIRE_CACHE` | `0`; `1` keeps messages' HTML, their gzip, and whole responses |
+| `CAMPFIRE_RESPONSE_CACHE` | `1`; `0` (with `CAMPFIRE_CACHE=1`) keeps all but whole responses |
 | `SECRET_KEY_BASE` | required |
 | `VAPID_PUBLIC_KEY` | empty |
 

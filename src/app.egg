@@ -15,6 +15,8 @@ const text = @import("std/text")
 const public_pages = @import("public_pages.egg")
 const respcache = @import("respcache.egg")
 const filecache = @import("filecache.egg")
+const fragcache = @import("fragcache.egg")
+const splice = @import("splice.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -24,8 +26,10 @@ const Config = struct {
     // Active Storage's root, and the precompiled assets.
     files: str
     assets: str
-    // Keep whole responses (CAMPFIRE_CACHE=1).
+    // Keep messages' HTML and gzip, and whole responses unless
+    // response_cache is off (CAMPFIRE_CACHE=1, CAMPFIRE_RESPONSE_CACHE=0).
     cache: bool
+    response_cache: bool
 }
 
 const Context = owned struct {
@@ -43,6 +47,8 @@ const Context = owned struct {
     assets: str
     cache: respcache.Cache
     files_sent: filecache.Cache
+    frags: fragcache.Cache
+    pieces: splice.Store
     // The write token: take it, write, hand it back (see main).
     lock_rx: Receiver(bool)
     lock_tx: Sender(bool)
@@ -53,6 +59,8 @@ const Context = owned struct {
         self.lock_tx.close()
         self.cache.close(a)
         self.files_sent.close(a)
+        self.frags.close(a)
+        self.pieces.close(a)
         a.free(self.key)
         a.free(self.sid_key)
         a.free(self.stream_key)
@@ -67,7 +75,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         lock_tx.close()
         return e
     }
-    const cache = respcache.open(a, cfg.db_path, cfg.cache) catch |e| {
+    const cache = respcache.open(a, cfg.db_path, cfg.cache, cfg.cache and cfg.response_cache) catch |e| {
         db.close()
         lock_rx.close()
         lock_tx.close()
@@ -87,6 +95,8 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         .assets = cfg.assets,
         .cache = cache,
         .files_sent = filecache.open(),
+        .frags = fragcache.open(cfg.cache),
+        .pieces = splice.open(cfg.cache),
         .lock_rx = lock_rx,
         .lock_tx = lock_tx,
     }
@@ -215,7 +225,18 @@ fn cached(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: 
 }
 
 // Send a page as HTML (gzipped if asked), and keep it for key.
-fn page_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: i64, key: []u8, own: []u8, body: []u8) !void {
+fn page_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: i64, key: []u8, own: []u8, body: []u8, cuts: Buf(i64)) !void {
+    // The fragments this page kept are of gen only if nothing committed.
+    ctx.frags.finish(a, try ctx.cache.generation_now(a))
+    if (req.gzip and ctx.pieces.on and @len(cuts) > 0) {
+        if (splice.gzip(a, &ctx.pieces, body, cuts)) |z| {
+            defer a.free(z)
+            const headers = a.concat(HTML, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
+            defer a.free(headers)
+            try http.write_parts(c, a, "200 OK", own, headers, z, req.keep)
+            return ctx.cache.put(a, gen, key, headers, z, ctx.clock.now())
+        }
+    }
     const e = http.encode(a, req, HTML, body)
     defer e.deinit(a)
     try http.write_parts(c, a, "200 OK", own, e.headers, e.body, req.keep)
@@ -282,8 +303,11 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     defer a.free(base)
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream)
-    return page_out(c, a, &ctx, req, gen, key, own, body)
+    var cuts: Buf(i64) = .empty
+    defer a.free(cuts)
+    ctx.frags.begin(a, gen)
+    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream, &ctx.frags, &cuts)
+    return page_out(c, a, &ctx, req, gen, key, own, body, cuts)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
@@ -343,8 +367,11 @@ fn messages_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request
     }
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.messages_index(a, &body, messages)
-    return page_out(c, a, &ctx, req, gen, key, "", body)
+    var cuts: Buf(i64) = .empty
+    defer a.free(cuts)
+    ctx.frags.begin(a, gen)
+    views.messages_index(a, &body, messages, &ctx.frags, &cuts)
+    return page_out(c, a, &ctx, req, gen, key, "", body, cuts)
 }
 
 // GET /users/me/sidebar: the room list, as a whole page.
@@ -378,7 +405,9 @@ fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     var body: Buf(u8) = .empty
     defer a.free(body)
     views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
-    return page_out(c, a, &ctx, req, gen, key, "", body)
+    const none: Buf(i64) = .empty
+    defer a.free(none)
+    return page_out(c, a, &ctx, req, gen, key, "", body, none)
 }
 
 // Whether the code point is in [[:word:]] (letter, mark, decimal digit or
@@ -488,8 +517,11 @@ fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) 
     defer a.free(base)
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin)
-    return page_out(c, a, &ctx, req, gen, key, "", body)
+    var cuts: Buf(i64) = .empty
+    defer a.free(cuts)
+    ctx.frags.begin(a, gen)
+    views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin, &ctx.frags, &cuts)
+    return page_out(c, a, &ctx, req, gen, key, "", body, cuts)
 }
 
 // The Content-Type header of a file, by its extension.

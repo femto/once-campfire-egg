@@ -7,7 +7,13 @@ whose `egg` branch adds two apps:
 - `egg`: this app's image as it is, rendering every page;
 - `egg-cache`: the same image with `CAMPFIRE_CACHE=1`, which keeps whole
   responses per worker (src/respcache.egg), as once-campfire-rust's
-  response cache does for the whole process.
+  response cache does for the whole process, and messages' HTML
+  (src/fragcache.egg) and gzipped pages in pieces (src/splice.egg), as
+  Rust's fragment cache and splicing deflater do (the runs below predate
+  these two);
+- `egg-fragments` and `rust-fragments`: the two without whole responses
+  (`CAMPFIRE_RESPONSE_CACHE=0`, `CAMPFIRE_RESPONSE_CACHE_MB=0`), to compare
+  what a page costs after a commit.
 
 Every app runs the same route contracts on the same Rails-built seed, in
 alternating rounds, and a run fails on any invalid response or any

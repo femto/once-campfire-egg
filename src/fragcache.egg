@@ -1,0 +1,90 @@
+// Messages' HTML kept per worker, as the Rails app keeps `cache message`
+// fragments and once-campfire-rust its fragment cache: a message renders
+// once and every page that shows it (its room, older pages, search) repeats
+// that rendering. A message's HTML depends only on the database, so the
+// store holds one generation's (see respcache): a request starts it with
+// the generation it took before signing in, and ends it with the current
+// one, which drops everything if a commit came in between.
+uses alloc
+
+// A worker's bound; the oldest go first.
+const MAX_BYTES = 8388608
+
+const Entry = owned struct {
+    id: i64
+    html: Buf(u8)
+
+    fn deinit(sink self: Entry, a: Allocator) void {
+        a.free(self.html)
+        @forget(self)
+    }
+}
+
+const Cache = owned struct {
+    on: bool
+    generation: i64
+    entries: Buf(Entry)
+    bytes: i64
+
+    fn close(sink self: Cache, a: Allocator) void {
+        a.free(self.entries)
+        @forget(self)
+    }
+
+    fn clear(inout self: Cache, a: Allocator) void {
+        a.free(@replace(&self.entries, .empty))
+        self.bytes = 0
+    }
+
+    // At the start of a request, with the generation it took.
+    fn begin(inout self: Cache, a: Allocator, gen: i64) void {
+        if (gen != self.generation) {
+            self.clear(a)
+            self.generation = gen
+        }
+    }
+
+    // At its end, with the generation now: what it kept is of the
+    // generation it started with only if no commit came in between.
+    fn finish(inout self: Cache, a: Allocator, gen: i64) void {
+        self.begin(a, gen)
+    }
+
+    // Where message id's HTML is; -1 if it isn't kept.
+    fn find(self: Cache, id: i64) i64 {
+        if (!self.on) {
+            return -1
+        }
+        var i = 0
+        while (i < @len(self.entries)) {
+            if (self.entries[i].id == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn put(inout self: Cache, a: Allocator, id: i64, html: []u8) void {
+        if (!self.on) {
+            return
+        }
+        while (@len(self.entries) > 0 and self.bytes + @len(html) > MAX_BYTES) {
+            var i = 0
+            while (i + 1 < @len(self.entries)) {
+                @swap(&self.entries, i, i + 1)
+                i = i + 1
+            }
+            if (a.pop(&self.entries)) |old| {
+                self.bytes = self.bytes - @len(old.html)
+                old.deinit(a)
+            }
+        }
+        self.bytes = self.bytes + @len(html)
+        a.push(&self.entries, Entry{ .id = id, .html = a.concat(html, "") })
+    }
+}
+
+fn open(on: bool) Cache {
+    return Cache{ .on = on, .generation = -1, .entries = .empty, .bytes = 0 }
+}

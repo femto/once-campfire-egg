@@ -6,6 +6,7 @@ const codec = @import("codec.egg")
 const tf = @import("timefmt.egg")
 const model = @import("model.egg")
 const static_head = @import("static_head.egg")
+const fragcache = @import("fragcache.egg")
 
 // The quick boosts of the message menu: the character, then its title.
 const QUICK_BOOSTS = "👍Thumbs up|👏Clapping|👋Waving hand|💪Muscle|❤️Red heart|😂Face with tears of joy|🎉Party popper|🔥Fire"
@@ -99,6 +100,22 @@ fn search_query(a: Allocator, inout out: Buf(u8), q: []u8) void {
     defer a.free(e)
     codec.escape(a, &e, q)
     html.escape(a, &out, e)
+}
+
+// A message from the worker's fragments, rendered and kept if it isn't
+// there; its start, end and id go on cuts, for splice.
+fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache, inout cuts: Buf(i64), m: model.MessageView) void {
+    const start = @len(out)
+    const i = frags.find(m.id)
+    if (i >= 0) {
+        a.append_str(&out, frags.entries[i].html)
+    } else {
+        message(a, &out, m)
+        frags.put(a, m.id, out[start..])
+    }
+    a.push(&cuts, start)
+    a.push(&cuts, @len(out))
+    a.push(&cuts, m.id)
 }
 
 // boost.html
@@ -246,10 +263,10 @@ fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
 }
 
 // messages.html
-fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView)) void {
+fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView), inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
     for (messages) |m| {
     a.append_str(&out, "\n")
-    message(a, &out, m)
+    cached_message(a, &out, &frags, &cuts, m)
     }
 }
 
@@ -289,7 +306,7 @@ fn recents(a: Allocator, inout out: Buf(u8), recent: Buf(Buf(u8)), base: []u8) v
 }
 
 // room.html
-fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8) void {
+fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
     layout_top(a, &out, room.display, user, vapid, logo_v)
     a.append_str(&out, "\n\n\n  <meta name=\"turbo-cache-control\" content=\"no-preview\">\n  <meta name=\"current-room-id\" content=\"")
     a.append_int(&out, room.id)
@@ -358,7 +375,7 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     a.append_str(&out, "/refresh\">")
     for (messages) |m| {
     a.append_str(&out, "\n    ")
-    message(a, &out, m)
+    cached_message(a, &out, &frags, &cuts, m)
     }
     a.append_str(&out, "\n  </div>\n\n  <turbo-cable-stream-source channel=\"RoomMessagesChannel\" signed-stream-name=\"")
     a.append_str(&out, stream)
@@ -377,7 +394,7 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
 }
 
 // search.html
-fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool) void {
+fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
     layout_top(a, &out, "Search", user, vapid, logo_v)
     a.append_str(&out, "\n\n  </head>\n\n  <body class=\"sidebar searches")
     if (admin) {
@@ -396,7 +413,7 @@ fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages
     a.append_str(&out, "\n  </div>    </nav>\n\n\n    <main id=\"main-content\">\n\n<div id=\"message-area\" class=\"message-area\">\n  <div class=\"message-area--empty min-width center\">\n    <figure class=\"center pad\">\n      <img aria-hidden=\"true\" class=\"colorize--black translucent\" src=\"/assets/search-5f29565f.svg\" />\n    </figure>\n  </div>\n\n  <div id=\"search-results\" class=\"messages searches__results\" data-controller=\"search-results\" data-search-results-target=\"messages\" data-search-results-me-class=\"message--me\" data-search-results-threaded-class=\"message--threaded\" data-search-results-mentioned-class=\"message--mentioned\" data-search-results-formatted-class=\"message--formatted\">")
     for (messages) |m| {
     a.append_str(&out, "\n    ")
-    message(a, &out, m)
+    cached_message(a, &out, &frags, &cuts, m)
     }
     a.append_str(&out, "\n  </div></div>\n      <footer id=\"footer\">\n\n  <div class=\"composer flex align-end gap\">\n    <a class=\"btn flex-item-no-shrink margin-block-end\" style=\"view-transition-name: input-switcher; --btn-border-radius: 0.5em\" href=\"/rooms/")
     a.append_int(&out, return_room)

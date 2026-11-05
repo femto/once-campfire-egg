@@ -5,6 +5,7 @@ const codec = @import("codec.egg")
 const tf = @import("timefmt.egg")
 const model = @import("model.egg")
 const static_head = @import("static_head.egg")
+const fragcache = @import("fragcache.egg")
 
 // The quick boosts of the message menu: the character, then its title.
 const QUICK_BOOSTS = "👍Thumbs up|👏Clapping|👋Waving hand|💪Muscle|❤️Red heart|😂Face with tears of joy|🎉Party popper|🔥Fire"
@@ -98,4 +99,20 @@ fn search_query(a: Allocator, inout out: Buf(u8), q: []u8) void {
     defer a.free(e)
     codec.escape(a, &e, q)
     html.escape(a, &out, e)
+}
+
+// A message from the worker's fragments, rendered and kept if it isn't
+// there; its start, end and id go on cuts, for splice.
+fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache, inout cuts: Buf(i64), m: model.MessageView) void {
+    const start = @len(out)
+    const i = frags.find(m.id)
+    if (i >= 0) {
+        a.append_str(&out, frags.entries[i].html)
+    } else {
+        message(a, &out, m)
+        frags.put(a, m.id, out[start..])
+    }
+    a.push(&cuts, start)
+    a.push(&cuts, @len(out))
+    a.push(&cuts, m.id)
 }

@@ -74,10 +74,11 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
         .cache = (args.env("CAMPFIRE_CACHE") orelse "0") == "1",
+        .response_cache = (args.env("CAMPFIRE_RESPONSE_CACHE") orelse "1") != "0",
     }
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
-    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (cfg.cache) ", caching responses" else "")
+    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (!cfg.cache) "" else if (cfg.response_cache) ", caching responses" else ", caching messages")
 
     // The database's writers take turns through this one token, rather than
     // wait on SQLite's lock, which lets some wait for seconds under load.

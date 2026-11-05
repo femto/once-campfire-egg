@@ -35,7 +35,10 @@ const Entry = owned struct {
 }
 
 const Cache = owned struct {
+    // Whether generations are watched (for fragcache too), and whether
+    // responses are kept.
     on: bool
+    store: bool
     observer: sqlite.Db
     version: i64
     generation: i64
@@ -68,7 +71,7 @@ const Cache = owned struct {
     // Where the entry for key is, if it is of generation gen and fresh; -1
     // if not.
     fn find(inout self: Cache, a: Allocator, gen: i64, key: []u8, now_ns: i64) !i64 {
-        if (!self.on or try self.generation_now(a) != gen) {
+        if (!self.store or try self.generation_now(a) != gen) {
             return -1
         }
         var i = 0
@@ -91,7 +94,7 @@ const Cache = owned struct {
 
     // Keep the response for key, if nothing has committed since gen.
     fn put(inout self: Cache, a: Allocator, gen: i64, key: []u8, headers: []u8, body: []u8, now_ns: i64) !void {
-        if (!self.on or @len(body) > MAX_BODY or try self.generation_now(a) != gen) {
+        if (!self.store or @len(body) > MAX_BODY or try self.generation_now(a) != gen) {
             return
         }
         // In place of the same key's expired entry, or of the first when full.
@@ -112,6 +115,6 @@ const Cache = owned struct {
     }
 }
 
-fn open(a: Allocator, path: []u8, on: bool) !Cache {
-    return Cache{ .on = on, .observer = try sqlite.open_readonly(a, path), .version = -1, .generation = 0, .entries = .empty }
+fn open(a: Allocator, path: []u8, on: bool, store: bool) !Cache {
+    return Cache{ .on = on, .store = store, .observer = try sqlite.open_readonly(a, path), .version = -1, .generation = 0, .entries = .empty }
 }
