@@ -69,6 +69,37 @@ posting varies more):
 | /up | 16832 | 110646 | 110718 |
 | post a message | 1801 | 2187 | 1898 |
 
+## After `f9ae6bf`: assets and avatars kept as sent
+
+Each worker keeps an asset's or an avatar's response as it sent it, gzipped
+or not (src/filecache.egg): a digested asset name and an Active Storage
+blob key never change content, so nothing invalidates them. A repeat
+request reads no file and compresses nothing; it still signs in and looks
+up the avatar's blob.
+
+[Run 41987883777](https://github.com/femto/once-campfire-egg/actions/runs/41987883777),
+2026-11-05, ubuntu-latest, 2 + 2 cores, all routes, median of 2 rounds:
+
+| route | Rust | Egg | Egg, cached |
+| --- | ---: | ---: | ---: |
+| room page | 12710 | 592 | 41833 |
+| messages page | 12553 | 783 | 43399 |
+| sidebar | 14287 | 3888 | 51243 |
+| search | 14138 | 1755 | 50540 |
+| avatar | 47899 | 51165 | 50559 |
+| static CSS | 48060 | 108952 | 108761 |
+| /up | 16177 | 112253 | 111849 |
+| post a message | 1818 | 1963 | 1771 |
+
+The local VM (4 + 4 cores), Rust and Egg on these three routes only,
+median of 3 rounds:
+
+| route | Rust | Egg |
+| --- | ---: | ---: |
+| avatar | 38661 | 57860 |
+| static CSS | 47960 | 122742 |
+| /up | 22028 | 121123 |
+
 ## Reading them
 
 - Uncached, Egg renders and gzips every page: the room page is 416 KB of
@@ -77,9 +108,12 @@ posting varies more):
   fragments it compressed before.
 - Cached, both serve the four pages from memory after signing in and
   checking room access; Egg's cache is per worker and takes no lock.
-- Avatar and CSS: Egg reads the file on every request, Rust serves them
-  from memory; which is faster depends on the machine (Egg on the local
-  VM, Rust on the runner).
+- Avatar and CSS, at `b7c7d16`: Egg read the file and gzipped the CSS on
+  every request. Rust sends the avatar from disk (`send_file`) and the CSS
+  from its binary, which embeds the assets, gzipping it each time as
+  Rack::Deflater does. Which was faster depended on the machine (Egg on the
+  local VM, Rust on the runner). Since `f9ae6bf` each Egg worker keeps an
+  asset's or an avatar's response as sent (src/filecache.egg); see below.
 - Posting: the two are on par. The Rust app also broadcasts the message
   over Action Cable, queues Web Push and calls bots' webhooks after it
   answers; Egg does none of these yet (see PLAN.md).
