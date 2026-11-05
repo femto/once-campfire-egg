@@ -746,13 +746,13 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     var has_body = false
     var body: Buf(u8) = .empty
     defer a.free(body)
-    if (codec.form_value(a, req.body, "message[body]")) |v| {
+    if (http.field(a, req, "message[body]")) |v| {
         has_body = true
         a.free(@replace(&body, v))
     }
     var client_id: Buf(u8) = .empty
     defer a.free(client_id)
-    if (codec.form_value(a, req.body, "message[client_message_id]")) |v| {
+    if (http.field(a, req, "message[client_message_id]")) |v| {
         a.free(@replace(&client_id, v))
     }
     _ = ctx.lock_rx.recv()

@@ -4,6 +4,7 @@
 uses alloc, net
 
 const gz = @import("gzip.egg")
+const codec = @import("codec.egg")
 const text = @import("std/text")
 
 const MAX_LINE = 8192
@@ -121,7 +122,14 @@ fn read_request(c: TcpConn, a: Allocator, served: i64) !?Request {
     var line: Buf(u8) = .empty
     defer a.free(line)
     try c.set_timeout(5000)
-    if (!try c.read_line_max(a, &line, MAX_LINE)) {
+    // A connection kept alive that sends nothing more is done, not failed.
+    const started = c.read_line_max(a, &line, MAX_LINE) catch |e| {
+        if (e == error.TimedOut and @len(line) == 0) {
+            return null
+        }
+        return e
+    }
+    if (!started) {
         return null
     }
     var header: Buf(u8) = .empty
@@ -294,4 +302,57 @@ fn respond(c: TcpConn, a: Allocator, req: Request, status: str, headers: []u8, b
     const e = encode(a, req, headers, body)
     defer e.deinit(a)
     return write_response(c, a, status, e.headers, e.body, req.keep)
+}
+
+// The boundary of a multipart/form-data Content-Type, or empty.
+fn boundary(a: Allocator, content_type: []u8) Buf(u8) {
+    const at = text.find(content_type, "boundary=") orelse -1
+    if (at < 0 or !text.starts_with(content_type, "multipart/form-data")) {
+        return .empty
+    }
+    var from = at + @len("boundary=")
+    var to = @len(content_type)
+    const semi = text.find_from(content_type, ";", from) orelse -1
+    if (semi >= 0) {
+        to = semi
+    }
+    if (to - from >= 2 and content_type[from] == '"' and content_type[to - 1] == '"') {
+        from = from + 1
+        to = to - 1
+    }
+    return a.concat(content_type[from..to], "")
+}
+
+// A field of the request's form: urlencoded, or a text part of
+// multipart/form-data (a file's part is not a field here); null if absent.
+fn field(a: Allocator, req: Request, name: str) ?Buf(u8) {
+    const b = boundary(a, req.content_type)
+    defer a.free(b)
+    if (@len(b) == 0) {
+        return codec.form_value(a, req.body, name)
+    }
+    const delim = a.concat("--", b)
+    defer a.free(delim)
+    const want = a.concat("name=\"", name, "\"")
+    defer a.free(want)
+    var at = text.find(req.body, delim) orelse -1
+    while (at >= 0) {
+        const head_from = at + @len(delim) + 2
+        const head_end = text.find_from(req.body, "\r\n\r\n", head_from) orelse -1
+        if (head_end < 0) {
+            return null
+        }
+        const next = text.find_from(req.body, delim, head_end) orelse -1
+        if (next < 0) {
+            return null
+        }
+        const head = req.body[head_from..head_end]
+        if (text.contains(head, want) and !text.contains(head, "filename=")) {
+            // The value ends before the CRLF that comes before the next delimiter.
+            const end = if (next >= 2) next - 2 else next
+            return a.concat(req.body[head_end + 4..end], "")
+        }
+        at = next
+    }
+    return null
 }
