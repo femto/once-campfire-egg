@@ -14,6 +14,7 @@ const tf = @import("timefmt.egg")
 const text = @import("std/text")
 const public_pages = @import("public_pages.egg")
 const respcache = @import("respcache.egg")
+const filecache = @import("filecache.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -41,6 +42,7 @@ const Context = owned struct {
     files: str
     assets: str
     cache: respcache.Cache
+    files_sent: filecache.Cache
     // The write token: take it, write, hand it back (see main).
     lock_rx: Receiver(bool)
     lock_tx: Sender(bool)
@@ -50,6 +52,7 @@ const Context = owned struct {
         self.lock_rx.close()
         self.lock_tx.close()
         self.cache.close(a)
+        self.files_sent.close(a)
         a.free(self.key)
         a.free(self.sid_key)
         a.free(self.stream_key)
@@ -83,6 +86,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         .files = cfg.files,
         .assets = cfg.assets,
         .cache = cache,
+        .files_sent = filecache.open(),
         .lock_rx = lock_rx,
         .lock_tx = lock_tx,
     }
@@ -518,6 +522,12 @@ fn asset(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void 
     }
     const path = a.concat(ctx.assets, "/", name)
     defer a.free(path)
+    const key = filecache.key_for(a, path, req)
+    defer a.free(key)
+    const i = ctx.files_sent.find(key)
+    if (i >= 0) {
+        return ctx.files_sent.send(c, a, i, req.keep)
+    }
     const body = ctx.fs.read(a, path) catch {
         return not_found(c, a, req)
     }
@@ -526,7 +536,15 @@ fn asset(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void 
     defer a.free(headers)
     a.append_str(&headers, content_type(name))
     a.append_str(&headers, "Cache-Control: public, max-age=2592000\r\n")
-    return http.respond(c, a, req, "200 OK", headers, body)
+    return send_file(c, a, &ctx, req, key, headers, body)
+}
+
+// A file's 200 response, kept under key for the next request.
+fn send_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, key: []u8, headers: []u8, body: []u8) !void {
+    const e = http.encode(a, req, headers, body)
+    defer e.deinit(a)
+    ctx.files_sent.put(a, key, e.headers, e.body)
+    return http.write_parts(c, a, "200 OK", "", e.headers, e.body, req.keep)
 }
 
 // ActiveStorage's digest of the :square variant (resize_to_limit
@@ -558,6 +576,12 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     defer a.free(kind)
     const path = a.concat(ctx.files, "/", key[0..2], "/", key[2..4], "/", key)
     defer a.free(path)
+    const sent = filecache.key_for(a, path, req)
+    defer a.free(sent)
+    const i = ctx.files_sent.find(sent)
+    if (i >= 0) {
+        return ctx.files_sent.send(c, a, i, req.keep)
+    }
     const body = ctx.fs.read(a, path) catch {
         return not_found(c, a, req)
     }
@@ -571,7 +595,7 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     a.append_str(&headers, "\"; filename*=UTF-8''")
     a.append_str(&headers, key)
     a.append_str(&headers, "\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
-    return http.respond(c, a, req, "200 OK", headers, body)
+    return send_file(c, a, &ctx, req, sent, headers, body)
 }
 
 // verify_authenticity_token as the Rust app does it, by headers instead of

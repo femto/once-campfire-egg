@@ -1,0 +1,80 @@
+// Files as sent, kept per worker: precompiled assets (digested, so a name
+// never changes content) and Active Storage blobs (a key is never reused).
+// An entry is the response for one file and one encoding: its headers and
+// its body, gzipped or not, so a hit neither reads nor compresses.
+uses alloc, net
+
+const http = @import("http.egg")
+
+// A file larger than this is read on every request; past MAX_BYTES in all,
+// the oldest entries go.
+const MAX_BODY = 1048576
+const MAX_BYTES = 4194304
+
+const Entry = owned struct {
+    key: Buf(u8)
+    headers: Buf(u8)
+    body: Buf(u8)
+
+    fn deinit(sink self: Entry, a: Allocator) void {
+        a.free(self.key)
+        a.free(self.headers)
+        a.free(self.body)
+        @forget(self)
+    }
+}
+
+const Cache = owned struct {
+    entries: Buf(Entry)
+    bytes: i64
+
+    fn close(sink self: Cache, a: Allocator) void {
+        a.free(self.entries)
+        @forget(self)
+    }
+
+    // Where the entry for key is; -1 if there is none.
+    fn find(self: Cache, key: []u8) i64 {
+        var i = 0
+        while (i < @len(self.entries)) {
+            if (self.entries[i].key == key) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, keep: bool) !void {
+        return http.write_parts(c, a, "200 OK", "", self.entries[i].headers, self.entries[i].body, keep)
+    }
+
+    fn put(inout self: Cache, a: Allocator, key: []u8, headers: []u8, body: []u8) void {
+        if (@len(body) > MAX_BODY) {
+            return
+        }
+        while (@len(self.entries) > 0 and self.bytes + @len(body) > MAX_BYTES) {
+            // The oldest is first: shift it to the end and drop it.
+            var i = 0
+            while (i + 1 < @len(self.entries)) {
+                @swap(&self.entries, i, i + 1)
+                i = i + 1
+            }
+            if (a.pop(&self.entries)) |old| {
+                self.bytes = self.bytes - @len(old.body)
+                old.deinit(a)
+            }
+        }
+        self.bytes = self.bytes + @len(body)
+        a.push(&self.entries, Entry{ .key = a.concat(key, ""), .headers = a.concat(headers, ""), .body = a.concat(body, "") })
+    }
+}
+
+fn open() Cache {
+    return Cache{ .entries = .empty, .bytes = 0 }
+}
+
+// The key for a file's response: its path and whether it goes gzipped.
+fn key_for(a: Allocator, path: []u8, req: http.Request) Buf(u8) {
+    return a.concat(path, if (req.gzip) "\ngzip" else "\nidentity")
+}
