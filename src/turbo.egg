@@ -7,6 +7,8 @@ uses alloc
 
 const codec = @import("codec.egg")
 const crypto = @import("crypto.egg")
+const json = @import("json.egg")
+const text = @import("std/text")
 
 const SALT = "turbo/signed_stream_verifier_key"
 
@@ -29,10 +31,10 @@ fn gid(a: Allocator, inout out: Buf(u8), class: []u8, id: i64) void {
 // The signed form of the stream name, at the end of out. The name must need
 // no JSON escaping, as GlobalID params and ":rooms" do not.
 fn sign(a: Allocator, inout out: Buf(u8), k: []u8, name: []u8) void {
-    const json = a.concat("\"", name, "\"")
-    defer a.free(json)
+    const quoted = a.concat("\"", name, "\"")
+    defer a.free(quoted)
     const start = @len(out)
-    codec.base64_encode(a, &out, json)
+    codec.base64_encode(a, &out, quoted)
     const mac = crypto.hmac_sha256(a, k, out[start..])
     defer a.free(mac)
     a.append_str(&out, "--")
@@ -47,4 +49,89 @@ fn record_stream(a: Allocator, inout out: Buf(u8), k: []u8, class: []u8, id: i64
     a.append_str(&name, ":")
     a.append_str(&name, suffix)
     sign(a, &out, k, name)
+}
+
+// Turbo.signed_stream_verifier.verified: the stream name signed says, if
+// this app signed it (the reverse of sign); null if not.
+fn verify(a: Allocator, k: []u8, signed: []u8) ?Buf(u8) {
+    // The Base64, "--", and 64 hex digits.
+    if (@len(signed) < 67) {
+        return null
+    }
+    const cut = @len(signed) - 66
+    if (signed[cut..cut + 2] != "--") {
+        return null
+    }
+    const mac = crypto.hmac_sha256(a, k, signed[0..cut])
+    defer a.free(mac)
+    var want: Buf(u8) = .empty
+    defer a.free(want)
+    codec.hex_encode(a, &want, mac)
+    if (!codec.same_secret(want, signed[cut + 2..])) {
+        return null
+    }
+    var raw: Buf(u8) = .empty
+    defer a.free(raw)
+    if (!codec.base64_decode(a, &raw, signed[0..cut])) {
+        return null
+    }
+    var name: Buf(u8) = .empty
+    const end = json.string_at(a, &name, raw, json.skip_ws(raw, 0))
+    if (end < 0 or json.skip_ws(raw, end) != @len(raw)) {
+        a.free(name)
+        return null
+    }
+    return name
+}
+
+// The room a room's message stream ("<GlobalID param>:messages") names,
+// as RoomMessagesChannel finds it: its id and its class (Room, or
+// Rooms::Open and the like); null if the name is not that.
+const RoomRef = owned struct {
+    id: i64
+    class: Buf(u8)
+
+    fn deinit(sink self: RoomRef, a: Allocator) void {
+        a.free(self.class)
+        @forget(self)
+    }
+}
+
+fn room_stream(a: Allocator, stream: []u8) ?RoomRef {
+    const colon = text.find(stream, ":") orelse -1
+    if (colon < 0 or stream[colon + 1..] != "messages") {
+        return null
+    }
+    var uri: Buf(u8) = .empty
+    defer a.free(uri)
+    const param = stream[0..colon]
+    if (text.starts_with(param, "gid://")) {
+        a.append_str(&uri, param)
+    } else if (!codec.base64_decode(a, &uri, param)) {
+        return null
+    }
+    const prefix = "gid://campfire/"
+    if (!text.starts_with(uri, prefix)) {
+        return null
+    }
+    const rest = uri[@len(prefix)..]
+    const slash = text.find(rest, "/") orelse -1
+    if (slash < 0) {
+        return null
+    }
+    const class = rest[0..slash]
+    if (class != "Room" and class != "Rooms::Open" and class != "Rooms::Closed" and class != "Rooms::Direct") {
+        return null
+    }
+    const id = text.parse_int(rest[slash + 1..]) orelse {
+        return null
+    }
+    return RoomRef{ .id = id, .class = a.concat(class, "") }
+}
+
+// Streams RoomMessagesChannel guards (a room's messages), which
+// Turbo::StreamsChannel turns away (RoomStreamsAreAuthorized).
+fn guarded(stream: []u8) bool {
+    const colon = text.find(stream, ":") orelse -1
+    return colon >= 0 and stream[colon + 1..] == "messages"
 }

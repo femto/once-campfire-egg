@@ -1,0 +1,346 @@
+// JSON, as much as Action Cable needs: an object's members (commands and
+// channel identifiers), and strings encoded as Rails encodes them
+// (ActiveSupport::JSON: the json gem's escapes, and < > & as <,
+// > and &).
+uses alloc
+
+const text = @import("std/text")
+
+// A member of an object: its key, and its value: a string decoded (kind
+// 's'), or the value's text as written (a number 'n', null 'z', anything
+// else 'o').
+const Member = owned struct {
+    key: Buf(u8)
+    kind: u8
+    value: Buf(u8)
+
+    fn deinit(sink self: Member, a: Allocator) void {
+        a.free(self.key)
+        a.free(self.value)
+        @forget(self)
+    }
+}
+
+fn is_ws(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r'
+}
+
+fn skip_ws(s: []u8, i: i64) i64 {
+    var j = i
+    while (j < @len(s) and is_ws(s[j])) {
+        j = j + 1
+    }
+    return j
+}
+
+fn hex4(s: []u8, i: i64) i64 {
+    if (i + 4 > @len(s)) {
+        return -1
+    }
+    var v = 0
+    var k = i
+    while (k < i + 4) {
+        const c = s[k]
+        var d = -1
+        if (c >= '0' and c <= '9') {
+            d = @as(i64, c - '0')
+        } else if (c >= 'a' and c <= 'f') {
+            d = @as(i64, c - 'a') + 10
+        } else if (c >= 'A' and c <= 'F') {
+            d = @as(i64, c - 'A') + 10
+        }
+        if (d < 0) {
+            return -1
+        }
+        v = v * 16 + d
+        k = k + 1
+    }
+    return v
+}
+
+fn push_utf8(a: Allocator, inout out: Buf(u8), cp: i64) void {
+    if (cp < 0x80) {
+        a.push(&out, @as(u8, cp))
+    } else if (cp < 0x800) {
+        a.push(&out, @as(u8, 0xC0 | (cp >> 6)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    } else if (cp < 0x10000) {
+        a.push(&out, @as(u8, 0xE0 | (cp >> 12)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 6) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    } else {
+        a.push(&out, @as(u8, 0xF0 | (cp >> 18)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 12) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 6) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    }
+}
+
+// The string starting with the quote at s[i], decoded at the end of out;
+// where it ends (after its closing quote), or -1 if it is not one.
+fn string_at(a: Allocator, inout out: Buf(u8), s: []u8, i: i64) i64 {
+    if (i >= @len(s) or s[i] != '"') {
+        return -1
+    }
+    var j = i + 1
+    while (j < @len(s)) {
+        const c = s[j]
+        if (c == '"') {
+            return j + 1
+        } else if (c < 0x20) {
+            return -1
+        } else if (c != '\\') {
+            a.push(&out, c)
+            j = j + 1
+        } else {
+            if (j + 1 >= @len(s)) {
+                return -1
+            }
+            const e = s[j + 1]
+            j = j + 2
+            if (e == '"' or e == '\\' or e == '/') {
+                a.push(&out, e)
+            } else if (e == 'b') {
+                a.push(&out, 8)
+            } else if (e == 'f') {
+                a.push(&out, 12)
+            } else if (e == 'n') {
+                a.push(&out, '\n')
+            } else if (e == 'r') {
+                a.push(&out, '\r')
+            } else if (e == 't') {
+                a.push(&out, '\t')
+            } else if (e == 'u') {
+                var cp = hex4(s, j)
+                if (cp < 0) {
+                    return -1
+                }
+                j = j + 4
+                // A surrogate pair is one character; a lone surrogate, as
+                // the json gem does, becomes U+FFFD.
+                if (cp >= 0xD800 and cp < 0xDC00 and j + 6 <= @len(s) and s[j] == '\\' and s[j + 1] == 'u') {
+                    const lo = hex4(s, j + 2)
+                    if (lo >= 0xDC00 and lo < 0xE000) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                        j = j + 6
+                    }
+                }
+                if (cp >= 0xD800 and cp < 0xE000) {
+                    cp = 0xFFFD
+                }
+                push_utf8(a, &out, cp)
+            } else {
+                return -1
+            }
+        }
+    }
+    return -1
+}
+
+// Where the value starting at s[i] ends, or -1 if there is none: strings,
+// numbers, true, false, null, and objects and arrays of them.
+fn value_end(a: Allocator, s: []u8, i: i64) i64 {
+    if (i >= @len(s)) {
+        return -1
+    }
+    const c = s[i]
+    if (c == '"') {
+        var scratch: Buf(u8) = .empty
+        defer a.free(scratch)
+        return string_at(a, &scratch, s, i)
+    }
+    if (c == '{' or c == '[') {
+        const close: u8 = if (c == '{') '}' else ']'
+        var j = skip_ws(s, i + 1)
+        if (j < @len(s) and s[j] == close) {
+            return j + 1
+        }
+        while (true) {
+            if (c == '{') {
+                // A key, which is a string.
+                if (j >= @len(s) or s[j] != '"') {
+                    return -1
+                }
+                j = value_end(a, s, j)
+                if (j < 0) {
+                    return -1
+                }
+                j = skip_ws(s, j)
+                if (j >= @len(s) or s[j] != ':') {
+                    return -1
+                }
+                j = skip_ws(s, j + 1)
+            }
+            j = value_end(a, s, j)
+            if (j < 0) {
+                return -1
+            }
+            j = skip_ws(s, j)
+            if (j >= @len(s)) {
+                return -1
+            }
+            if (s[j] == close) {
+                return j + 1
+            }
+            if (s[j] != ',') {
+                return -1
+            }
+            j = skip_ws(s, j + 1)
+        }
+    }
+    for ([_]str{ "true", "false", "null" }) |word| {
+        if (text.starts_with(s[i..], word)) {
+            return i + @len(word)
+        }
+    }
+    // A number: -?digits(.digits)?([eE][+-]?digits)?
+    var j = i
+    if (s[j] == '-') {
+        j = j + 1
+    }
+    const digits_from = j
+    while (j < @len(s) and s[j] >= '0' and s[j] <= '9') {
+        j = j + 1
+    }
+    if (j == digits_from or (s[digits_from] == '0' and j - digits_from > 1)) {
+        return -1
+    }
+    if (j < @len(s) and s[j] == '.') {
+        j = j + 1
+        const f = j
+        while (j < @len(s) and s[j] >= '0' and s[j] <= '9') {
+            j = j + 1
+        }
+        if (j == f) {
+            return -1
+        }
+    }
+    if (j < @len(s) and (s[j] == 'e' or s[j] == 'E')) {
+        j = j + 1
+        if (j < @len(s) and (s[j] == '+' or s[j] == '-')) {
+            j = j + 1
+        }
+        const f = j
+        while (j < @len(s) and s[j] >= '0' and s[j] <= '9') {
+            j = j + 1
+        }
+        if (j == f) {
+            return -1
+        }
+    }
+    return j
+}
+
+// The members of the object s is (whitespace around it allowed), in out;
+// false if s is not one. A key given twice keeps its last value.
+fn object(a: Allocator, inout out: Buf(Member), s: []u8) bool {
+    var i = skip_ws(s, 0)
+    if (i >= @len(s) or s[i] != '{') {
+        return false
+    }
+    i = skip_ws(s, i + 1)
+    if (i < @len(s) and s[i] == '}') {
+        return skip_ws(s, i + 1) == @len(s)
+    }
+    while (true) {
+        var key: Buf(u8) = .empty
+        i = string_at(a, &key, s, i)
+        if (i < 0) {
+            a.free(key)
+            return false
+        }
+        i = skip_ws(s, i)
+        if (i >= @len(s) or s[i] != ':') {
+            a.free(key)
+            return false
+        }
+        i = skip_ws(s, i + 1)
+        const end = value_end(a, s, i)
+        if (end < 0) {
+            a.free(key)
+            return false
+        }
+        var value: Buf(u8) = .empty
+        var kind: u8 = 'o'
+        if (s[i] == '"') {
+            kind = 's'
+            _ = string_at(a, &value, s, i)
+        } else {
+            a.append_str(&value, s[i..end])
+            if (s[i] == '-' or (s[i] >= '0' and s[i] <= '9')) {
+                kind = 'n'
+            } else if (s[i..end] == "null") {
+                kind = 'z'
+            }
+        }
+        // The last of a repeated key wins, as JSON.parse keeps it.
+        var k = 0
+        while (k < @len(out)) {
+            if (out[k].key == key) {
+                @swap(&out, k, @len(out) - 1)
+                if (a.pop(&out)) |old| {
+                    old.deinit(a)
+                }
+                k = @len(out)
+            }
+            k = k + 1
+        }
+        a.push(&out, Member{ .key = key, .kind = kind, .value = value })
+        i = skip_ws(s, end)
+        if (i >= @len(s)) {
+            return false
+        }
+        if (s[i] == '}') {
+            return skip_ws(s, i + 1) == @len(s)
+        }
+        if (s[i] != ',') {
+            return false
+        }
+        i = skip_ws(s, i + 1)
+    }
+    return false
+}
+
+// Where the member named key is in members, or -1.
+fn find(members: Buf(Member), key: str) i64 {
+    var i = 0
+    while (i < @len(members)) {
+        if (members[i].key == key) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+const HEX = "0123456789abcdef"
+
+// s as a JSON string, as ActiveSupport::JSON.encode writes it, at the end
+// of out.
+fn encode_string(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    a.push(&out, '"')
+    for (s) |c| {
+        if (c == '"') {
+            a.append_str(&out, "\\\"")
+        } else if (c == '\\') {
+            a.append_str(&out, "\\\\")
+        } else if (c == '\n') {
+            a.append_str(&out, "\\n")
+        } else if (c == '\r') {
+            a.append_str(&out, "\\r")
+        } else if (c == '\t') {
+            a.append_str(&out, "\\t")
+        } else if (c == 8) {
+            a.append_str(&out, "\\b")
+        } else if (c == 12) {
+            a.append_str(&out, "\\f")
+        } else if (c < 0x20 or c == '<' or c == '>' or c == '&') {
+            a.append_str(&out, "\\u00")
+            a.push(&out, HEX[@as(i64, c >> 4)])
+            a.push(&out, HEX[@as(i64, c & 15)])
+        } else {
+            a.push(&out, c)
+        }
+    }
+    a.push(&out, '"')
+}

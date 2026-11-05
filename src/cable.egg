@@ -10,14 +10,47 @@
 //   without one.
 //
 // The reader ends the writer by queueing an empty frame when it is done.
-uses alloc, net, thread, time
+uses alloc, io, net, thread, time
 
 const ws = @import("ws.egg")
+const json = @import("json.egg")
+const turbo = @import("turbo.egg")
+const sqlite = @import("sqlite.egg")
 
 // The ping Action Cable sends every BEAT_NS, whatever else goes out.
 const BEAT_NS = 3000000000
 // Frames a writer may have queued before the reader waits.
 const QUEUE = 256
+// Database connections the readers share, taken for a query and handed
+// back (a connection per socket would be one per open page).
+const POOL = 4
+// Bounds on what one socket can make the server hold, as in the Rust app (a
+// page subscribes to six channels, with identifiers of a few hundred bytes).
+const MAX_SUBSCRIPTIONS = 64
+const MAX_IDENTIFIER = 4096
+
+// A database connection of the pool.
+const Pooled = owned struct {
+    db: sqlite.Db
+
+    fn deinit(sink self: Pooled) void {
+        self.db.close()
+        @forget(self)
+    }
+}
+
+// A subscription: its identifier as the client wrote it, and the stream it
+// listens to (empty for none yet).
+const Sub = owned struct {
+    identifier: Buf(u8)
+    stream: Buf(u8)
+
+    fn deinit(sink self: Sub, a: Allocator) void {
+        a.free(self.identifier)
+        a.free(self.stream)
+        @forget(self)
+    }
+}
 
 // A connection the handshake signed in as user.
 const Upgrade = owned struct {
@@ -41,9 +74,23 @@ const WELCOME = "{\"type\":\"welcome\"}"
 const UNAUTHORIZED = "{\"type\":\"disconnect\",\"reason\":\"unauthorized\",\"reconnect\":false}"
 
 // Takes connections from ups and starts their threads, until every worker
-// has stopped.
-fn run(sink ups: Receiver(Upgrade), a: Allocator, threads: Threads, clock: Clock) void {
+// has stopped. key verifies signed stream names (turbo.key).
+fn run(sink ups: Receiver(Upgrade), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
     defer ups.close()
+    defer a.free(key)
+    const pool = threads.channel(Pooled, POOL)
+    defer pool.close()
+    const back = pool.sender()
+    defer back.close()
+    var i = 0
+    while (i < POOL) {
+        const db = sqlite.open(a, db_path) catch |e| {
+            io.eprint("cable: cannot open ", db_path, ": ", @errorName(e))
+            return
+        }
+        back.send(Pooled{ .db = db })
+        i = i + 1
+    }
     while (ups.recv()) |u| {
         const copy = u.conn.clone() catch {
             u.deinit()
@@ -52,17 +99,17 @@ fn run(sink ups: Receiver(Upgrade), a: Allocator, threads: Threads, clock: Clock
         const queue = threads.channel(Buf(u8), QUEUE)
         const out = queue.sender()
         threads.spawn(writer, copy, queue, a, clock).detach()
-        threads.spawn(reader, u, out, a).detach()
+        threads.spawn(reader, u, out, pool.clone(), back.clone(), a.concat(key, ""), io, a).detach()
     }
 }
 
 fn ping(a: Allocator, clock: Clock) Buf(u8) {
-    var json: Buf(u8) = .empty
-    defer a.free(json)
-    a.append_str(&json, "{\"type\":\"ping\",\"message\":")
-    a.append_int(&json, clock.now() / 1000000000)
-    a.append_str(&json, "}")
-    return ws.text_frame(a, json)
+    var msg: Buf(u8) = .empty
+    defer a.free(msg)
+    a.append_str(&msg, "{\"type\":\"ping\",\"message\":")
+    a.append_int(&msg, clock.now() / 1000000000)
+    a.append_str(&msg, "}")
+    return ws.text_frame(a, msg)
 }
 
 // Sends what is queued, and a ping every BEAT_NS, until an empty frame.
@@ -102,11 +149,16 @@ fn writer(sink c: TcpConn, sink queue: Receiver(Buf(u8)), a: Allocator, clock: C
 
 // Reads the client's messages until it closes or breaks the protocol, then
 // ends the writer.
-fn reader(sink u: Upgrade, sink out: Sender(Buf(u8)), a: Allocator) void {
+fn reader(sink u: Upgrade, sink out: Sender(Buf(u8)), sink pool: Receiver(Pooled), sink back: Sender(Pooled), sink key: Buf(u8), io: Io, a: Allocator) void {
     defer u.deinit()
+    defer pool.close()
+    defer back.close()
+    defer a.free(key)
     defer out.close()
     defer out.send(.empty)
     out.send(ws.text_frame(a, WELCOME))
+    var subs: Buf(Sub) = .empty
+    defer a.free(subs)
     var part = ws.partial()
     defer part.deinit(a)
     var data: Buf(u8) = .empty
@@ -115,7 +167,9 @@ fn reader(sink u: Upgrade, sink out: Sender(Buf(u8)), a: Allocator) void {
         const kind = ws.read_message(u.conn, a, &part, &data) catch {
             return
         }
-        if (kind == ws.PING) {
+        if (kind == ws.TEXT) {
+            command(a, io, u.user, key, &subs, out, pool, back, data)
+        } else if (kind == ws.PING) {
             var pong: Buf(u8) = .empty
             ws.frame(a, &pong, ws.PONG, data)
             out.send(pong)
@@ -127,7 +181,179 @@ fn reader(sink u: Upgrade, sink out: Sender(Buf(u8)), a: Allocator) void {
         } else if (kind == ws.PROTOCOL_ERROR or kind == ws.TOO_BIG) {
             out.send(ws.close_frame(a, -kind))
             return
+        } else if (kind == ws.BINARY) {
+            io.eprint("cable: Couldn't handle non-string message")
         }
-        // Text: commands, not handled yet. Binary and pongs are ignored.
     }
+}
+
+// {"identifier":<identifier>,"type":<kind>} as a frame.
+fn reply(a: Allocator, identifier: []u8, kind: str) Buf(u8) {
+    var msg: Buf(u8) = .empty
+    defer a.free(msg)
+    a.append_str(&msg, "{\"identifier\":")
+    json.encode_string(a, &msg, identifier)
+    a.append_str(&msg, ",\"type\":\"")
+    a.append_str(&msg, kind)
+    a.append_str(&msg, "\"}")
+    return ws.text_frame(a, msg)
+}
+
+// Is members' key the string value?
+fn is(members: Buf(json.Member), key: str, value: str) bool {
+    const i = json.find(members, key)
+    return i >= 0 and members[i].kind == 's' and members[i].value == value
+}
+
+// Where the subscription with identifier is in subs, or -1.
+fn sub_at(subs: Buf(Sub), identifier: []u8) i64 {
+    var i = 0
+    while (i < @len(subs)) {
+        if (subs[i].identifier == identifier) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// One command from the client (ActionCable::Connection::Subscriptions):
+// subscribe, unsubscribe, or a message to a channel. What it cannot do is
+// logged, as Rails logs it, and not answered.
+fn command(a: Allocator, io: Io, user: i64, key: []u8, inout subs: Buf(Sub), out: Sender(Buf(u8)), pool: Receiver(Pooled), back: Sender(Pooled), text: []u8) void {
+    var data: Buf(json.Member) = .empty
+    defer a.free(data)
+    if (!json.object(a, &data, text)) {
+        io.eprint("cable: Could not execute command from ", text)
+        return
+    }
+    const subscribe = is(data, "command", "subscribe")
+    const unsubscribe = is(data, "command", "unsubscribe")
+    const ii = json.find(data, "identifier")
+    if (!subscribe and !unsubscribe and !is(data, "command", "message")) {
+        io.eprint("cable: Received unrecognized command in ", text)
+        return
+    }
+    if (ii < 0 or data[ii].kind != 's') {
+        io.eprint("cable: Could not execute command: missing identifier")
+        return
+    }
+    const identifier = data[ii].value[0..]
+    const at = sub_at(subs, identifier)
+    if (unsubscribe) {
+        if (at < 0) {
+            io.eprint("cable: Unable to find subscription with identifier: ", identifier)
+            return
+        }
+        @swap(&subs, at, @len(subs) - 1)
+        if (a.pop(&subs)) |gone| {
+            gone.deinit(a)
+        }
+        return
+    }
+    if (!subscribe) {
+        if (at < 0) {
+            io.eprint("cable: Unable to find subscription with identifier: ", identifier)
+        }
+        // Channels' actions come later.
+        return
+    }
+    var params: Buf(json.Member) = .empty
+    defer a.free(params)
+    if (!json.object(a, &params, identifier)) {
+        io.eprint("cable: Could not execute command: invalid identifier ", identifier)
+        return
+    }
+    if (at >= 0) {
+        return
+    }
+    if (@len(subs) >= MAX_SUBSCRIPTIONS or @len(identifier) > MAX_IDENTIFIER) {
+        io.eprint("cable: Could not execute command: subscription limit reached")
+        return
+    }
+    const streams = is(params, "channel", "Turbo::StreamsChannel")
+    const room_messages = is(params, "channel", "RoomMessagesChannel")
+    var stream: Buf(u8) = .empty
+    if (streams or room_messages) {
+        const si = json.find(params, "signed_stream_name")
+        if (si >= 0 and params[si].kind != 's' and params[si].kind != 'z') {
+            io.eprint("cable: Could not execute command: ", identifier)
+            a.free(stream)
+            return
+        }
+        var verified: Buf(u8) = .empty
+        if (si >= 0 and params[si].kind == 's') {
+            if (turbo.verify(a, key, params[si].value)) |v| {
+                a.free(@replace(&verified, v))
+            }
+        }
+        var ok = @len(verified) > 0
+        if (ok and streams) {
+            // RoomStreamsAreAuthorized: a room's messages only through
+            // RoomMessagesChannel.
+            ok = !turbo.guarded(verified)
+        } else if (ok) {
+            ok = member_of_room(a, io, pool, back, user, verified)
+        }
+        if (!ok) {
+            a.free(verified)
+            a.free(stream)
+            out.send(reply(a, identifier, "reject_subscription"))
+            return
+        }
+        a.free(@replace(&stream, verified))
+    } else if (!other_channel(params)) {
+        io.eprint("cable: Subscription class not found: ", identifier)
+        a.free(stream)
+        return
+    }
+    // The app's other channels are confirmed; what they do comes later.
+    a.push(&subs, Sub{ .identifier = a.concat(identifier, ""), .stream = stream })
+    out.send(reply(a, identifier, "confirm_subscription"))
+}
+
+// The app's other channels.
+fn other_channel(params: Buf(json.Member)) bool {
+    for ([_]str{ "HeartbeatChannel", "PresenceChannel", "ReadRoomsChannel", "TypingNotificationsChannel", "UnreadRoomsChannel", "RoomChannel", "ApplicationCable::Channel" }) |c| {
+        if (is(params, "channel", c)) {
+            return true
+        }
+    }
+    return false
+}
+
+// RoomMessagesChannel.subscribable_room: is the room the message stream
+// names one the user is a member of (and of the class the name says)?
+fn member_of_room(a: Allocator, io: Io, pool: Receiver(Pooled), back: Sender(Pooled), user: i64, stream: []u8) bool {
+    const ref = turbo.room_stream(a, stream) orelse {
+        return false
+    }
+    defer ref.deinit(a)
+    const p = pool.recv() orelse {
+        return false
+    }
+    defer back.send(p)
+    var st = p.db.prepare("SELECT rooms.type FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1") catch {
+        return false
+    }
+    defer st.finalize()
+    st.bind_int(1, ref.id) catch {
+        return false
+    }
+    st.bind_int(2, user) catch {
+        return false
+    }
+    const found = st.next() catch |e| {
+        io.eprint("cable: ", @errorName(e))
+        return false
+    }
+    if (!found) {
+        return false
+    }
+    if (ref.class == "Room") {
+        return true
+    }
+    const kind = st.text(a, 0)
+    defer a.free(kind)
+    return kind == ref.class
 }

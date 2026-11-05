@@ -7,6 +7,7 @@ const text = @import("std/text")
 const http = @import("http.egg")
 const app = @import("app.egg")
 const cable = @import("cable.egg")
+const turbo = @import("turbo.egg")
 
 const Worker = owned struct {
     t: Thread
@@ -48,8 +49,8 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
 }
 
 // cable.run, as spawn takes only this file's functions for now.
-fn run_cable(sink ups: Receiver(cable.Upgrade), a: Allocator, threads: Threads, clock: Clock) void {
-    cable.run(ups, a, threads, clock)
+fn run_cable(sink ups: Receiver(cable.Upgrade), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
+    cable.run(ups, key, io, a, threads, clock, db_path)
 }
 
 fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs) !void {
@@ -94,7 +95,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     // threads for each.
     const upgrades = threads.channel(cable.Upgrade, 64)
     const cable_tx = upgrades.sender()
-    threads.spawn(run_cable, upgrades, a, threads, clock).detach()
+    threads.spawn(run_cable, upgrades, turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty
