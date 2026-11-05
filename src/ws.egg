@@ -1,0 +1,197 @@
+// WebSocket (RFC 6455) for Action Cable: the handshake's accept value, and
+// frames. A server's frames go out unmasked and whole; a client's come in
+// masked, and a message may come in fragments, with control frames between
+// them. No extension is offered (no permessage-deflate).
+uses alloc, net
+
+const codec = @import("codec.egg")
+const crypto = @import("crypto.egg")
+
+const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const CONTINUATION = 0
+const TEXT = 1
+const BINARY = 2
+const CLOSE = 8
+const PING = 9
+const PONG = 10
+
+// What read_message gives for a frame no client may send (close 1002), and
+// for a message larger than MAX_MESSAGE (close 1009).
+const PROTOCOL_ERROR = -1002
+const TOO_BIG = -1009
+const MAX_MESSAGE = 1048576
+
+// Is key a Sec-WebSocket-Key: the Base64 of 16 bytes?
+fn valid_key(a: Allocator, key: []u8) bool {
+    var raw: Buf(u8) = .empty
+    defer a.free(raw)
+    return codec.base64_decode(a, &raw, key) and @len(raw) == 16
+}
+
+// Sec-WebSocket-Accept for key.
+fn accept(a: Allocator, key: []u8) Buf(u8) {
+    const joined = a.concat(key, GUID)
+    defer a.free(joined)
+    const digest = crypto.sha1(a, joined)
+    defer a.free(digest)
+    var out: Buf(u8) = .empty
+    codec.base64_encode(a, &out, digest)
+    return out
+}
+
+// A whole frame of opcode with payload, at the end of out.
+fn frame(a: Allocator, inout out: Buf(u8), opcode: i64, payload: []u8) void {
+    a.push(&out, @as(u8, 0x80 | opcode))
+    const n = @len(payload)
+    if (n < 126) {
+        a.push(&out, @as(u8, n))
+    } else if (n < 65536) {
+        a.push(&out, 126)
+        a.push(&out, @as(u8, n >> 8))
+        a.push(&out, @as(u8, n & 0xFF))
+    } else {
+        a.push(&out, 127)
+        var shift = 56
+        while (shift >= 0) {
+            a.push(&out, @as(u8, (n >> shift) & 0xFF))
+            shift = shift - 8
+        }
+    }
+    a.append_str(&out, payload)
+}
+
+// A text frame of payload, by itself.
+fn text_frame(a: Allocator, payload: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    frame(a, &out, TEXT, payload)
+    return out
+}
+
+// A close frame with code and no reason.
+fn close_frame(a: Allocator, code: i64) Buf(u8) {
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    a.push(&body, @as(u8, code >> 8))
+    a.push(&body, @as(u8, code & 0xFF))
+    var out: Buf(u8) = .empty
+    frame(a, &out, CLOSE, body)
+    return out
+}
+
+// n more bytes from c at the end of out. A timeout only means the client
+// is quiet: waiting goes on. Fails with error.Closed if c ends first.
+fn read_exact(c: TcpConn, a: Allocator, inout out: Buf(u8), n: i64) !void {
+    var chunk: Buf(u8) = .empty
+    defer a.free(chunk)
+    const want = @len(out) + n
+    while (@len(out) < want) {
+        const got = c.read(a, &chunk, want - @len(out)) catch |e| {
+            if (e == error.TimedOut) {
+                continue
+            }
+            return e
+        }
+        if (got == 0) {
+            return error.Closed
+        }
+        a.append_str(&out, chunk)
+    }
+}
+
+// What a connection has received of a message that came in fragments.
+const Partial = owned struct {
+    // Its opcode (text or binary), or -1 between messages.
+    kind: i64
+    data: Buf(u8)
+
+    fn deinit(sink self: Partial, a: Allocator) void {
+        a.free(self.data)
+        @forget(self)
+    }
+}
+
+fn partial() Partial {
+    return Partial{ .kind = -1, .data = .empty }
+}
+
+// The next message from c in data (in place of what it held): a text or
+// binary message whole, or a control frame (close, ping, pong) with its
+// payload, which may come between the fragments of a message (kept in
+// part meanwhile). Its opcode, or PROTOCOL_ERROR or TOO_BIG.
+fn read_message(c: TcpConn, a: Allocator, inout part: Partial, inout data: Buf(u8)) !i64 {
+    a.free(@replace(&data, .empty))
+    var head: Buf(u8) = .empty
+    defer a.free(head)
+    while (true) {
+        a.free(@replace(&head, .empty))
+        try read_exact(c, a, &head, 2)
+        const fin = (head[0] & 0x80) != 0
+        const opcode = @as(i64, head[0] & 0x0F)
+        var n = @as(i64, head[1] & 0x7F)
+        // No extension was agreed, so no reserved bit may be set, and every
+        // client frame is masked.
+        if ((head[0] & 0x70) != 0 or (head[1] & 0x80) == 0) {
+            return PROTOCOL_ERROR
+        }
+        if (n == 126) {
+            try read_exact(c, a, &head, 2)
+            n = @as(i64, head[2]) << 8 | @as(i64, head[3])
+        } else if (n == 127) {
+            try read_exact(c, a, &head, 8)
+            if ((head[2] & 0x80) != 0) {
+                return PROTOCOL_ERROR
+            }
+            n = 0
+            var i = 2
+            while (i < 10) {
+                n = n << 8 | @as(i64, head[i])
+                i = i + 1
+            }
+        }
+        const control = opcode >= CLOSE
+        if (opcode >= 3 and opcode <= 7 or opcode > PONG) {
+            return PROTOCOL_ERROR
+        }
+        if (control and (!fin or n > 125)) {
+            return PROTOCOL_ERROR
+        }
+        // A message's first fragment, or the next one of the message begun.
+        if (!control and (opcode == CONTINUATION) == (part.kind < 0)) {
+            return PROTOCOL_ERROR
+        }
+        if (!control and @len(part.data) + n > MAX_MESSAGE) {
+            return TOO_BIG
+        }
+        const mask_at = @len(head)
+        try read_exact(c, a, &head, 4)
+        const from = if (control) 0 else @len(part.data)
+        if (control) {
+            try read_exact(c, a, &data, n)
+        } else {
+            try read_exact(c, a, &part.data, n)
+        }
+        var i = 0
+        while (i < n) {
+            if (control) {
+                data[i] = data[i] ^ head[mask_at + i % 4]
+            } else {
+                part.data[from + i] = part.data[from + i] ^ head[mask_at + i % 4]
+            }
+            i = i + 1
+        }
+        if (control) {
+            return opcode
+        }
+        if (part.kind < 0) {
+            part.kind = opcode
+        }
+        if (fin) {
+            const kind = part.kind
+            part.kind = -1
+            a.free(@replace(&data, @replace(&part.data, .empty)))
+            return kind
+        }
+    }
+    return PROTOCOL_ERROR
+}

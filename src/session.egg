@@ -85,6 +85,26 @@ fn set_cookie(a: Allocator, inout out: Buf(u8), key: []u8, clock: Clock, token: 
     a.append_str(&out, "; httponly; samesite=lax\r\n")
 }
 
+// ApplicationCable::Connection's current_user: the user of the session the
+// Cookie header names, whatever the user's status; null if none.
+fn cable_user(a: Allocator, db: sqlite.Db, key: []u8, clock: Clock, header: []u8) !?i64 {
+    const raw = codec.cookie_value(a, header, "session_token") orelse {
+        return null
+    }
+    defer a.free(raw)
+    const token = cookie.verify(a, key, "session_token", raw, clock.now()) orelse {
+        return null
+    }
+    defer a.free(token)
+    var st = try db.prepare("SELECT users.id FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind(1, token)
+    if (try st.next()) {
+        return st.int(0)
+    }
+    return null
+}
+
 // The user whose session the Cookie header names, or null.
 fn current_user(a: Allocator, db: sqlite.Db, key: []u8, clock: Clock, header: []u8) !?i64 {
     const raw = codec.cookie_value(a, header, "session_token") orelse {

@@ -5,7 +5,7 @@
 # first.
 ARG DEBIAN_RELEASE=trixie
 # egg main with #74-#77 (FFI bytes, args.env, constants, time and rand).
-ARG EGG_REF=f5fba8f
+ARG EGG_REF=0e5ba2f
 # gzip through zlib-ng's zlib-compatible build, linked statically: the Rust
 # app deflates with zlib-rs, of the same speed, and stock zlib is slower.
 ARG ZLIB_NG_VERSION=2.2.4

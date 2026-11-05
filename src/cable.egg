@@ -1,0 +1,133 @@
+// Action Cable over WebSocket. An HTTP worker answers the handshake on
+// /cable, signs the connection in, and hands it here; it then serves other
+// requests. Each connection gets two threads, since a TcpConn blocks:
+//
+// - its reader, which holds the connection, reads the client's frames and
+//   answers them;
+// - its writer, with a clone of the connection, the only one to write it:
+//   every frame goes through its queue, whole, and it sends Action Cable's
+//   ping every 3 s, as the client counts a connection stale after 6 s
+//   without one.
+//
+// The reader ends the writer by queueing an empty frame when it is done.
+uses alloc, net, thread, time
+
+const ws = @import("ws.egg")
+
+// The ping Action Cable sends every BEAT_NS, whatever else goes out.
+const BEAT_NS = 3000000000
+// Frames a writer may have queued before the reader waits.
+const QUEUE = 256
+
+// A connection the handshake signed in as user.
+const Upgrade = owned struct {
+    conn: TcpConn
+    user: i64
+
+    fn deinit(sink self: Upgrade) void {
+        self.conn.close()
+        @forget(self)
+    }
+}
+
+fn upgrade(sink conn: TcpConn, user: i64) Upgrade {
+    return Upgrade{ .conn = conn, .user = user }
+}
+
+const WELCOME = "{\"type\":\"welcome\"}"
+
+// {"type":"disconnect","reason":"unauthorized","reconnect":false}, for a
+// connection that did not sign in.
+const UNAUTHORIZED = "{\"type\":\"disconnect\",\"reason\":\"unauthorized\",\"reconnect\":false}"
+
+// Takes connections from ups and starts their threads, until every worker
+// has stopped.
+fn run(sink ups: Receiver(Upgrade), a: Allocator, threads: Threads, clock: Clock) void {
+    defer ups.close()
+    while (ups.recv()) |u| {
+        const copy = u.conn.clone() catch {
+            u.deinit()
+            continue
+        }
+        const queue = threads.channel(Buf(u8), QUEUE)
+        const out = queue.sender()
+        threads.spawn(writer, copy, queue, a, clock).detach()
+        threads.spawn(reader, u, out, a).detach()
+    }
+}
+
+fn ping(a: Allocator, clock: Clock) Buf(u8) {
+    var json: Buf(u8) = .empty
+    defer a.free(json)
+    a.append_str(&json, "{\"type\":\"ping\",\"message\":")
+    a.append_int(&json, clock.now() / 1000000000)
+    a.append_str(&json, "}")
+    return ws.text_frame(a, json)
+}
+
+// Sends what is queued, and a ping every BEAT_NS, until an empty frame.
+// Once a write fails it only empties the queue, so no sender waits on it.
+fn writer(sink c: TcpConn, sink queue: Receiver(Buf(u8)), a: Allocator, clock: Clock) void {
+    defer c.close()
+    defer queue.close()
+    var alive = true
+    var beat = clock.monotonic()
+    while (true) {
+        const wait_ms = (beat + BEAT_NS - clock.monotonic()) / 1000000
+        if (wait_ms <= 0) {
+            if (alive) {
+                const p = ping(a, clock)
+                defer a.free(p)
+                c.write(p) catch {
+                    alive = false
+                }
+            }
+            beat = clock.monotonic()
+            continue
+        }
+        if (queue.recv_timeout(wait_ms)) |bytes| {
+            const done = @len(bytes) == 0
+            if (alive and !done) {
+                c.write(bytes) catch {
+                    alive = false
+                }
+            }
+            a.free(bytes)
+            if (done) {
+                return
+            }
+        }
+    }
+}
+
+// Reads the client's messages until it closes or breaks the protocol, then
+// ends the writer.
+fn reader(sink u: Upgrade, sink out: Sender(Buf(u8)), a: Allocator) void {
+    defer u.deinit()
+    defer out.close()
+    defer out.send(.empty)
+    out.send(ws.text_frame(a, WELCOME))
+    var part = ws.partial()
+    defer part.deinit(a)
+    var data: Buf(u8) = .empty
+    defer a.free(data)
+    while (true) {
+        const kind = ws.read_message(u.conn, a, &part, &data) catch {
+            return
+        }
+        if (kind == ws.PING) {
+            var pong: Buf(u8) = .empty
+            ws.frame(a, &pong, ws.PONG, data)
+            out.send(pong)
+        } else if (kind == ws.CLOSE) {
+            // The closing handshake: the same code back, or a normal close.
+            const code = if (@len(data) >= 2) @as(i64, data[0]) << 8 | @as(i64, data[1]) else 1000
+            out.send(ws.close_frame(a, code))
+            return
+        } else if (kind == ws.PROTOCOL_ERROR or kind == ws.TOO_BIG) {
+            out.send(ws.close_frame(a, -kind))
+            return
+        }
+        // Text: commands, not handled yet. Binary and pongs are ignored.
+    }
+}

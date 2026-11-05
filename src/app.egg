@@ -17,6 +17,8 @@ const respcache = @import("respcache.egg")
 const filecache = @import("filecache.egg")
 const fragcache = @import("fragcache.egg")
 const splice = @import("splice.egg")
+const ws = @import("ws.egg")
+const cable = @import("cable.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -52,11 +54,14 @@ const Context = owned struct {
     // The write token: take it, write, hand it back (see main).
     lock_rx: Receiver(bool)
     lock_tx: Sender(bool)
+    // Where a WebSocket goes once signed in (see cable).
+    cable: Sender(cable.Upgrade)
 
     fn close(sink self: Context, a: Allocator) void {
         self.db.close()
         self.lock_rx.close()
         self.lock_tx.close()
+        self.cable.close()
         self.cache.close(a)
         self.files_sent.close(a)
         self.frags.close(a)
@@ -69,16 +74,18 @@ const Context = owned struct {
     }
 }
 
-fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool)) !Context {
+fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade)) !Context {
     const db = sqlite.open(a, cfg.db_path) catch |e| {
         lock_rx.close()
         lock_tx.close()
+        cable_tx.close()
         return e
     }
     const cache = respcache.open(a, cfg.db_path, cfg.cache, cfg.cache and cfg.response_cache) catch |e| {
         db.close()
         lock_rx.close()
         lock_tx.close()
+        cable_tx.close()
         return e
     }
     const secret = cfg.secret
@@ -99,6 +106,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         .pieces = splice.open(cfg.cache),
         .lock_rx = lock_rx,
         .lock_tx = lock_tx,
+        .cable = cable_tx,
     }
 }
 
@@ -106,7 +114,81 @@ const HTML = "Content-Type: text/html; charset=utf-8\r\n"
 
 const SIGN_IN = "<!DOCTYPE html><html><head><title>Campfire</title></head><body><form action=\"/session\" method=\"post\"><input type=\"email\" name=\"email_address\" required autofocus><input type=\"password\" name=\"password\" required><button type=\"submit\">Sign in</button></form></body></html>"
 
-fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+// Answers req; whether c goes on serving HTTP (not after a WebSocket
+// handshake).
+fn handle(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !bool {
+    if (req.method == "GET" and req.path == "/cable") {
+        return cable_open(c, a, &ctx, req)
+    }
+    try dispatch(c, a, &ctx, req)
+    return true
+}
+
+// The Action Cable subprotocol the client asks for first of those there
+// are, as the client lists them; null if none.
+fn cable_protocol(asked: []u8) ?str {
+    var i = 0
+    while (i < @len(asked)) {
+        const end = text.find_from(asked, ",", i) orelse @len(asked)
+        var lo = i
+        var hi = end
+        while (lo < hi and asked[lo] == ' ') {
+            lo = lo + 1
+        }
+        while (hi > lo and asked[hi - 1] == ' ') {
+            hi = hi - 1
+        }
+        if (asked[lo..hi] == "actioncable-v1-json") {
+            return "actioncable-v1-json"
+        } else if (asked[lo..hi] == "actioncable-unsupported") {
+            return "actioncable-unsupported"
+        }
+        i = end + 1
+    }
+    return null
+}
+
+// GET /cable: a WebSocket handshake from this app's own origin, as Action
+// Cable allows by default, or the 404 page. Once switched, the connection
+// signs in with its session cookie after all, as ApplicationCable::Connection
+// does: if it cannot, it is told so and closed; if it can, cable takes it.
+fn cable_open(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !bool {
+    const base = a.concat("http://", req.host)
+    defer a.free(base)
+    if (!req.upgrade or req.origin != base or req.ws_version != "13" or !ws.valid_key(a, req.ws_key)) {
+        try not_found(c, a, req)
+        return true
+    }
+    var head: Buf(u8) = .empty
+    defer a.free(head)
+    a.append_str(&head, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: ")
+    const key = ws.accept(a, req.ws_key)
+    defer a.free(key)
+    a.append_str(&head, key)
+    a.append_str(&head, "\r\n")
+    if (cable_protocol(req.ws_protocol)) |p| {
+        a.append_str(&head, "Sec-WebSocket-Protocol: ")
+        a.append_str(&head, p)
+        a.append_str(&head, "\r\n")
+    }
+    a.append_str(&head, "\r\n")
+    try c.write(head)
+    const user = try session.cable_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        var bye = ws.text_frame(a, cable.UNAUTHORIZED)
+        defer a.free(bye)
+        const close = ws.close_frame(a, 1000)
+        defer a.free(close)
+        a.append_str(&bye, close)
+        try c.write(bye)
+        return false
+    }
+    // A quiet client is fine; a client that stops reading is let go.
+    try c.set_timeout(60000)
+    ctx.cable.send(cable.upgrade(try c.clone(), user))
+    return false
+}
+
+fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
     if (req.method == "GET" and req.path == "/up") {
         return http.respond(c, a, req, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>")
     }
