@@ -22,6 +22,7 @@ const ws = @import("ws.egg")
 const cable = @import("cable.egg")
 const json = @import("json.egg")
 const crypto = @import("crypto.egg")
+const gzip = @import("gzip.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -206,6 +207,15 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
             return redirect(c, a, req, "/first_run")
         }
         return http.respond(c, a, req, "200 OK", HTML, SIGN_IN)
+    }
+    if (req.method == "GET" and req.path == "/account/logo") {
+        return account_logo(c, a, &ctx, req)
+    }
+    if (req.method == "GET" and req.path == "/webmanifest.json") {
+        return web_manifest(c, a, &ctx, req)
+    }
+    if (req.method == "GET" and req.path == "/service-worker.js") {
+        return service_worker(c, a, req)
     }
     if (req.method == "GET" and req.path == "/first_run") {
         return first_run_page(c, a, &ctx, req)
@@ -799,8 +809,8 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     try st.bind(1, SQUARE)
     try st.bind_int(2, user)
     if (!try st.next()) {
-        // No processed variant: initials and bot avatars are not drawn yet.
-        return not_found(c, a, req)
+        // No processed variant: the stock bot avatar, or initials.
+        return drawn_avatar(c, a, &ctx, req, user)
     }
     const key = st.text(a, 0)
     defer a.free(key)
@@ -831,6 +841,136 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     a.append_str(&headers, key)
     a.append_str(&headers, "\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
     return send_file(c, a, &ctx, req, sent, headers, body)
+}
+
+// Users::AvatarsHelper::AVATAR_COLORS, 18 of 7 bytes each.
+const AVATAR_COLORS = "#AF2E1B#CC6324#3B4B59#BFA07A#ED8008#ED3F1C#BF1B1B#736B1E#D07B53#736356#AD1D1D#BF7C2A#C09C6F#698F9C#7C956B#5D618F#3B3633#67695E"
+
+// A user without an uploaded avatar: a bot's stock picture, or an SVG of
+// the initials on a color picked by Zlib.crc32 of the id.
+fn drawn_avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, user: i64) !void {
+    var st = try ctx.db.prepare("SELECT name, role FROM users WHERE id = ?")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    if (!try st.next()) {
+        return not_found(c, a, req)
+    }
+    if (st.int(1) == 2) {
+        return stock_file(c, a, &ctx, req, "default-bot-avatar-de1d12f7.svg", "Content-Type: image/svg+xml\r\nContent-Disposition: inline; filename=\"default-bot-avatar.svg\"; filename*=UTF-8''default-bot-avatar.svg\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n")
+    }
+    const name = st.text(a, 0)
+    defer a.free(name)
+    const letters = initials(a, name)
+    defer a.free(letters)
+    var id: Buf(u8) = .empty
+    defer a.free(id)
+    a.append_int(&id, user)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    const color = gzip.checksum(id) % 18 * 7
+    views.avatar_svg(a, &body, AVATAR_COLORS[color..color + 7], letters, @len(letters) >= 3)
+    return http.respond(c, a, req, "200 OK", "Content-Type: image/svg+xml; charset=utf-8\r\nCache-Control: max-age=1800, public, stale-while-revalidate=604800\r\n", body)
+}
+
+// User#initials, name.scan(/\b\w/).join: an ASCII word character that
+// starts a word (any non-ASCII byte counts as part of a word, as Ruby's \b
+// sees Unicode letters).
+fn initials(a: Allocator, name: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    var prev_word = false
+    for (name) |ch| {
+        const ascii_word = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_'
+        if (ascii_word and !prev_word) {
+            a.push(&out, ch)
+        }
+        prev_word = ascii_word or ch >= 128
+    }
+    return out
+}
+
+// A file of the precompiled assets under its own headers, kept like an
+// asset's response.
+fn stock_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, name: str, headers: str) !void {
+    const path = a.concat(ctx.assets, "/", name)
+    defer a.free(path)
+    const key = filecache.key_for(a, path, req)
+    defer a.free(key)
+    const i = ctx.files_sent.find(key)
+    if (i >= 0) {
+        return ctx.files_sent.send(c, a, i, req.keep)
+    }
+    const body = ctx.fs.read(a, path) catch {
+        return not_found(c, a, req)
+    }
+    defer a.free(body)
+    return send_file(c, a, &ctx, req, key, headers, body)
+}
+
+// GET /account/logo: the stock app icon, public so it can be the PWA's
+// icon (an uploaded logo is not served yet).
+fn account_logo(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    var small = false
+    if (codec.form_value(a, req.query, "size")) |v| {
+        small = v == "small"
+        a.free(v)
+    }
+    if (small) {
+        return stock_file(c, a, &ctx, req, "logos/app-icon-192-646b105a.png", "Content-Type: image/png\r\nContent-Disposition: inline; filename=\"app-icon-192.png\"; filename*=UTF-8''app-icon-192.png\r\nCache-Control: max-age=300, public, stale-while-revalidate=604800\r\n")
+    }
+    return stock_file(c, a, &ctx, req, "logos/app-icon-a6fa894e.png", "Content-Type: image/png\r\nContent-Disposition: inline; filename=\"app-icon.png\"; filename*=UTF-8''app-icon.png\r\nCache-Control: max-age=300, public, stale-while-revalidate=604800\r\n")
+}
+
+// GET /webmanifest.json
+fn web_manifest(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    var name: Buf(u8) = .empty
+    defer a.free(name)
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
+    var st = try ctx.db.prepare("SELECT name, updated_at FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (try st.next()) {
+        const n = st.text(a, 0)
+        defer a.free(n)
+        json.encode_plain(a, &name, n)
+        const t = st.text(a, 1)
+        defer a.free(t)
+        a.append_str(&stamp, "v=")
+        tf.number_stamp(a, &stamp, tf.parse_db(t) orelse 0)
+    } else {
+        a.append_str(&name, "\"Campfire\"")
+    }
+    var small: Buf(u8) = .empty
+    defer a.free(small)
+    var large: Buf(u8) = .empty
+    defer a.free(large)
+    a.append_str(&small, "/account/logo?size=small")
+    a.append_str(&large, "/account/logo")
+    if (@len(stamp) > 0) {
+        a.append_str(&small, "&")
+        a.append_str(&small, stamp)
+        a.append_str(&large, "?")
+        a.append_str(&large, stamp)
+    }
+    var small_json: Buf(u8) = .empty
+    defer a.free(small_json)
+    json.encode_plain(a, &small_json, small)
+    var large_json: Buf(u8) = .empty
+    defer a.free(large_json)
+    json.encode_plain(a, &large_json, large)
+    const base = a.concat("http://", req.host)
+    defer a.free(base)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.manifest(a, &body, name, small_json, large_json, base)
+    return http.respond(c, a, req, "200 OK", "Content-Type: application/json; charset=utf-8\r\n", body)
+}
+
+// GET /service-worker.js
+fn service_worker(c: TcpConn, a: Allocator, req: http.Request) !void {
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.service_worker(a, &body)
+    return http.respond(c, a, req, "200 OK", "Content-Type: text/javascript; charset=utf-8\r\n", body)
 }
 
 // verify_authenticity_token as the Rust app does it, by headers instead of

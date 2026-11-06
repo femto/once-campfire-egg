@@ -318,6 +318,16 @@ const HEX = "0123456789abcdef"
 // s as a JSON string, as ActiveSupport::JSON.encode writes it, at the end
 // of out.
 fn encode_string(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    quote(a, &out, s, true)
+}
+
+// s as a JSON string with only what JSON requires escaped (as serde_json
+// writes it: <, > and & stay), at the end of out.
+fn encode_plain(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    quote(a, &out, s, false)
+}
+
+fn quote(a: Allocator, inout out: Buf(u8), s: []u8, html_safe: bool) void {
     a.push(&out, '"')
     for (s) |c| {
         if (c == '"') {
@@ -334,7 +344,7 @@ fn encode_string(a: Allocator, inout out: Buf(u8), s: []u8) void {
             a.append_str(&out, "\\b")
         } else if (c == 12) {
             a.append_str(&out, "\\f")
-        } else if (c < 0x20 or c == '<' or c == '>' or c == '&') {
+        } else if (c < 0x20 or (html_safe and (c == '<' or c == '>' or c == '&'))) {
             a.append_str(&out, "\\u00")
             a.push(&out, HEX[@as(i64, c >> 4)])
             a.push(&out, HEX[@as(i64, c & 15)])

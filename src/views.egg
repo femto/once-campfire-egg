@@ -118,6 +118,19 @@ fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache
     a.push(&cuts, m.id)
 }
 
+// avatar_svg.html
+fn avatar_svg(a: Allocator, inout out: Buf(u8), color: []u8, letters: []u8, wide: bool) void {
+    a.append_str(&out, "<svg version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"\n  viewBox=\"0 0 512 512\" class=\"avatar\" aria-hidden=\"true\">\n  <defs>\n    <clipPath id=\"porthole\">\n      <circle cx=\"50%\" cy=\"50%\" r=\"50%\" />\n    </clipPath>\n  </defs>\n\n  <g>\n    <rect width=\"100%\" height=\"100%\" rx=\"50\" fill=\"")
+    a.append_str(&out, color)
+    a.append_str(&out, "\" />\n\n    <text x=\"50%\" y=\"50%\" fill=\"#FFFFFF\"\n      text-anchor=\"middle\" dy=\"0.35em\"\n      ")
+    if (wide) {
+    a.append_str(&out, "textLength=\"85%\" lengthAdjust=\"spacingAndGlyphs\"")
+    }
+    a.append_str(&out, "\n      font-family=\"-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif\"\n      font-size=\"230\"\n      font-weight=\"800\"\n      letter-spacing=\"-5\">\n      ")
+    html.escape(a, &out, letters)
+    a.append_str(&out, "\n    </text>\n  </g>\n</svg>\n")
+}
+
 // boost.html
 fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) void {
     a.append_str(&out, "\n      <div id=\"boost_")
@@ -226,6 +239,29 @@ fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserVie
     a.append_str(&out, logo_v)
     a.append_str(&out, "\">\n\n    ")
     a.append_str(&out, static_head.ASSETS)
+}
+
+// manifest.html
+fn manifest(a: Allocator, inout out: Buf(u8), name: []u8, small: []u8, large: []u8, base: []u8) void {
+    a.append_str(&out, "{\n  \"name\": ")
+    a.append_str(&out, name)
+    a.append_str(&out, ",\n  \"icons\": [\n    {\n      \"src\": ")
+    a.append_str(&out, small)
+    a.append_str(&out, ",\n      \"type\": \"image/png\",\n      \"sizes\": \"192x192\"\n    },\n    {\n      \"src\": ")
+    a.append_str(&out, large)
+    a.append_str(&out, ",\n      \"type\": \"image/png\",\n      \"sizes\": \"512x512\"\n    },\n    {\n      \"src\": ")
+    a.append_str(&out, large)
+    a.append_str(&out, ",\n      \"type\": \"image/png\",\n      \"sizes\": \"512x512\",\n      \"purpose\": \"maskable\"\n    }\n  ],\n  \"start_url\": \"/\",\n  \"display\": \"standalone\",\n  \"scope\": \"/\",\n  \"description\": \"A chat app from the makers of Basecamp and HEY.\",\n  \"categories\": [\"social\", \"business\", \"productivity\"],\n  \"theme_color\": \"#ffffff\",\n  \"background_color\": \"#ffffff\",\n  \"shortcuts\": [\n    {\n      \"name\": \"New chat room\",\n      \"description\": \"Open Campfire and start a new chat room\",\n      \"url\": \"rooms/opens/new\",\n      \"icons\": [{ \"src\": \"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/assets/add-f232d8a6.svg\", \"sizes\": \"any\" }]\n    },\n    {\n      \"name\": \"My profile\",\n      \"description\": \"Open Campfire and view your profile\",\n      \"url\": \"/users/me/profile\",\n      \"icons\": [{ \"src\": \"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/assets/person-da193438.svg\", \"sizes\": \"any\" }]\n    }\n  ],\n  \"screenshots\": [\n    {\n      \"src\": \"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/assets/screenshots/android-chat-f8b923c9.png\",\n      \"sizes\": \"1080x2400\",\n      \"form_factor\": \"narrow\",\n      \"label\": \"Campfire is an installable, self-hosted group chat system.\"\n    },\n    {\n      \"src\": \"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/assets/screenshots/android-sidebar-e9d2b49f.png\",\n      \"sizes\": \"1080x2400\",\n      \"form_factor\": \"narrow\",\n      \"label\": \"Easily invite people. Make rooms. @mentions, DMs, and mobile support.\"\n    },\n    {\n      \"src\": \"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/assets/screenshots/android-dark-mode-e43dcf59.png\",\n      \"sizes\": \"1080x2400\",\n      \"form_factor\": \"narrow\",\n      \"label\": \"Full support for dark mode, customizable to your brand.\"\n    }\n  ]\n}\n")
 }
 
 // message.html
@@ -479,6 +515,11 @@ fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages
     recents(a, &out, recent, base)
     a.append_str(&out, "\n  </div>    </aside>\n\n")
     layout_bottom(a, &out)
+}
+
+// service_worker.html
+fn service_worker(a: Allocator, inout out: Buf(u8)) void {
+    a.append_str(&out, "self.addEventListener(\"push\", async (event) => {\n  const data = await event.data.json()\n  event.waitUntil(Promise.all([ showNotification(data), updateBadgeCount(data.options) ]))\n})\n\nasync function showNotification({ title, options }) {\n  return self.registration.showNotification(title, options)\n}\n\nasync function updateBadgeCount({ data: { badge } }) {\n  return self.navigator.setAppBadge?.(badge || 0)\n}\n\nself.addEventListener(\"notificationclick\", (event) => {\n  event.notification.close()\n\n  const url = new URL(event.notification.data.path, self.location.origin).href\n  event.waitUntil(openURL(url))\n})\n\nasync function openURL(url) {\n  const clients = await self.clients.matchAll({ type: \"window\" })\n  const focused = clients.find((client) => client.focused)\n\n  if (focused) {\n    await focused.navigate(url)\n  } else {\n    await self.clients.openWindow(url)\n  }\n}\n")
 }
 
 // sidebar.html

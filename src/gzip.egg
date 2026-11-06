@@ -37,3 +37,8 @@ fn compress(a: Allocator, data: []u8) ?Buf(u8) {
     push_le32(a, &out, @as(u64, @len(data)) & 0xFFFFFFFF)
     return out
 }
+
+// Zlib.crc32 of data.
+fn checksum(data: []u8) i64 {
+    return @as(i64, crc32(0, @strPtr(data), @as(u32, @len(data))))
+}
