@@ -19,6 +19,7 @@ const ws = @import("ws.egg")
 const json = @import("json.egg")
 const turbo = @import("turbo.egg")
 const sqlite = @import("sqlite.egg")
+const tf = @import("timefmt.egg")
 
 // The ping Action Cable sends every BEAT_NS, whatever else goes out.
 const BEAT_NS = 3000000000
@@ -175,15 +176,55 @@ fn hub(sink cmds: Receiver(Cmd), a: Allocator) void {
     }
 }
 
-// A subscription: its identifier as the client wrote it, and the stream it
-// listens to (empty for none yet).
+// What a subscription is, for what its channel does after confirming it.
+const OTHER = 0
+const PRESENCE = 1
+const TYPING = 2
+
+// A subscription: its identifier as the client wrote it, the stream it
+// listens to (empty for none), and for a room's channels, which kind and
+// which room.
 const Sub = owned struct {
     identifier: Buf(u8)
     stream: Buf(u8)
+    kind: i64
+    room: i64
 
     fn deinit(sink self: Sub, a: Allocator) void {
         a.free(self.identifier)
         a.free(self.stream)
+        @forget(self)
+    }
+}
+
+// What a reader works with besides its socket: its writer's queue, the
+// hub, the shared database connections and the write token (as the HTTP
+// workers take it), the key for signed stream names, and its subscriptions.
+const Session = owned struct {
+    id: i64
+    user: i64
+    // The user's name, for typing notifications; looked up once.
+    name: Buf(u8)
+    key: Buf(u8)
+    clock: Clock
+    out: Sender(Buf(u8))
+    to_hub: Sender(Cmd)
+    pool: Receiver(Pooled)
+    back: Sender(Pooled)
+    lock_rx: Receiver(bool)
+    lock_tx: Sender(bool)
+    subs: Buf(Sub)
+
+    fn close(sink self: Session, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.key)
+        self.out.close()
+        self.to_hub.close()
+        self.pool.close()
+        self.back.close()
+        self.lock_rx.close()
+        self.lock_tx.close()
+        a.free(self.subs)
         @forget(self)
     }
 }
@@ -210,10 +251,13 @@ const WELCOME = "{\"type\":\"welcome\"}"
 const UNAUTHORIZED = "{\"type\":\"disconnect\",\"reason\":\"unauthorized\",\"reconnect\":false}"
 
 // Takes connections from ups and starts their threads, until every worker
-// has stopped. key verifies signed stream names (turbo.key).
-fn run(sink ups: Receiver(Upgrade), sink to_hub: Sender(Cmd), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
+// has stopped. key verifies signed stream names (turbo.key); lock_rx and
+// lock_tx are the database's write token.
+fn run(sink ups: Receiver(Upgrade), sink to_hub: Sender(Cmd), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
     defer ups.close()
     defer to_hub.close()
+    defer lock_rx.close()
+    defer lock_tx.close()
     defer a.free(key)
     const pool = threads.channel(Pooled, POOL)
     defer pool.close()
@@ -238,7 +282,9 @@ fn run(sink ups: Receiver(Upgrade), sink to_hub: Sender(Cmd), sink key: Buf(u8),
         const queue = threads.channel(Buf(u8), QUEUE)
         const out = queue.sender()
         threads.spawn(writer, copy, queue, a, clock).detach()
-        threads.spawn(reader, u, next_id, out, to_hub.clone(), pool.clone(), back.clone(), a.concat(key, ""), io, a).detach()
+        const user = u.user
+        const s = Session{ .id = next_id, .user = user, .name = .empty, .key = a.concat(key, ""), .clock = clock, .out = out, .to_hub = to_hub.clone(), .pool = pool.clone(), .back = back.clone(), .lock_rx = lock_rx.clone(), .lock_tx = lock_tx.clone(), .subs = .empty }
+        threads.spawn(reader, u, s, io, a).detach()
     }
 }
 
@@ -291,49 +337,51 @@ fn writer(sink c: TcpConn, sink queue: Receiver(Buf(u8)), a: Allocator, clock: C
     }
 }
 
-// Reads the client's messages until it closes or breaks the protocol, then
-// ends the writer.
-fn reader(sink u: Upgrade, id: i64, sink out: Sender(Buf(u8)), sink to_hub: Sender(Cmd), sink pool: Receiver(Pooled), sink back: Sender(Pooled), sink key: Buf(u8), io: Io, a: Allocator) void {
+// Reads the client's messages until it closes or breaks the protocol;
+// then unsubscribes from everything, as Rails does when a socket closes,
+// leaves the hub and ends the writer.
+fn reader(sink u: Upgrade, sink session: Session, io: Io, a: Allocator) void {
     defer u.deinit()
-    defer to_hub.close()
-    defer to_hub.send(cmd(a, LEAVE, id, "", ""))
-    defer pool.close()
-    defer back.close()
-    defer a.free(key)
-    defer out.close()
-    defer out.send(.empty)
-    var joining = cmd(a, JOIN, id, "", "")
-    a.push(&joining.outs, Out{ .id = id, .tx = out.clone() })
-    to_hub.send(joining)
-    out.send(ws.text_frame(a, WELCOME))
-    var subs: Buf(Sub) = .empty
-    defer a.free(subs)
+    var s = session
+    defer s.close(a)
+    var joining = cmd(a, JOIN, s.id, "", "")
+    a.push(&joining.outs, Out{ .id = s.id, .tx = s.out.clone() })
+    s.to_hub.send(joining)
+    s.out.send(ws.text_frame(a, WELCOME))
     var part = ws.partial()
     defer part.deinit(a)
     var data: Buf(u8) = .empty
     defer a.free(data)
     while (true) {
         const kind = ws.read_message(u.conn, a, &part, &data) catch {
-            return
+            break
         }
         if (kind == ws.TEXT) {
-            command(a, io, u.user, id, key, &subs, out, to_hub, pool, back, data)
+            command(a, io, &s, data)
         } else if (kind == ws.PING) {
             var pong: Buf(u8) = .empty
             ws.frame(a, &pong, ws.PONG, data)
-            out.send(pong)
+            s.out.send(pong)
         } else if (kind == ws.CLOSE) {
             // The closing handshake: the same code back, or a normal close.
             const code = if (@len(data) >= 2) @as(i64, data[0]) << 8 | @as(i64, data[1]) else 1000
-            out.send(ws.close_frame(a, code))
-            return
+            s.out.send(ws.close_frame(a, code))
+            break
         } else if (kind == ws.PROTOCOL_ERROR or kind == ws.TOO_BIG) {
-            out.send(ws.close_frame(a, -kind))
-            return
+            s.out.send(ws.close_frame(a, -kind))
+            break
         } else if (kind == ws.BINARY) {
             io.eprint("cable: Couldn't handle non-string message")
         }
     }
+    // unsubscribe_from_all: a room the user was present in, they are not.
+    for (s.subs) |sub| {
+        if (sub.kind == PRESENCE) {
+            _ = membership(a, io, &s, sub.room, ABSENT)
+        }
+    }
+    s.to_hub.send(cmd(a, LEAVE, s.id, "", ""))
+    s.out.send(.empty)
 }
 
 // {"identifier":<identifier>,"type":<kind>} as a frame.
@@ -374,10 +422,69 @@ fn sub_at(subs: Buf(Sub), identifier: []u8) i64 {
     return -1
 }
 
+// How Active Record casts a room_id for an integer id: a number truncated,
+// true and false as 1 and 0, a string as to_i if it starts like a number;
+// null for anything else, which finds no room.
+fn cast_id(m: json.Member) ?i64 {
+    if (m.kind == 'o') {
+        if (m.value == "true") {
+            return 1
+        } else if (m.value == "false") {
+            return 0
+        }
+        return null
+    }
+    if (m.kind != 'n' and m.kind != 's') {
+        return null
+    }
+    var i = 0
+    while (i < @len(m.value) and (m.value[i] == ' ' or m.value[i] == '\t' or m.value[i] == '\n' or m.value[i] == '\r' or m.value[i] == 11 or m.value[i] == 12)) {
+        i = i + 1
+    }
+    var negative = false
+    if (i < @len(m.value) and (m.value[i] == '-' or m.value[i] == '+')) {
+        negative = m.value[i] == '-'
+        i = i + 1
+    }
+    var n = 0
+    var digits = 0
+    while (i < @len(m.value) and (m.value[i] >= '0' and m.value[i] <= '9' or m.value[i] == '_' and digits > 0)) {
+        if (m.value[i] != '_') {
+            if (n > 922337203685477580) {
+                return null
+            }
+            n = n * 10 + @as(i64, m.value[i] - '0')
+            digits = digits + 1
+        }
+        i = i + 1
+    }
+    if (digits == 0) {
+        return null
+    }
+    return if (negative) -n else n
+}
+
+fn confirm(a: Allocator, inout s: Session, identifier: []u8) void {
+    s.out.send(reply(a, identifier, "confirm_subscription"))
+}
+
+fn reject(a: Allocator, inout s: Session, identifier: []u8) void {
+    s.out.send(reply(a, identifier, "reject_subscription"))
+}
+
+// Confirmed by the hub once it listens to stream for this subscription, so
+// nothing cast after the confirmation is missed.
+fn listen(a: Allocator, inout s: Session, identifier: []u8, stream: []u8) void {
+    var encoded: Buf(u8) = .empty
+    defer a.free(encoded)
+    json.encode_string(a, &encoded, identifier)
+    s.to_hub.send(cmd(a, LISTEN, s.id, stream, encoded))
+}
+
 // One command from the client (ActionCable::Connection::Subscriptions):
 // subscribe, unsubscribe, or a message to a channel. What it cannot do is
 // logged, as Rails logs it, and not answered.
-fn command(a: Allocator, io: Io, user: i64, id: i64, key: []u8, inout subs: Buf(Sub), out: Sender(Buf(u8)), to_hub: Sender(Cmd), pool: Receiver(Pooled), back: Sender(Pooled), text: []u8) void {
+fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
     var data: Buf(json.Member) = .empty
     defer a.free(data)
     if (!json.object(a, &data, text)) {
@@ -386,8 +493,9 @@ fn command(a: Allocator, io: Io, user: i64, id: i64, key: []u8, inout subs: Buf(
     }
     const subscribe = is(data, "command", "subscribe")
     const unsubscribe = is(data, "command", "unsubscribe")
+    const message = is(data, "command", "message")
     const ii = json.find(data, "identifier")
-    if (!subscribe and !unsubscribe and !is(data, "command", "message")) {
+    if (!subscribe and !unsubscribe and !message) {
         io.eprint("cable: Received unrecognized command in ", text)
         return
     }
@@ -396,29 +504,34 @@ fn command(a: Allocator, io: Io, user: i64, id: i64, key: []u8, inout subs: Buf(
         return
     }
     const identifier = data[ii].value[0..]
-    const at = sub_at(subs, identifier)
+    const at = sub_at(s.subs, identifier)
     if (unsubscribe) {
         if (at < 0) {
             io.eprint("cable: Unable to find subscription with identifier: ", identifier)
             return
         }
-        if (@len(subs[at].stream) > 0) {
+        if (@len(s.subs[at].stream) > 0) {
             var encoded: Buf(u8) = .empty
             defer a.free(encoded)
             json.encode_string(a, &encoded, identifier)
-            to_hub.send(cmd(a, STOP, id, "", encoded))
+            s.to_hub.send(cmd(a, STOP, s.id, "", encoded))
         }
-        @swap(&subs, at, @len(subs) - 1)
-        if (a.pop(&subs)) |gone| {
+        if (s.subs[at].kind == PRESENCE) {
+            const room = s.subs[at].room
+            _ = membership(a, io, &s, room, ABSENT)
+        }
+        @swap(&s.subs, at, @len(s.subs) - 1)
+        if (a.pop(&s.subs)) |gone| {
             gone.deinit(a)
         }
         return
     }
-    if (!subscribe) {
+    if (message) {
         if (at < 0) {
             io.eprint("cable: Unable to find subscription with identifier: ", identifier)
+            return
         }
-        // Channels' actions come later.
+        perform(a, io, &s, at, data)
         return
     }
     var params: Buf(json.Member) = .empty
@@ -430,101 +543,322 @@ fn command(a: Allocator, io: Io, user: i64, id: i64, key: []u8, inout subs: Buf(
     if (at >= 0) {
         return
     }
-    if (@len(subs) >= MAX_SUBSCRIPTIONS or @len(identifier) > MAX_IDENTIFIER) {
+    if (@len(s.subs) >= MAX_SUBSCRIPTIONS or @len(identifier) > MAX_IDENTIFIER) {
         io.eprint("cable: Could not execute command: subscription limit reached")
         return
     }
-    const streams = is(params, "channel", "Turbo::StreamsChannel")
-    const room_messages = is(params, "channel", "RoomMessagesChannel")
-    var stream: Buf(u8) = .empty
-    if (streams or room_messages) {
-        const si = json.find(params, "signed_stream_name")
-        if (si >= 0 and params[si].kind != 's' and params[si].kind != 'z') {
-            io.eprint("cable: Could not execute command: ", identifier)
-            a.free(stream)
-            return
-        }
-        var verified: Buf(u8) = .empty
-        if (si >= 0 and params[si].kind == 's') {
-            if (turbo.verify(a, key, params[si].value)) |v| {
-                a.free(@replace(&verified, v))
-            }
-        }
-        var ok = @len(verified) > 0
-        if (ok and streams) {
-            // RoomStreamsAreAuthorized: a room's messages only through
-            // RoomMessagesChannel.
-            ok = !turbo.guarded(verified)
-        } else if (ok) {
-            ok = member_of_room(a, io, pool, back, user, verified)
-        }
-        if (!ok) {
-            a.free(verified)
-            a.free(stream)
-            out.send(reply(a, identifier, "reject_subscription"))
-            return
-        }
-        a.free(@replace(&stream, verified))
-    } else if (!other_channel(params)) {
-        io.eprint("cable: Subscription class not found: ", identifier)
-        a.free(stream)
-        return
-    }
-    // A stream's subscription is confirmed by the hub, once it listens.
-    // The app's other channels are confirmed here; what they do comes later.
-    if (@len(stream) > 0) {
-        var encoded: Buf(u8) = .empty
-        defer a.free(encoded)
-        json.encode_string(a, &encoded, identifier)
-        to_hub.send(cmd(a, LISTEN, id, stream, encoded))
+    if (is(params, "channel", "Turbo::StreamsChannel") or is(params, "channel", "RoomMessagesChannel")) {
+        turbo_subscribe(a, io, &s, identifier, params)
+    } else if (is(params, "channel", "UnreadRoomsChannel") or is(params, "channel", "ReadRoomsChannel")) {
+        // The user's own streams.
+        var stream: Buf(u8) = .empty
+        defer a.free(stream)
+        a.append_str(&stream, "user_")
+        a.append_int(&stream, s.user)
+        a.append_str(&stream, if (is(params, "channel", "UnreadRoomsChannel")) "_unreads" else "_reads")
+        a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = OTHER, .room = 0 })
+        listen(a, &s, identifier, stream)
+    } else if (is(params, "channel", "RoomChannel") or is(params, "channel", "PresenceChannel") or is(params, "channel", "TypingNotificationsChannel")) {
+        room_subscribe(a, io, &s, identifier, params)
+    } else if (is(params, "channel", "HeartbeatChannel") or is(params, "channel", "ApplicationCable::Channel")) {
+        a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = .empty, .kind = OTHER, .room = 0 })
+        confirm(a, &s, identifier)
     } else {
-        out.send(reply(a, identifier, "confirm_subscription"))
+        io.eprint("cable: Subscription class not found: ", identifier)
     }
-    a.push(&subs, Sub{ .identifier = a.concat(identifier, ""), .stream = stream })
 }
 
-// The app's other channels.
-fn other_channel(params: Buf(json.Member)) bool {
-    for ([_]str{ "HeartbeatChannel", "PresenceChannel", "ReadRoomsChannel", "TypingNotificationsChannel", "UnreadRoomsChannel", "RoomChannel", "ApplicationCable::Channel" }) |c| {
-        if (is(params, "channel", c)) {
-            return true
+// Turbo::StreamsChannel and RoomMessagesChannel: a signed stream name, and
+// for a room's messages, a member of the room.
+fn turbo_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, params: Buf(json.Member)) void {
+    const streams = is(params, "channel", "Turbo::StreamsChannel")
+    const si = json.find(params, "signed_stream_name")
+    if (si >= 0 and params[si].kind != 's' and params[si].kind != 'z') {
+        io.eprint("cable: Could not execute command: ", identifier)
+        return
+    }
+    var verified: Buf(u8) = .empty
+    defer a.free(verified)
+    if (si >= 0 and params[si].kind == 's') {
+        if (turbo.verify(a, s.key, params[si].value)) |v| {
+            a.free(@replace(&verified, v))
         }
     }
-    return false
+    var ok = @len(verified) > 0
+    if (ok and streams) {
+        // RoomStreamsAreAuthorized: a room's messages only through
+        // RoomMessagesChannel.
+        ok = !turbo.guarded(verified)
+    } else if (ok) {
+        ok = member_of_room(a, io, &s, verified)
+    }
+    if (!ok) {
+        reject(a, &s, identifier)
+        return
+    }
+    a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(verified, ""), .kind = OTHER, .room = 0 })
+    listen(a, &s, identifier, verified)
+}
+
+// RoomChannel and the channels built on it: the room room_id names, if the
+// user is a member (current_user.rooms.find_by), streamed for as
+// "<channel>:<the room's GlobalID param>"; PresenceChannel then marks the
+// user present, before the confirmation, as on_subscribe does.
+fn room_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, params: Buf(json.Member)) void {
+    const ri = json.find(params, "room_id")
+    var room = -1
+    var class: Buf(u8) = .empty
+    defer a.free(class)
+    if (ri >= 0) {
+        if (cast_id(params[ri])) |id| {
+            if (room_class(a, io, &s, id)) |c| {
+                a.free(@replace(&class, c))
+                room = id
+            }
+        }
+    }
+    if (room < 0) {
+        reject(a, &s, identifier)
+        return
+    }
+    const presence = is(params, "channel", "PresenceChannel")
+    const typing = is(params, "channel", "TypingNotificationsChannel")
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    a.append_str(&stream, if (presence) "presence:" else if (typing) "typing_notifications:" else "room:")
+    turbo.gid(a, &stream, class, room)
+    const kind = if (presence) PRESENCE else if (typing) TYPING else OTHER
+    a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = kind, .room = room })
+    // present before the confirmation, as on_subscribe does; the other
+    // windows hear of the room read after it, as Rails' pub/sub delivers.
+    var present = false
+    if (presence) {
+        present = membership(a, io, &s, room, PRESENT)
+    }
+    listen(a, &s, identifier, stream)
+    if (present) {
+        read_room(a, &s, room)
+    }
+}
+
+// broadcast_read_room: the user's other windows hear the room is read.
+fn read_room(a: Allocator, inout s: Session, room: i64) void {
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    a.append_str(&stream, "user_")
+    a.append_int(&stream, s.user)
+    a.append_str(&stream, "_reads")
+    var msg: Buf(u8) = .empty
+    defer a.free(msg)
+    a.append_str(&msg, "{\"room_id\":")
+    a.append_int(&msg, room)
+    a.append_str(&msg, "}")
+    s.to_hub.send(cmd(a, CAST, 0, stream, msg))
+}
+
+// A message to a subscription: {"command":"message","data":"<JSON with
+// an action>"}, the action being one of the channel's public methods.
+fn perform(a: Allocator, io: Io, inout s: Session, at: i64, data: Buf(json.Member)) void {
+    const di = json.find(data, "data")
+    var payload: Buf(json.Member) = .empty
+    defer a.free(payload)
+    if (di < 0 or data[di].kind != 's' or !json.object(a, &payload, data[di].value)) {
+        io.eprint("cable: Could not execute command: invalid data")
+        return
+    }
+    const kind = s.subs[at].kind
+    const room = s.subs[at].room
+    if (kind == PRESENCE and (is(payload, "action", "present") or is(payload, "action", "absent") or is(payload, "action", "refresh"))) {
+        const op = if (is(payload, "action", "present")) PRESENT else if (is(payload, "action", "absent")) ABSENT else REFRESH
+        if (membership(a, io, &s, room, op) and op == PRESENT) {
+            read_room(a, &s, room)
+        }
+    } else if (kind == TYPING and (is(payload, "action", "start") or is(payload, "action", "stop"))) {
+        // broadcast_to @room, action:, user: current_user.slice(:id, :name)
+        if (@len(s.name) == 0) {
+            user_name(a, io, &s)
+        }
+        var msg: Buf(u8) = .empty
+        defer a.free(msg)
+        a.append_str(&msg, if (is(payload, "action", "start")) "{\"action\":\"start\",\"user\":{\"id\":" else "{\"action\":\"stop\",\"user\":{\"id\":")
+        a.append_int(&msg, s.user)
+        a.append_str(&msg, ",\"name\":")
+        json.encode_string(a, &msg, s.name)
+        a.append_str(&msg, "}}")
+        s.to_hub.send(cmd(a, CAST, 0, s.subs[at].stream, msg))
+    } else {
+        io.eprint("cable: Unable to process an action")
+    }
+}
+
+// The user's name, once.
+fn user_name(a: Allocator, io: Io, inout s: Session) void {
+    const p = s.pool.recv() orelse {
+        return
+    }
+    defer s.back.send(p)
+    var st = p.db.prepare("SELECT name FROM users WHERE id = ?") catch {
+        return
+    }
+    defer st.finalize()
+    st.bind_int(1, s.user) catch {
+        return
+    }
+    const found = st.next() catch |e| {
+        io.eprint("cable: ", @errorName(e))
+        return
+    }
+    if (found) {
+        a.free(@replace(&s.name, st.text(a, 0)))
+    }
+}
+
+// The class (Rooms::Open and the like) of the room id, if the user is a
+// member of it; null if not.
+fn room_class(a: Allocator, io: Io, inout s: Session, room: i64) ?Buf(u8) {
+    const p = s.pool.recv() orelse {
+        return null
+    }
+    defer s.back.send(p)
+    var st = p.db.prepare("SELECT rooms.type FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1") catch {
+        return null
+    }
+    defer st.finalize()
+    st.bind_int(1, room) catch {
+        return null
+    }
+    st.bind_int(2, s.user) catch {
+        return null
+    }
+    const found = st.next() catch |e| {
+        io.eprint("cable: ", @errorName(e))
+        return null
+    }
+    if (!found) {
+        return null
+    }
+    return st.text(a, 0)
 }
 
 // RoomMessagesChannel.subscribable_room: is the room the message stream
 // names one the user is a member of (and of the class the name says)?
-fn member_of_room(a: Allocator, io: Io, pool: Receiver(Pooled), back: Sender(Pooled), user: i64, stream: []u8) bool {
+fn member_of_room(a: Allocator, io: Io, inout s: Session, stream: []u8) bool {
     const ref = turbo.room_stream(a, stream) orelse {
         return false
     }
     defer ref.deinit(a)
-    const p = pool.recv() orelse {
+    const class = room_class(a, io, &s, ref.id) orelse {
         return false
     }
-    defer back.send(p)
-    var st = p.db.prepare("SELECT rooms.type FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1") catch {
+    defer a.free(class)
+    return ref.class == "Room" or class == ref.class
+}
+
+const PRESENT = 1
+const ABSENT = 2
+const REFRESH = 3
+
+// Membership::Connectable, for the user's membership of room: present
+// (connected again, its unread mark cleared, and the user's other windows
+// told the room is read, by the caller), absent (disconnected), or refresh
+// (still here). A connection counts for CONNECTION_TTL after it was last
+// seen. Whether present took.
+fn membership(a: Allocator, io: Io, inout s: Session, room: i64, op: i64) bool {
+    const p = s.pool.recv() orelse {
         return false
     }
-    defer st.finalize()
-    st.bind_int(1, ref.id) catch {
-        return false
-    }
-    st.bind_int(2, user) catch {
-        return false
-    }
-    const found = st.next() catch |e| {
+    defer s.back.send(p)
+    _ = s.lock_rx.recv()
+    defer s.lock_tx.send(true)
+    const now_ns = s.clock.now()
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, now_ns)
+    var cutoff: Buf(u8) = .empty
+    defer a.free(cutoff)
+    tf.db_time(a, &cutoff, now_ns - CONNECTION_TTL_NS)
+    p.db.exec("BEGIN IMMEDIATE") catch |e| {
         io.eprint("cable: ", @errorName(e))
         return false
     }
-    if (!found) {
+    const found = connect_change(a, p.db, s.user, room, op, now, cutoff) catch |e| {
+        io.eprint("cable: ", @errorName(e))
+        p.db.exec("ROLLBACK") catch {}
         return false
     }
-    if (ref.class == "Room") {
-        return true
+    p.db.exec("COMMIT") catch |e| {
+        io.eprint("cable: ", @errorName(e))
+        p.db.exec("ROLLBACK") catch {}
+        return false
     }
-    const kind = st.text(a, 0)
-    defer a.free(kind)
-    return kind == ref.class
+    if (!found) {
+        io.eprint("cable: undefined method for nil (membership)")
+    }
+    return found
+}
+
+const CONNECTION_TTL_NS = 60000000000
+
+// The writes of present, disconnected and refresh_connection, in a
+// transaction begun; whether there was a membership.
+fn connect_change(a: Allocator, db: sqlite.Db, user: i64, room: i64, op: i64, now: []u8, cutoff: []u8) !bool {
+    var st = try db.prepare("SELECT id, connections, connected_at FROM memberships WHERE room_id = ? AND user_id = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    try st.bind_int(2, user)
+    if (!try st.next()) {
+        return false
+    }
+    const id = st.int(0)
+    var connections = st.int(1)
+    const has_connected_at = !st.is_null(2)
+    var connected = false
+    if (has_connected_at) {
+        const at = st.text(a, 2)
+        defer a.free(at)
+        connected = at >= cutoff
+    }
+    if (op == PRESENT) {
+        // connect(self, connected? ? connections + 1 : 1)
+        try set_connections(db, id, if (connected) connections + 1 else 1, now, true)
+    } else if (op == ABSENT) {
+        // decrement_connections, then update! connected_at: nil if connections < 1
+        if (connected) {
+            connections = connections - 1
+            try set_connections(db, id, connections, now, false)
+        } else if (connections != 0) {
+            connections = 0
+            try set_connections(db, id, 0, now, false)
+        }
+        if (connections < 1 and has_connected_at) {
+            try set_connected_at(db, id, false, now)
+        }
+    } else {
+        // increment_connections unless connected?, then touch :connected_at
+        if (!connected and connections != 1) {
+            try set_connections(db, id, 1, now, false)
+        }
+        try set_connected_at(db, id, true, now)
+    }
+    return true
+}
+
+// connections = n; for Membership.connect also connected_at = now and no
+// unread mark (and no updated_at), else updated_at = now.
+fn set_connections(db: sqlite.Db, id: i64, n: i64, now: []u8, connect: bool) !void {
+    var st = try db.prepare(if (connect) "UPDATE memberships SET connections = ?, connected_at = ?, unread_at = NULL WHERE id = ?" else "UPDATE memberships SET connections = ?, updated_at = ? WHERE id = ?")
+    defer st.finalize()
+    try st.bind_int(1, n)
+    try st.bind(2, now)
+    try st.bind_int(3, id)
+    while (try st.next()) {}
+}
+
+// connected_at = now (touch) or NULL, and updated_at = now.
+fn set_connected_at(db: sqlite.Db, id: i64, touch: bool, now: []u8) !void {
+    var st = try db.prepare(if (touch) "UPDATE memberships SET connected_at = ?1, updated_at = ?1 WHERE id = ?2" else "UPDATE memberships SET connected_at = NULL, updated_at = ?1 WHERE id = ?2")
+    defer st.finalize()
+    try st.bind(1, now)
+    try st.bind_int(2, id)
+    while (try st.next()) {}
 }

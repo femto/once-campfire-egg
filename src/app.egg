@@ -784,6 +784,23 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
     defer a.free(message)
     json.encode_string(a, &message, out)
     cable.broadcast(a, ctx.hub, stream, message)
+    // broadcast_unread_room: each member's unread stream hears of the room.
+    var unread: Buf(u8) = .empty
+    defer a.free(unread)
+    a.append_str(&unread, "{\"roomId\":")
+    a.append_int(&unread, room.id)
+    a.append_str(&unread, "}")
+    var st = try ctx.db.prepare("SELECT user_id FROM memberships WHERE room_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, room.id)
+    while (try st.next()) {
+        var to: Buf(u8) = .empty
+        defer a.free(to)
+        a.append_str(&to, "user_")
+        a.append_int(&to, st.int(0))
+        a.append_str(&to, "_unreads")
+        cable.broadcast(a, ctx.hub, to, unread)
+    }
     return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
 }
 

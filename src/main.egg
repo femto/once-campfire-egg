@@ -49,8 +49,8 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
 }
 
 // cable.run, as spawn takes only this file's functions for now.
-fn run_cable(sink ups: Receiver(cable.Upgrade), sink to_hub: Sender(cable.Cmd), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
-    cable.run(ups, to_hub, key, io, a, threads, clock, db_path)
+fn run_cable(sink ups: Receiver(cable.Upgrade), sink to_hub: Sender(cable.Cmd), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
+    cable.run(ups, to_hub, lock_rx, lock_tx, key, io, a, threads, clock, db_path)
 }
 
 fn run_hub(sink cmds: Receiver(cable.Cmd), a: Allocator) void {
@@ -102,7 +102,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     const cmds = threads.channel(cable.Cmd, 1024)
     const hub_tx = cmds.sender()
     threads.spawn(run_hub, cmds, a).detach()
-    threads.spawn(run_cable, upgrades, hub_tx.clone(), turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
+    threads.spawn(run_cable, upgrades, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty
