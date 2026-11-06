@@ -1,4 +1,4 @@
-<%fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
+<%fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
 <% layout_top(a, &out, room.display, user, vapid, logo_v) %>
 
 
@@ -136,7 +136,24 @@
   </div>
 </script>
 
-  <div id="messages_rooms_<%- room.kind %>_<%d room.id %>" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="<%d loaded_ms %>" data-refresh-room-url-value="<%- base %>/rooms/<%d room.id %>/refresh"><% for (messages) |m| { %><%- "\n    " %><% cached_message(a, &out, &frags, &cuts, m) %><% } %>
+  <div id="messages_rooms_<%- room.kind %>_<%d room.id %>" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="<%d loaded_ms %>" data-refresh-room-url-value="<%- base %>/rooms/<%d room.id %>/refresh"><% if (invite) { %>
+    <div id="system_welcome" class="message message--formatted txt-align-center center">
+    <div class="message__body center">
+      <div class="message__body-content position-relative">
+        <figure class="account-logo avatar center margin-block-end txt-large"><img alt="Account logo" src="/account/logo?v=<%- logo_v %>" width="300" height="300" /></figure>
+        <div class="flex align-center gap">
+          <div class="system-welcome--translation">
+            <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Welcome to Campfire. To invite some people to chat with you, share the join link below.</dd><dt>🇪🇸</dt><dd class="margin-none">Bienvenido a Campfire. Para invitar a algunas personas a chatear contigo, comparte el enlace de unión que se encuentra a continuación.</dd><dt>🇫🇷</dt><dd class="margin-none">Bienvenue sur Campfire. Pour inviter des personnes à discuter avec vous, partagez le lien pour rejoindre ci-dessous.</dd><dt>🇮🇳</dt><dd class="margin-none">Campfire में आपका स्वागत है। अधिक लोगों को चैट के लिए आमंत्रित करने के लिए, नीचे जुड़ने का लिंक साझा करें।</dd><dt>🇩🇪</dt><dd class="margin-none">Willkommen bei Campfire. Um einige Personen zum Chatten einzuladen, teilen Sie den unten stehenden Beitrittslink.</dd><dt>🇧🇷</dt><dd class="margin-none">Boas vindas ao Campfire. Para convidar pessoas para conversarem com você, compartilhe o link de convite abaixo.</dd><dt>🇯🇵</dt><dd class="margin-none">Campfireへようこそ。他の人をチャットに招待するには、下記の参加リンクを共有してください。</dd></dl></div></details>
+          </div>
+          <p>
+            <strong>Welcome to Campfire</strong><br>
+            To invite people to chat, share the join link below.
+          </p>
+        </div>
+        <%: invite_link(a, &out, base, join_code, admin) %>
+      </div>
+    </div>
+  </div><% } %><% for (messages) |m| { %><%- "\n    " %><% cached_message(a, &out, &frags, &cuts, m) %><% } %>
   </div>
 
   <turbo-cable-stream-source channel="RoomMessagesChannel" signed-stream-name="<%- stream %>"></turbo-cable-stream-source>

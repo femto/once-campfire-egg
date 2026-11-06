@@ -779,3 +779,28 @@ fn users_exist(db: sqlite.Db) !bool {
     defer st.finalize()
     return st.next()
 }
+
+// Whether the room page welcomes with the join link: the room is the
+// original (Room.original, first created) and its messages fit on one
+// page (!messages.paged?). The account's join code goes into code.
+fn invitation(a: Allocator, inout code: Buf(u8), db: sqlite.Db, room: i64) !bool {
+    var st = try db.prepare("SELECT id FROM rooms ORDER BY created_at ASC LIMIT 1")
+    defer st.finalize()
+    if (!try st.next() or st.int(0) != room) {
+        return false
+    }
+    var sc = try db.prepare("SELECT COUNT(*) FROM messages WHERE room_id = ?")
+    defer sc.finalize()
+    try sc.bind_int(1, room)
+    if (!try sc.next() or sc.int(0) > PAGE_SIZE) {
+        return false
+    }
+    var sa = try db.prepare("SELECT join_code FROM accounts ORDER BY id LIMIT 1")
+    defer sa.finalize()
+    if (try sa.next()) {
+        const t = sa.text(a, 0)
+        a.append_str(&code, t)
+        a.free(t)
+    }
+    return true
+}

@@ -218,3 +218,18 @@ fn same_secret(x: []u8, y: []u8) bool {
     }
     return diff == 0
 }
+
+// URL-safe Base64 with padding (Base64.urlsafe_encode64), at the end of out.
+fn base64url_padded(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    const start = @len(out)
+    base64_encode(a, &out, s)
+    var i = start
+    while (i < @len(out)) {
+        if (out[i] == '+') {
+            out[i] = '-'
+        } else if (out[i] == '/') {
+            out[i] = '_'
+        }
+        i = i + 1
+    }
+}

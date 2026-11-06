@@ -426,7 +426,10 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     var cuts: Buf(i64) = .empty
     defer a.free(cuts)
     ctx.frags.begin(a, gen)
-    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream, &ctx.frags, &cuts)
+    var join_code: Buf(u8) = .empty
+    defer a.free(join_code)
+    const invite = try model.invitation(a, &join_code, ctx.db, room.id)
+    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream, invite, join_code, &ctx.frags, &cuts)
     return page_out(c, a, &ctx, req, gen, key, own, body, cuts)
 }
 

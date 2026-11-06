@@ -181,6 +181,30 @@ fn guest_top(a: Allocator, inout out: Buf(u8), title: []u8, vapid: []u8, logo: [
     a.append_str(&out, static_head.ASSETS)
 }
 
+// invite.html
+fn invite_link(a: Allocator, inout out: Buf(u8), base: []u8, join_code: []u8, admin: bool) void {
+    const url = a.concat(base, "/join/", join_code)
+    defer a.free(url)
+    var qr: Buf(u8) = .empty
+    defer a.free(qr)
+    codec.base64url_padded(a, &qr, url)
+    a.append_str(&out, "<div class=\"flex flex-column align-center gap\">\n\n  <label class=\"flex flex-column gap full-width\" style=\"--row-gap: 0.5em\">\n    <strong id=\"invite_label\" class=\"invite-label\">Share to invite more people</strong>\n    <span class=\"flex align-center gap input input--actor fill-white\">\n      <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/person-add-1432b76b.svg\" width=\"20\" height=\"20\" />\n      <input type=\"text\" class=\"input\" id=\"invite_url\" value=\"")
+    html.escape(a, &out, url)
+    a.append_str(&out, "\" aria-labelledby=\"invite_label\" readonly>\n    </span>\n  </label>\n\n  <div class=\"flex align-center gap\">\n    <a class=\"btn\" data-lightbox-target=\"image\" data-action=\"lightbox#open\" data-lightbox-url-value=\"/qr_code/")
+    a.append_str(&out, qr)
+    a.append_str(&out, "\" href=\"/qr_code/")
+    a.append_str(&out, qr)
+    a.append_str(&out, "\">\n      <span class=\"for-screen-reader\">Show join link QR code</span>\n      <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/qr-code-dac3b273.svg\" width=\"20\" height=\"20\" />\n</a>\n    <button class=\"btn\" data-controller=\"copy-to-clipboard\" data-action=\"copy-to-clipboard#copy\" data-copy-to-clipboard-success-class=\"btn--success\" data-copy-to-clipboard-content-value=\"")
+    html.escape(a, &out, url)
+    a.append_str(&out, "\">\n      <span class=\"for-screen-reader\">Copy join link</span>\n      <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/copy-paste-4c379063.svg\" width=\"20\" height=\"20\" />\n</button>\n    <button class=\"btn\" hidden=\"hidden\" data-controller=\"web-share\" data-action=\"web-share#share\" data-web-share-url-value=\"")
+    html.escape(a, &out, url)
+    a.append_str(&out, "\" data-web-share-text-value=\"Hit this link to join me in Campfire and start chatting.\" data-web-share-title-value=\"Link to join Campfire\">\n      <span class=\"for-screen-reader\">Share join link</span>\n      <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/share-bf28da4f.svg\" width=\"20\" height=\"20\" />\n</button>\n")
+    if (admin) {
+    a.append_str(&out, "      <form class=\"button_to\" method=\"post\" action=\"/account/join_code\"><button class=\"btn btn--regenerate\" type=\"submit\">\n        <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/refresh-249f0509.svg\" width=\"20\" height=\"20\" />\n        <span class=\"for-screen-reader\">Regenerate join link</span>\n</button></form>")
+    }
+    a.append_str(&out, "  </div>\n</div>\n")
+}
+
 // layout_bottom.html
 fn layout_bottom(a: Allocator, inout out: Buf(u8)) void {
     a.append_str(&out, "    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n")
@@ -327,7 +351,7 @@ fn recents(a: Allocator, inout out: Buf(u8), recent: Buf(Buf(u8)), base: []u8) v
 }
 
 // room.html
-fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
+fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
     layout_top(a, &out, room.display, user, vapid, logo_v)
     a.append_str(&out, "\n\n\n  <meta name=\"turbo-cache-control\" content=\"no-preview\">\n  <meta name=\"current-room-id\" content=\"")
     a.append_int(&out, room.id)
@@ -394,6 +418,13 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     a.append_str(&out, "/rooms/")
     a.append_int(&out, room.id)
     a.append_str(&out, "/refresh\">")
+    if (invite) {
+    a.append_str(&out, "\n    <div id=\"system_welcome\" class=\"message message--formatted txt-align-center center\">\n    <div class=\"message__body center\">\n      <div class=\"message__body-content position-relative\">\n        <figure class=\"account-logo avatar center margin-block-end txt-large\"><img alt=\"Account logo\" src=\"/account/logo?v=")
+    a.append_str(&out, logo_v)
+    a.append_str(&out, "\" width=\"300\" height=\"300\" /></figure>\n        <div class=\"flex align-center gap\">\n          <div class=\"system-welcome--translation\">\n            <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Welcome to Campfire. To invite some people to chat with you, share the join link below.</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Bienvenido a Campfire. Para invitar a algunas personas a chatear contigo, comparte el enlace de unión que se encuentra a continuación.</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Bienvenue sur Campfire. Pour inviter des personnes à discuter avec vous, partagez le lien pour rejoindre ci-dessous.</dd><dt>🇮🇳</dt><dd class=\"margin-none\">Campfire में आपका स्वागत है। अधिक लोगों को चैट के लिए आमंत्रित करने के लिए, नीचे जुड़ने का लिंक साझा करें।</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Willkommen bei Campfire. Um einige Personen zum Chatten einzuladen, teilen Sie den unten stehenden Beitrittslink.</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Boas vindas ao Campfire. Para convidar pessoas para conversarem com você, compartilhe o link de convite abaixo.</dd><dt>🇯🇵</dt><dd class=\"margin-none\">Campfireへようこそ。他の人をチャットに招待するには、下記の参加リンクを共有してください。</dd></dl></div></details>\n          </div>\n          <p>\n            <strong>Welcome to Campfire</strong><br>\n            To invite people to chat, share the join link below.\n          </p>\n        </div>\n        ")
+    invite_link(a, &out, base, join_code, admin)
+    a.append_str(&out, "\n      </div>\n    </div>\n  </div>")
+    }
     for (messages) |m| {
     a.append_str(&out, "\n    ")
     cached_message(a, &out, &frags, &cuts, m)
