@@ -12,19 +12,28 @@ pages are compared with it byte for byte (`script/compare.sh`).
 
 ## What it serves
 
-So far, what [once-campfire-verification](https://github.com/basecamp/once-campfire-verification)'s
-benchmark asks for, passing its contracts and write audits:
+What [once-campfire-verification](https://github.com/basecamp/once-campfire-verification)'s
+benchmark asks for, passing its contracts and write audits, and what keeps
+an open room live:
 
 - signing in (`POST /session`, bcrypt, the `session_token` cookie)
-- a room page and older pages of its messages
+- a room page and older pages of its messages, and what changed in a room
+  since a page loaded (`/rooms/:id/refresh`)
 - the sidebar and search
 - avatars and precompiled assets
 - posting a message (the row, the search index and unread marks in one
-  transaction, answered with a turbo-stream)
+  transaction, answered with a turbo-stream), from a plain or a multipart
+  form
+- Action Cable over WebSocket (`/cable`, src/cable.egg): the Turbo streams
+  a page subscribes to, with a new message appended live in its room, and
+  the app's channels: unread and read rooms, presence (who is in a room,
+  which decides unread marks) and typing. Messages and database writes
+  match once-campfire-rust's step for step.
 - `/up`
 
-Not yet: Action Cable, Web Push, bot webhooks, invitations, initials and bot
-avatars, and the rest of the app. PLAN.md has the status and the gaps.
+Not yet: Web Push, bot webhooks, attachments, editing and deleting
+messages, boosts, invitations, initials and bot avatars, and the rest of
+the app. PLAN.md has the status and the gaps.
 
 ## Performance
 
