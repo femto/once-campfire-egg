@@ -163,11 +163,59 @@ At 1000 WebSockets Egg is level with Rust, on a quarter of the memory:
 docs/benchmark.md, "Action Cable fan-out". Cable runs on event loops with
 Egg's `net.poller()` (egg #82); a socket more than 4 MB behind is let go.
 
+## Phase 2: bin/browser
+
+once-campfire-verification's functional gate (`bin/browser`, browser/smoke.mjs)
+walks a fresh install in Chromium and fails on any console error. Each step
+is compared with once-campfire-rust's output (a fresh `rust-fresh` container)
+byte for byte where it can be.
+
+Done:
+
+- [x] Fresh install: schema on an empty database (src/setup.egg, generated
+  src/schema.egg), GET/POST /first_run, / to the last room, /session/new to
+  /first_run while there are no users, bcrypt passwords.
+- [x] The original room's welcome with the join link (rooms/show/_invitation).
+- [x] Initials avatars (and the stock bot avatar), /account/logo (stock icon),
+  /webmanifest.json, /service-worker.js.
+- [x] Message bodies sanitized when presented (src/sanitize.egg); tagged
+  bodies stored normalized.
+- [x] Message edit, show, update (replace broadcast, search reindex) and
+  delete.
+
+To do, in the order bin/browser needs them:
+
+- [ ] Profile: /users/me/profile and PATCH (name, email, password, bio);
+  memberships with involvement buttons; GET and PUT /rooms/:id/involvement.
+  Templates started (profile*.html, involvement_button.html), not wired.
+- [ ] Session transfer: the link on the profile (signed id, purpose
+  "transfer", 4 h), GET /session/transfers/:id (auto-submit form), POST.
+- [ ] QR codes: /qr_code/:base64url (an SVG or PNG of the URL).
+- [ ] Account: /account/edit and update (name); custom styles
+  (/account/custom_styles/edit, the style tag in every layout); join code
+  regenerate; /join/:code signup; members see no admin controls.
+- [ ] Rooms: /rooms/opens/new and create, room settings and rename,
+  #shared_rooms broadcasts to other sidebars.
+- [ ] Bots: /account/bots new/create/edit/update, the curl command, and the
+  bot message API (POST /rooms/:id/:bot_key/messages).
+- [ ] Direct pings: New Ping in the sidebar, /autocompletable/users, create
+  a direct room, the "Ping with ..." nav.
+- [ ] Run bin/browser (`node browser/smoke.mjs --base URL` in the
+  verification repo; Playwright 1.63 installed there) until it passes.
+
+Known gaps, not checked by bin/browser:
+
+- Flash notices: Rails keeps them in its encrypted session cookie, which
+  Egg does not write yet.
+- The notifications help names the browser from the User-Agent; Egg always
+  says Mozilla (the benchmark's agent).
+- Sessions do not record the IP address and User-Agent.
+- Uploaded account logos; rich text attachments (mentions, embeds) in
+  bodies are not rendered.
+
 ## Later
 
-The rest of the app (see README: editing, boosts, rooms, accounts, bots,
-invitations...), what bin/browser walks through first; attachments and
-media; Web Push.
+Attachments and media; Web Push.
 
 ## Egg pain points found
 
