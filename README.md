@@ -51,8 +51,13 @@ On GitHub's ubuntu-latest, requests a second:
 | static CSS | 48060 | 108952 | 108761 |
 | post a message | 1818 | 1963 | 1771 |
 
-docs/benchmark.md has every route, the local runs, the setup and how to read
-the numbers; `.github/workflows/benchmark.yml` runs it.
+With 1000 WebSockets on one busy room (`loadgen cable`), every message
+reaches every client, as fast as the Rust app's (195-222 against 178
+messages a second to all, at full load), in 35-39 MiB against its 134.
+
+docs/benchmark.md has every route, the local runs, the WebSocket run, the
+setup and how to read the numbers; `.github/workflows/benchmark.yml` runs
+the HTTP routes.
 
 ## Building and running
 

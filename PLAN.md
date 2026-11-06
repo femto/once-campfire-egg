@@ -159,54 +159,9 @@ response cache (the mixed profile).
 
 ## Action Cable fan-out
 
-`loadgen cable` (once-campfire-verification), 2026-11-06, in the OrbStack
-Ubuntu VM: the app on CPUs 0-3, the load generator on 4-7, host networking,
-a fresh seed each; 1000 clients on the busy room's messages, presence,
-unread rooms and heartbeat; 30 paced posts, then 4 posters for 15 s. Egg at
-`4dbf4a5`, Rust's published image `6dae2fd`.
-
-| | Rust | Egg |
-| --- | ---: | ---: |
-| clients ready / failed | 1000 / 0 | 1000 / 0 |
-| paced: reached every client | 30 / 30 | 30 / 30 |
-| paced: to every client, p50 / p99 | 11.7 / 19.6 ms | 13.1 / 102.9 ms |
-| saturated: posts a second | 181 | 69 |
-| saturated: messages delivered whole a second | 181 | 50 |
-| saturated: to every client, p50 / p99 | 41 / 157 ms | 4.9 / 5.8 s |
-| saturated: messages not reaching every client | 0 | 0 |
-| memory, peak | 142 MiB | 90 MiB |
-| threads (tasks), peak | 18 | 2035 |
-
-Both deliver every message to every client. Under load Egg delivers a
-quarter of what Rust does, and posts queue up behind the fan-out (5 s).
-Why: each socket is two threads (2000 on 4 cores), and the hub, one
-thread, builds each listener's JSON and frame anew (about 10 KB each, over
-10 MB copied per message), where Rust encodes a frame once and shares it.
-
-Done since (`aa35d59`, Egg `8f14ee6`): egg #82 added `net.poller()`, a
-readiness poller (epoll, kqueue, WSAPoll or poll), and cable now runs on
-`CAMPFIRE_CABLE_LOOPS` event loops (4), each a thread with a Poller serving
-its sockets: frames are taken from what has come in, what a socket cannot
-take waits in its outbox, a socket 4 MB behind is let go (so no one can
-hold the others up), and a broadcast's frame is made once per
-subscription identifier. The same profile, Egg and Rust in turn the same
-hour (two runs of Egg, one of Rust; runs on this VM differ by 10-20%):
-
-| | Rust | Egg, event loops |
-| --- | ---: | ---: |
-| clients ready / failed | 1000 / 0 | 1000 / 0 |
-| paced: to every client, p50 / p99 | 12.4 / 33.8 ms | 13.0-13.4 / 20.4-40.4 ms |
-| saturated: posts a second | 178 | 195-222 |
-| saturated: messages delivered whole a second | 178 | 195-222 |
-| saturated: to every client, p50 / p99 | 37 / 185 ms | 51-56 / 166-196 ms |
-| saturated: messages not reaching every client | 0 | 0 |
-| memory, peak | 134 MiB | 35-39 MiB |
-| threads (tasks), peak | 18 | 39 |
-
-Level with Rust: every message reaches every client, about as fast, on a
-quarter of the memory.
-
-The script: ~/bench/cable.sh in the VM (`cable.sh APP IMAGE PORT`).
+At 1000 WebSockets Egg is level with Rust, on a quarter of the memory:
+docs/benchmark.md, "Action Cable fan-out". Cable runs on event loops with
+Egg's `net.poller()` (egg #82); a socket more than 4 MB behind is let go.
 
 ## Later
 

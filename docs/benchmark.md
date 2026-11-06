@@ -79,6 +79,31 @@ cd ~/bench/once-campfire-egg && git pull
 tail -16 ~/bench/run.log
 ```
 
+## Action Cable fan-out: 1000 WebSockets
+
+`loadgen cable` (once-campfire-verification's load generator), 2026-11-06,
+commit `aa35d59` (Egg `8f14ee6`), in the same OrbStack VM, apps on CPUs
+0-3, the load generator on 4-7, host networking, a fresh seed each; Rust
+and Egg in turn within the hour. 1000 clients, each subscribed as a room
+page is (the busy room's messages, presence, unread rooms, heartbeat); 30
+posts at a steady pace, then 4 posters as fast as they can for 15 s. Every
+message is checked to reach every client.
+
+| | Rust | Egg |
+| --- | ---: | ---: |
+| clients ready / failed | 1000 / 0 | 1000 / 0 |
+| paced: to every client, p50 / p99 | 12.4 / 33.8 ms | 13.0-13.4 / 20.4-40.4 ms |
+| saturated: messages delivered to all a second | 178 | 195-222 |
+| saturated: to every client, p50 / p99 | 37 / 185 ms | 51-56 / 166-196 ms |
+| messages not reaching every client | 0 | 0 |
+| memory, peak | 134 MiB | 35-39 MiB |
+| threads, peak | 18 | 39 |
+
+Egg's ranges are two runs; runs on this VM differ by 10-20%, so the two
+are level rather than one ahead. Egg serves its sockets from
+`CAMPFIRE_CABLE_LOOPS` event loops (4 here), each a thread with a
+`net.poller()`. The script is `~/bench/cable.sh APP IMAGE PORT` in the VM.
+
 ## Reading them
 
 - Uncached, Egg renders and gzips every page: the room page is 416 KB of
