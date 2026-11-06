@@ -1,18 +1,15 @@
 // Action Cable over WebSocket. An HTTP worker answers the handshake on
 // /cable, signs the connection in, and hands it here; it then serves other
-// requests. Each connection gets two threads, since a TcpConn blocks:
+// requests. Here a few event loops serve every socket, each from a thread
+// of its own with a Poller: a loop reads what its sockets send, answers
+// them, writes what goes out (what a socket cannot take yet waits in its
+// outbox, and a socket that falls too far behind is let go), and sends
+// Action Cable's ping every 3 s, as the client counts a connection stale
+// after 6 s without one.
 //
-// - its reader, which holds the connection, reads the client's frames and
-//   answers them;
-// - its writer, with a clone of the connection, the only one to write it:
-//   every frame goes through its queue, whole, and it sends Action Cable's
-//   ping every 3 s, as the client counts a connection stale after 6 s
-//   without one.
-//
-// The reader ends the writer by queueing an empty frame when it is done.
-//
-// Broadcasts go through the hub, a thread of its own that knows every
-// socket's queue and which streams it listens to (see hub).
+// What is broadcast goes through the hub, a thread that hands it to every
+// loop; a loop sends it to its sockets that listen to its stream, the
+// frame made once for each subscription's identifier.
 uses alloc, io, net, thread, time
 
 const ws = @import("ws.egg")
@@ -20,214 +17,18 @@ const json = @import("json.egg")
 const turbo = @import("turbo.egg")
 const sqlite = @import("sqlite.egg")
 const tf = @import("timefmt.egg")
+const map = @import("std/map")
 
-// The ping Action Cable sends every BEAT_NS, whatever else goes out.
+// The ping Action Cable sends every BEAT_NS.
 const BEAT_NS = 3000000000
-// Frames a writer may have queued before the reader waits.
-const QUEUE = 256
-// Database connections the readers share, taken for a query and handed
-// back (a connection per socket would be one per open page).
-const POOL = 4
+// What a socket may have waiting to go out before it is let go: a client
+// that stops reading cannot hold anyone else up.
+const MAX_OUTBOX = 4194304
 // Bounds on what one socket can make the server hold, as in the Rust app (a
 // page subscribes to six channels, with identifiers of a few hundred bytes).
 const MAX_SUBSCRIPTIONS = 64
 const MAX_IDENTIFIER = 4096
-
-// A database connection of the pool.
-const Pooled = owned struct {
-    db: sqlite.Db
-
-    fn deinit(sink self: Pooled) void {
-        self.db.close()
-        @forget(self)
-    }
-}
-
-// A socket's queue, as the hub holds it.
-const Out = owned struct {
-    id: i64
-    tx: Sender(Buf(u8))
-
-    fn deinit(sink self: Out) void {
-        self.tx.close()
-        @forget(self)
-    }
-}
-
-const JOIN = 1
-const LEAVE = 2
-const LISTEN = 3
-const STOP = 4
-const CAST = 5
-
-// What the hub is told: socket id joins with its queue (outs), leaves,
-// listens to stream for the subscription whose encoded identifier is text
-// (and is confirmed then), stops listening for it, or a message (text, as
-// JSON) is cast to stream.
-const Cmd = owned struct {
-    kind: i64
-    id: i64
-    stream: Buf(u8)
-    text: Buf(u8)
-    outs: Buf(Out)
-
-    fn deinit(sink self: Cmd, a: Allocator) void {
-        a.free(self.stream)
-        a.free(self.text)
-        a.free(self.outs)
-        @forget(self)
-    }
-}
-
-fn cmd(a: Allocator, kind: i64, id: i64, stream: []u8, text: []u8) Cmd {
-    return Cmd{ .kind = kind, .id = id, .stream = a.concat(stream, ""), .text = a.concat(text, ""), .outs = .empty }
-}
-
-// ActionCable.server.broadcast(stream, message): message is the JSON of
-// what each subscriber gets.
-fn broadcast(a: Allocator, to_hub: Sender(Cmd), stream: []u8, message: []u8) void {
-    to_hub.send(cmd(a, CAST, 0, stream, message))
-}
-
-// A stream a socket listens to, for one of its subscriptions.
-const Listener = owned struct {
-    id: i64
-    stream: Buf(u8)
-    // The subscription's identifier, encoded as JSON.
-    identifier: Buf(u8)
-
-    fn deinit(sink self: Listener, a: Allocator) void {
-        a.free(self.stream)
-        a.free(self.identifier)
-        @forget(self)
-    }
-}
-
-fn out_at(outs: Buf(Out), id: i64) i64 {
-    var i = 0
-    while (i < @len(outs)) {
-        if (outs[i].id == id) {
-            return i
-        }
-        i = i + 1
-    }
-    return -1
-}
-
-// The hub: the sockets' queues and their streams, for as long as anyone
-// can tell it something.
-fn hub(sink cmds: Receiver(Cmd), a: Allocator) void {
-    defer cmds.close()
-    var outs: Buf(Out) = .empty
-    defer a.free(outs)
-    var listeners: Buf(Listener) = .empty
-    defer a.free(listeners)
-    while (cmds.recv()) |c| {
-        var m = c
-        if (m.kind == JOIN) {
-            if (a.pop(&m.outs)) |o| {
-                a.push(&outs, o)
-            }
-        } else if (m.kind == LEAVE or m.kind == STOP) {
-            var i = 0
-            while (i < @len(listeners)) {
-                if (listeners[i].id == m.id and (m.kind == LEAVE or listeners[i].identifier == m.text)) {
-                    @swap(&listeners, i, @len(listeners) - 1)
-                    if (a.pop(&listeners)) |gone| {
-                        gone.deinit(a)
-                    }
-                } else {
-                    i = i + 1
-                }
-            }
-            const at = out_at(outs, m.id)
-            if (m.kind == LEAVE and at >= 0) {
-                @swap(&outs, at, @len(outs) - 1)
-                if (a.pop(&outs)) |gone| {
-                    gone.deinit()
-                }
-            }
-        } else if (m.kind == LISTEN) {
-            const at = out_at(outs, m.id)
-            if (at >= 0) {
-                a.push(&listeners, Listener{ .id = m.id, .stream = a.concat(m.stream, ""), .identifier = a.concat(m.text, "") })
-                // Confirmed once listening, so nothing cast after it is
-                // missed, as Rails confirms once the stream is ready.
-                outs[at].tx.send(reply_encoded(a, m.text, "confirm_subscription"))
-            }
-        } else if (m.kind == CAST) {
-            for (listeners) |l| {
-                if (l.stream == m.stream) {
-                    const at = out_at(outs, l.id)
-                    if (at >= 0) {
-                        var msg: Buf(u8) = .empty
-                        defer a.free(msg)
-                        a.append_str(&msg, "{\"identifier\":")
-                        a.append_str(&msg, l.identifier)
-                        a.append_str(&msg, ",\"message\":")
-                        a.append_str(&msg, m.text)
-                        a.append_str(&msg, "}")
-                        outs[at].tx.send(ws.text_frame(a, msg))
-                    }
-                }
-            }
-        }
-        m.deinit(a)
-    }
-}
-
-// What a subscription is, for what its channel does after confirming it.
-const OTHER = 0
-const PRESENCE = 1
-const TYPING = 2
-
-// A subscription: its identifier as the client wrote it, the stream it
-// listens to (empty for none), and for a room's channels, which kind and
-// which room.
-const Sub = owned struct {
-    identifier: Buf(u8)
-    stream: Buf(u8)
-    kind: i64
-    room: i64
-
-    fn deinit(sink self: Sub, a: Allocator) void {
-        a.free(self.identifier)
-        a.free(self.stream)
-        @forget(self)
-    }
-}
-
-// What a reader works with besides its socket: its writer's queue, the
-// hub, the shared database connections and the write token (as the HTTP
-// workers take it), the key for signed stream names, and its subscriptions.
-const Session = owned struct {
-    id: i64
-    user: i64
-    // The user's name, for typing notifications; looked up once.
-    name: Buf(u8)
-    key: Buf(u8)
-    clock: Clock
-    out: Sender(Buf(u8))
-    to_hub: Sender(Cmd)
-    pool: Receiver(Pooled)
-    back: Sender(Pooled)
-    lock_rx: Receiver(bool)
-    lock_tx: Sender(bool)
-    subs: Buf(Sub)
-
-    fn close(sink self: Session, a: Allocator) void {
-        a.free(self.name)
-        a.free(self.key)
-        self.out.close()
-        self.to_hub.close()
-        self.pool.close()
-        self.back.close()
-        self.lock_rx.close()
-        self.lock_tx.close()
-        a.free(self.subs)
-        @forget(self)
-    }
-}
+const READ_SIZE = 65536
 
 // A connection the handshake signed in as user.
 const Upgrade = owned struct {
@@ -237,6 +38,12 @@ const Upgrade = owned struct {
     fn deinit(sink self: Upgrade) void {
         self.conn.close()
         @forget(self)
+    }
+
+    fn take(sink self: Upgrade) TcpConn {
+        const c = self.conn
+        @forget(self)
+        return c
     }
 }
 
@@ -250,41 +57,216 @@ const WELCOME = "{\"type\":\"welcome\"}"
 // connection that did not sign in.
 const UNAUTHORIZED = "{\"type\":\"disconnect\",\"reason\":\"unauthorized\",\"reconnect\":false}"
 
-// Takes connections from ups and starts their threads, until every worker
-// has stopped. key verifies signed stream names (turbo.key); lock_rx and
-// lock_tx are the database's write token.
-fn run(sink ups: Receiver(Upgrade), sink to_hub: Sender(Cmd), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink key: Buf(u8), io: Io, a: Allocator, threads: Threads, clock: Clock, db_path: str) void {
+// ActionCable.server.broadcast(stream, message): message is the JSON of
+// what each subscriber gets.
+const Cmd = owned struct {
+    stream: Buf(u8)
+    text: Buf(u8)
+
+    fn deinit(sink self: Cmd, a: Allocator) void {
+        a.free(self.stream)
+        a.free(self.text)
+        @forget(self)
+    }
+}
+
+fn broadcast(a: Allocator, to_hub: Sender(Cmd), stream: []u8, message: []u8) void {
+    to_hub.send(Cmd{ .stream = a.concat(stream, ""), .text = a.concat(message, "") })
+}
+
+// What a loop is handed: a connection to serve (ups), or a broadcast.
+const In = owned struct {
+    user: i64
+    stream: Buf(u8)
+    text: Buf(u8)
+    ups: Buf(Upgrade)
+
+    fn deinit(sink self: In, a: Allocator) void {
+        a.free(self.stream)
+        a.free(self.text)
+        a.free(self.ups)
+        @forget(self)
+    }
+}
+
+// The way into a loop from another thread: its queue, and its waker.
+const Gate = owned struct {
+    tx: Sender(In)
+    w: Waker
+
+    fn deinit(sink self: Gate) void {
+        self.tx.close()
+        self.w.close()
+        @forget(self)
+    }
+
+    fn give(self: Gate, sink m: In) void {
+        self.tx.send(m)
+        self.w.wake()
+    }
+}
+
+// The hub: each broadcast, to every loop.
+fn hub(sink cmds: Receiver(Cmd), sink gates: Buf(Gate), a: Allocator) void {
+    defer cmds.close()
+    defer a.free(gates)
+    while (cmds.recv()) |c| {
+        for (gates) |g| {
+            g.give(In{ .user = 0, .stream = a.concat(c.stream, ""), .text = a.concat(c.text, ""), .ups = .empty })
+        }
+        c.deinit(a)
+    }
+}
+
+// What subscriptions there are: their identifier as the client wrote it,
+// the stream they listen to (empty for none), and for a room's channels,
+// which kind and which room.
+const OTHER = 0
+const PRESENCE = 1
+const TYPING = 2
+
+const Sub = owned struct {
+    identifier: Buf(u8)
+    stream: Buf(u8)
+    kind: i64
+    room: i64
+
+    fn deinit(sink self: Sub, a: Allocator) void {
+        a.free(self.identifier)
+        a.free(self.stream)
+        @forget(self)
+    }
+}
+
+// A socket a loop serves: who signed in, what has come in but not made a
+// whole frame, what has not gone out yet, and its subscriptions.
+const Conn = owned struct {
+    token: i64
+    user: i64
+    // The user's name, for typing notifications; looked up once.
+    name: Buf(u8)
+    inbox: Buf(u8)
+    part: ws.Partial
+    outbox: Buf(u8)
+    subs: Buf(Sub)
+    // To be let go once this round is over.
+    dead: bool
+
+    fn deinit(sink self: Conn, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.inbox)
+        self.part.deinit(a)
+        a.free(self.outbox)
+        a.free(self.subs)
+        @forget(self)
+    }
+}
+
+// A subscription's stream as its loop finds it: the socket's token, the
+// stream, and the subscription's identifier as JSON.
+const Listener = owned struct {
+    token: i64
+    stream: Buf(u8)
+    identifier: Buf(u8)
+
+    fn deinit(sink self: Listener, a: Allocator) void {
+        a.free(self.stream)
+        a.free(self.identifier)
+        @forget(self)
+    }
+}
+
+// An event loop: its poller, its sockets (index: a socket's place in conns
+// by token), their streams, a database connection of its own, and what it
+// shares: the write token, the key for signed stream names, the hub.
+const Loop = owned struct {
+    p: Poller
+    conns: Buf(Conn)
+    index: map.HashMap(i64, i64)
+    listeners: Buf(Listener)
+    db: sqlite.Db
+    key: Buf(u8)
+    clock: Clock
+    lock_rx: Receiver(bool)
+    lock_tx: Sender(bool)
+    to_hub: Sender(Cmd)
+    inbox: Receiver(In)
+
+    fn close(sink self: Loop, a: Allocator) void {
+        self.p.close()
+        a.free(self.conns)
+        a.free(self.index)
+        a.free(self.listeners)
+        self.db.close()
+        a.free(self.key)
+        self.lock_rx.close()
+        self.lock_tx.close()
+        self.to_hub.close()
+        self.inbox.close()
+        @forget(self)
+    }
+}
+
+// Starts the hub and n loops, then hands each connection from ups to the
+// next loop, until every worker has stopped. key verifies signed stream
+// names (turbo.key); lock_rx and lock_tx are the database's write token.
+fn run(sink ups: Receiver(Upgrade), sink cmds: Receiver(Cmd), sink to_hub: Sender(Cmd), sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink key: Buf(u8), io: Io, net: Net, a: Allocator, threads: Threads, clock: Clock, db_path: str, n: i64) void {
     defer ups.close()
     defer to_hub.close()
     defer lock_rx.close()
     defer lock_tx.close()
     defer a.free(key)
-    const pool = threads.channel(Pooled, POOL)
-    defer pool.close()
-    const back = pool.sender()
-    defer back.close()
+    var mine: Buf(Gate) = .empty
+    defer a.free(mine)
+    var hubs: Buf(Gate) = .empty
     var i = 0
-    while (i < POOL) {
-        const db = sqlite.open(a, db_path) catch |e| {
-            io.eprint("cable: cannot open ", db_path, ": ", @errorName(e))
+    while (i < n) {
+        const p = net.poller() catch |e| {
+            io.eprint("cable: cannot make a poller: ", @errorName(e))
+            a.free(hubs)
+            cmds.close()
             return
         }
-        back.send(Pooled{ .db = db })
+        const db = sqlite.open(a, db_path) catch |e| {
+            io.eprint("cable: cannot open ", db_path, ": ", @errorName(e))
+            p.close()
+            a.free(hubs)
+            cmds.close()
+            return
+        }
+        const q = threads.channel(In, 256)
+        const w1 = p.waker() catch |e| {
+            io.eprint("cable: ", @errorName(e))
+            p.close()
+            db.close()
+            q.close()
+            a.free(hubs)
+            cmds.close()
+            return
+        }
+        a.push(&mine, Gate{ .tx = q.sender(), .w = w1 })
+        const w2 = p.waker() catch |e| {
+            io.eprint("cable: ", @errorName(e))
+            p.close()
+            db.close()
+            q.close()
+            a.free(hubs)
+            cmds.close()
+            return
+        }
+        a.push(&hubs, Gate{ .tx = q.sender(), .w = w2 })
+        const l = Loop{ .p = p, .conns = .empty, .index = map.HashMap(i64, i64).init(), .listeners = .empty, .db = db, .key = a.concat(key, ""), .clock = clock, .lock_rx = lock_rx.clone(), .lock_tx = lock_tx.clone(), .to_hub = to_hub.clone(), .inbox = q }
+        threads.spawn(serve, l, io, a).detach()
         i = i + 1
     }
-    var next_id = 0
+    threads.spawn(hub, cmds, hubs, a).detach()
+    var next = 0
     while (ups.recv()) |u| {
-        next_id = next_id + 1
-        const copy = u.conn.clone() catch {
-            u.deinit()
-            continue
-        }
-        const queue = threads.channel(Buf(u8), QUEUE)
-        const out = queue.sender()
-        threads.spawn(writer, copy, queue, a, clock).detach()
         const user = u.user
-        const s = Session{ .id = next_id, .user = user, .name = .empty, .key = a.concat(key, ""), .clock = clock, .out = out, .to_hub = to_hub.clone(), .pool = pool.clone(), .back = back.clone(), .lock_rx = lock_rx.clone(), .lock_tx = lock_tx.clone(), .subs = .empty }
-        threads.spawn(reader, u, s, io, a).detach()
+        var m = In{ .user = user, .stream = .empty, .text = .empty, .ups = .empty }
+        a.push(&m.ups, u)
+        mine[next].give(m)
+        next = (next + 1) % n
     }
 }
 
@@ -297,91 +279,285 @@ fn ping(a: Allocator, clock: Clock) Buf(u8) {
     return ws.text_frame(a, msg)
 }
 
-// Sends what is queued, and a ping every BEAT_NS, until an empty frame.
-// Once a write fails it only empties the queue, so no sender waits on it.
-fn writer(sink c: TcpConn, sink queue: Receiver(Buf(u8)), a: Allocator, clock: Clock) void {
-    defer c.close()
-    defer queue.close()
-    var alive = true
-    var beat = clock.monotonic()
+// A loop, for as long as the process runs.
+fn serve(sink loop: Loop, io: Io, a: Allocator) void {
+    var l = loop
+    defer l.close(a)
+    var events: Buf(PollEvent) = .empty
+    defer a.free(events)
+    var data: Buf(u8) = .empty
+    defer a.free(data)
+    var beat = l.clock.monotonic() + BEAT_NS
     while (true) {
-        const wait_ms = (beat + BEAT_NS - clock.monotonic()) / 1000000
-        if (wait_ms <= 0) {
-            if (alive) {
-                const p = ping(a, clock)
-                defer a.free(p)
-                c.write(p) catch {
-                    alive = false
-                }
-            }
-            beat = clock.monotonic()
+        var wait_ms = (beat - l.clock.monotonic()) / 1000000
+        if (wait_ms < 0) {
+            wait_ms = 0
+        }
+        _ = l.p.wait(a, &events, wait_ms) catch |e| {
+            io.eprint("cable: ", @errorName(e))
             continue
         }
-        if (queue.recv_timeout(wait_ms)) |bytes| {
-            const done = @len(bytes) == 0
-            if (alive and !done) {
-                c.write(bytes) catch {
-                    alive = false
-                }
+        var k = 0
+        while (k < @len(events)) {
+            const e = events[k]
+            k = k + 1
+            if (e.token == -1) {
+                continue
             }
-            a.free(bytes)
-            if (done) {
-                // Sending to a queue nobody receives panics: wait for every
-                // sender (the reader, the hub) to let go first.
-                while (queue.recv()) |rest| {
-                    a.free(rest)
-                }
-                return
+            if (e.writable) {
+                flush(a, &l, e.token)
             }
+            if (e.readable or e.hangup) {
+                readable(a, io, &l, e.token, &data)
+            }
+        }
+        // What other threads handed over: new sockets, broadcasts.
+        while (l.inbox.recv_timeout(0)) |m| {
+            take_in(a, &l, m)
+        }
+        if (l.clock.monotonic() >= beat) {
+            const p = ping(a, l.clock)
+            defer a.free(p)
+            var c = 0
+            while (c < @len(l.conns)) {
+                send(a, &l, c, p)
+                c = c + 1
+            }
+            beat = l.clock.monotonic() + BEAT_NS
+        }
+        sweep(a, io, &l)
+    }
+}
+
+// A new socket (welcomed) or a broadcast (to every listener of its stream).
+fn take_in(a: Allocator, inout l: Loop, sink m: In) void {
+    var msg = m
+    while (a.pop(&msg.ups)) |u| {
+        const user = u.user
+        const t = l.p.add(u.take(), .read) catch {
+            continue
+        }
+        a.push(&l.conns, Conn{ .token = t, .user = user, .name = .empty, .inbox = .empty, .part = ws.partial(), .outbox = .empty, .subs = .empty, .dead = false })
+        l.index.put(a, t, @len(l.conns) - 1)
+        const w = ws.text_frame(a, WELCOME)
+        defer a.free(w)
+        const ci = @len(l.conns) - 1
+        send(a, &l, ci, w)
+    }
+    if (@len(msg.stream) > 0) {
+        cast(a, &l, msg.stream, msg.text)
+    }
+    msg.deinit(a)
+}
+
+// {"identifier":...,"message":...} to every listener of stream, the frame
+// made once for each identifier.
+fn cast(a: Allocator, inout l: Loop, stream: []u8, message: []u8) void {
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    var made_for: Buf(u8) = .empty
+    defer a.free(made_for)
+    var i = 0
+    while (i < @len(l.listeners)) {
+        if (l.listeners[i].stream == stream) {
+            if (@len(frame) == 0 or l.listeners[i].identifier != made_for) {
+                var msg: Buf(u8) = .empty
+                defer a.free(msg)
+                a.append_str(&msg, "{\"identifier\":")
+                a.append_str(&msg, l.listeners[i].identifier)
+                a.append_str(&msg, ",\"message\":")
+                a.append_str(&msg, message)
+                a.append_str(&msg, "}")
+                a.free(@replace(&frame, ws.text_frame(a, msg)))
+                a.free(@replace(&made_for, a.concat(l.listeners[i].identifier, "")))
+            }
+            if (l.index.get(l.listeners[i].token)) |ci| {
+                send(a, &l, ci, frame)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Sends bytes to socket ci: what it cannot take now waits in its outbox,
+// to go when it is writable; one that falls too far behind is let go.
+fn send(a: Allocator, inout l: Loop, ci: i64, bytes: []u8) void {
+    if (l.conns[ci].dead) {
+        return
+    }
+    if (@len(l.conns[ci].outbox) > 0) {
+        if (@len(l.conns[ci].outbox) + @len(bytes) > MAX_OUTBOX) {
+            l.conns[ci].dead = true
+        } else {
+            a.append_str(&l.conns[ci].outbox, bytes)
+        }
+        return
+    }
+    const t = l.conns[ci].token
+    const n = l.p.write(t, bytes) catch {
+        l.conns[ci].dead = true
+        return
+    }
+    if (n < @len(bytes)) {
+        a.append_str(&l.conns[ci].outbox, bytes[n..])
+        l.p.want(t, .read_write) catch {
+            l.conns[ci].dead = true
         }
     }
 }
 
-// Reads the client's messages until it closes or breaks the protocol;
-// then unsubscribes from everything, as Rails does when a socket closes,
-// leaves the hub and ends the writer.
-fn reader(sink u: Upgrade, sink session: Session, io: Io, a: Allocator) void {
-    defer u.deinit()
-    var s = session
-    defer s.close(a)
-    var joining = cmd(a, JOIN, s.id, "", "")
-    a.push(&joining.outs, Out{ .id = s.id, .tx = s.out.clone() })
-    s.to_hub.send(joining)
-    s.out.send(ws.text_frame(a, WELCOME))
-    var part = ws.partial()
-    defer part.deinit(a)
-    var data: Buf(u8) = .empty
-    defer a.free(data)
-    while (true) {
-        const kind = ws.read_message(u.conn, a, &part, &data) catch {
-            break
+fn send_owned(a: Allocator, inout l: Loop, ci: i64, sink bytes: Buf(u8)) void {
+    send(a, &l, ci, bytes)
+    a.free(bytes)
+}
+
+// Socket t is writable: as much of its outbox as it takes.
+fn flush(a: Allocator, inout l: Loop, t: i64) void {
+    const ci = l.index.get(t) orelse {
+        return
+    }
+    if (@len(l.conns[ci].outbox) == 0 or l.conns[ci].dead) {
+        return
+    }
+    const n = l.p.write(t, l.conns[ci].outbox) catch {
+        l.conns[ci].dead = true
+        return
+    }
+    const rest = a.concat(l.conns[ci].outbox[n..], "")
+    a.free(@replace(&l.conns[ci].outbox, rest))
+    if (@len(l.conns[ci].outbox) == 0) {
+        l.p.want(t, .read) catch {
+            l.conns[ci].dead = true
+        }
+    }
+}
+
+// Socket t has something to read: its frames, as far as they have come.
+fn readable(a: Allocator, io: Io, inout l: Loop, t: i64, inout data: Buf(u8)) void {
+    const ci = l.index.get(t) orelse {
+        return
+    }
+    if (l.conns[ci].dead) {
+        return
+    }
+    var chunk: Buf(u8) = .empty
+    defer a.free(chunk)
+    const got = l.p.read(t, a, &chunk, READ_SIZE) catch {
+        l.conns[ci].dead = true
+        return
+    }
+    const n = got orelse {
+        return
+    }
+    if (n == 0) {
+        l.conns[ci].dead = true
+        return
+    }
+    a.append_str(&l.conns[ci].inbox, chunk)
+    while (!l.conns[ci].dead) {
+        var inbox = @replace(&l.conns[ci].inbox, .empty)
+        var part = @replace(&l.conns[ci].part, ws.partial())
+        const kind = ws.take(a, &inbox, &part, &data)
+        a.free(@replace(&l.conns[ci].inbox, inbox))
+        const old = @replace(&l.conns[ci].part, part)
+        old.deinit(a)
+        if (kind == ws.NEED_MORE) {
+            return
         }
         if (kind == ws.TEXT) {
-            command(a, io, &s, data)
+            command(a, io, &l, ci, data)
         } else if (kind == ws.PING) {
             var pong: Buf(u8) = .empty
             ws.frame(a, &pong, ws.PONG, data)
-            s.out.send(pong)
+            send_owned(a, &l, ci, pong)
         } else if (kind == ws.CLOSE) {
             // The closing handshake: the same code back, or a normal close.
             const code = if (@len(data) >= 2) @as(i64, data[0]) << 8 | @as(i64, data[1]) else 1000
-            s.out.send(ws.close_frame(a, code))
-            break
+            send_owned(a, &l, ci, ws.close_frame(a, code))
+            l.conns[ci].dead = true
         } else if (kind == ws.PROTOCOL_ERROR or kind == ws.TOO_BIG) {
-            s.out.send(ws.close_frame(a, -kind))
-            break
+            send_owned(a, &l, ci, ws.close_frame(a, -kind))
+            l.conns[ci].dead = true
         } else if (kind == ws.BINARY) {
             io.eprint("cable: Couldn't handle non-string message")
         }
     }
-    // unsubscribe_from_all: a room the user was present in, they are not.
-    for (s.subs) |sub| {
-        if (sub.kind == PRESENCE) {
-            _ = membership(a, io, &s, sub.room, ABSENT)
+}
+
+// Lets go of the sockets marked dead: unsubscribes them from everything,
+// as Rails does when a socket closes (a room the user was present in, they
+// are not), and closes them.
+fn sweep(a: Allocator, io: Io, inout l: Loop) void {
+    var ci = 0
+    while (ci < @len(l.conns)) {
+        if (!l.conns[ci].dead) {
+            ci = ci + 1
+            continue
+        }
+        var s = 0
+        while (s < @len(l.conns[ci].subs)) {
+            if (l.conns[ci].subs[s].kind == PRESENCE) {
+                const room = l.conns[ci].subs[s].room
+                _ = membership(a, io, &l, ci, room, ABSENT)
+            }
+            s = s + 1
+        }
+        const t = l.conns[ci].token
+        stop(a, &l, t, "")
+        release(&l, t)
+        _ = l.index.remove(a, t)
+        // The last socket takes its place.
+        const last = @len(l.conns) - 1
+        if (ci != last) {
+            @swap(&l.conns, ci, last)
+            l.index.put(a, l.conns[ci].token, ci)
+        }
+        if (a.pop(&l.conns)) |gone| {
+            gone.deinit(a)
         }
     }
-    s.to_hub.send(cmd(a, LEAVE, s.id, "", ""))
-    s.out.send(.empty)
+}
+
+// Takes socket t back from the poller and closes it.
+fn release(inout l: Loop, t: i64) void {
+    const c = l.p.remove(t) catch {
+        return
+    }
+    c.close()
+}
+
+// Socket t stops listening for the subscription whose encoded identifier
+// is given, or for every one if it is empty.
+fn stop(a: Allocator, inout l: Loop, t: i64, identifier: []u8) void {
+    var i = 0
+    while (i < @len(l.listeners)) {
+        if (l.listeners[i].token == t and (@len(identifier) == 0 or l.listeners[i].identifier == identifier)) {
+            @swap(&l.listeners, i, @len(l.listeners) - 1)
+            if (a.pop(&l.listeners)) |gone| {
+                gone.deinit(a)
+            }
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn confirm(a: Allocator, inout l: Loop, ci: i64, identifier: []u8) void {
+    send_owned(a, &l, ci, reply(a, identifier, "confirm_subscription"))
+}
+
+fn reject(a: Allocator, inout l: Loop, ci: i64, identifier: []u8) void {
+    send_owned(a, &l, ci, reply(a, identifier, "reject_subscription"))
+}
+
+// Listens to stream for this subscription, then confirms it: anything cast
+// after the confirmation reaches it, as Rails confirms once its stream is
+// ready.
+fn listen(a: Allocator, inout l: Loop, ci: i64, identifier: []u8, stream: []u8) void {
+    var encoded: Buf(u8) = .empty
+    json.encode_string(a, &encoded, identifier)
+    a.push(&l.listeners, Listener{ .token = l.conns[ci].token, .stream = a.concat(stream, ""), .identifier = encoded })
+    confirm(a, &l, ci, identifier)
 }
 
 // {"identifier":<identifier>,"type":<kind>} as a frame.
@@ -464,27 +640,10 @@ fn cast_id(m: json.Member) ?i64 {
     return if (negative) -n else n
 }
 
-fn confirm(a: Allocator, inout s: Session, identifier: []u8) void {
-    s.out.send(reply(a, identifier, "confirm_subscription"))
-}
-
-fn reject(a: Allocator, inout s: Session, identifier: []u8) void {
-    s.out.send(reply(a, identifier, "reject_subscription"))
-}
-
-// Confirmed by the hub once it listens to stream for this subscription, so
-// nothing cast after the confirmation is missed.
-fn listen(a: Allocator, inout s: Session, identifier: []u8, stream: []u8) void {
-    var encoded: Buf(u8) = .empty
-    defer a.free(encoded)
-    json.encode_string(a, &encoded, identifier)
-    s.to_hub.send(cmd(a, LISTEN, s.id, stream, encoded))
-}
-
 // One command from the client (ActionCable::Connection::Subscriptions):
 // subscribe, unsubscribe, or a message to a channel. What it cannot do is
 // logged, as Rails logs it, and not answered.
-fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
+fn command(a: Allocator, io: Io, inout l: Loop, ci: i64, text: []u8) void {
     var data: Buf(json.Member) = .empty
     defer a.free(data)
     if (!json.object(a, &data, text)) {
@@ -504,24 +663,25 @@ fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
         return
     }
     const identifier = data[ii].value[0..]
-    const at = sub_at(s.subs, identifier)
+    const at = sub_at(l.conns[ci].subs, identifier)
     if (unsubscribe) {
         if (at < 0) {
             io.eprint("cable: Unable to find subscription with identifier: ", identifier)
             return
         }
-        if (@len(s.subs[at].stream) > 0) {
+        if (@len(l.conns[ci].subs[at].stream) > 0) {
             var encoded: Buf(u8) = .empty
             defer a.free(encoded)
             json.encode_string(a, &encoded, identifier)
-            s.to_hub.send(cmd(a, STOP, s.id, "", encoded))
+            const t = l.conns[ci].token
+            stop(a, &l, t, encoded)
         }
-        if (s.subs[at].kind == PRESENCE) {
-            const room = s.subs[at].room
-            _ = membership(a, io, &s, room, ABSENT)
+        if (l.conns[ci].subs[at].kind == PRESENCE) {
+            const room = l.conns[ci].subs[at].room
+            _ = membership(a, io, &l, ci, room, ABSENT)
         }
-        @swap(&s.subs, at, @len(s.subs) - 1)
-        if (a.pop(&s.subs)) |gone| {
+        @swap(&l.conns[ci].subs, at, @len(l.conns[ci].subs) - 1)
+        if (a.pop(&l.conns[ci].subs)) |gone| {
             gone.deinit(a)
         }
         return
@@ -531,7 +691,7 @@ fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
             io.eprint("cable: Unable to find subscription with identifier: ", identifier)
             return
         }
-        perform(a, io, &s, at, data)
+        perform(a, io, &l, ci, at, data)
         return
     }
     var params: Buf(json.Member) = .empty
@@ -543,26 +703,26 @@ fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
     if (at >= 0) {
         return
     }
-    if (@len(s.subs) >= MAX_SUBSCRIPTIONS or @len(identifier) > MAX_IDENTIFIER) {
+    if (@len(l.conns[ci].subs) >= MAX_SUBSCRIPTIONS or @len(identifier) > MAX_IDENTIFIER) {
         io.eprint("cable: Could not execute command: subscription limit reached")
         return
     }
     if (is(params, "channel", "Turbo::StreamsChannel") or is(params, "channel", "RoomMessagesChannel")) {
-        turbo_subscribe(a, io, &s, identifier, params)
+        turbo_subscribe(a, io, &l, ci, identifier, params)
     } else if (is(params, "channel", "UnreadRoomsChannel") or is(params, "channel", "ReadRoomsChannel")) {
         // The user's own streams.
         var stream: Buf(u8) = .empty
         defer a.free(stream)
         a.append_str(&stream, "user_")
-        a.append_int(&stream, s.user)
+        a.append_int(&stream, l.conns[ci].user)
         a.append_str(&stream, if (is(params, "channel", "UnreadRoomsChannel")) "_unreads" else "_reads")
-        a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = OTHER, .room = 0 })
-        listen(a, &s, identifier, stream)
+        a.push(&l.conns[ci].subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = OTHER, .room = 0 })
+        listen(a, &l, ci, identifier, stream)
     } else if (is(params, "channel", "RoomChannel") or is(params, "channel", "PresenceChannel") or is(params, "channel", "TypingNotificationsChannel")) {
-        room_subscribe(a, io, &s, identifier, params)
+        room_subscribe(a, io, &l, ci, identifier, params)
     } else if (is(params, "channel", "HeartbeatChannel") or is(params, "channel", "ApplicationCable::Channel")) {
-        a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = .empty, .kind = OTHER, .room = 0 })
-        confirm(a, &s, identifier)
+        a.push(&l.conns[ci].subs, Sub{ .identifier = a.concat(identifier, ""), .stream = .empty, .kind = OTHER, .room = 0 })
+        confirm(a, &l, ci, identifier)
     } else {
         io.eprint("cable: Subscription class not found: ", identifier)
     }
@@ -570,7 +730,7 @@ fn command(a: Allocator, io: Io, inout s: Session, text: []u8) void {
 
 // Turbo::StreamsChannel and RoomMessagesChannel: a signed stream name, and
 // for a room's messages, a member of the room.
-fn turbo_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, params: Buf(json.Member)) void {
+fn turbo_subscribe(a: Allocator, io: Io, inout l: Loop, ci: i64, identifier: []u8, params: Buf(json.Member)) void {
     const streams = is(params, "channel", "Turbo::StreamsChannel")
     const si = json.find(params, "signed_stream_name")
     if (si >= 0 and params[si].kind != 's' and params[si].kind != 'z') {
@@ -580,7 +740,7 @@ fn turbo_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, par
     var verified: Buf(u8) = .empty
     defer a.free(verified)
     if (si >= 0 and params[si].kind == 's') {
-        if (turbo.verify(a, s.key, params[si].value)) |v| {
+        if (turbo.verify(a, l.key, params[si].value)) |v| {
             a.free(@replace(&verified, v))
         }
     }
@@ -590,35 +750,35 @@ fn turbo_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, par
         // RoomMessagesChannel.
         ok = !turbo.guarded(verified)
     } else if (ok) {
-        ok = member_of_room(a, io, &s, verified)
+        ok = member_of_room(a, io, &l, ci, verified)
     }
     if (!ok) {
-        reject(a, &s, identifier)
+        reject(a, &l, ci, identifier)
         return
     }
-    a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(verified, ""), .kind = OTHER, .room = 0 })
-    listen(a, &s, identifier, verified)
+    a.push(&l.conns[ci].subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(verified, ""), .kind = OTHER, .room = 0 })
+    listen(a, &l, ci, identifier, verified)
 }
 
 // RoomChannel and the channels built on it: the room room_id names, if the
 // user is a member (current_user.rooms.find_by), streamed for as
 // "<channel>:<the room's GlobalID param>"; PresenceChannel then marks the
 // user present, before the confirmation, as on_subscribe does.
-fn room_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, params: Buf(json.Member)) void {
+fn room_subscribe(a: Allocator, io: Io, inout l: Loop, ci: i64, identifier: []u8, params: Buf(json.Member)) void {
     const ri = json.find(params, "room_id")
     var room = -1
     var class: Buf(u8) = .empty
     defer a.free(class)
     if (ri >= 0) {
         if (cast_id(params[ri])) |id| {
-            if (room_class(a, io, &s, id)) |c| {
+            if (room_class(a, io, &l, ci, id)) |c| {
                 a.free(@replace(&class, c))
                 room = id
             }
         }
     }
     if (room < 0) {
-        reject(a, &s, identifier)
+        reject(a, &l, ci, identifier)
         return
     }
     const presence = is(params, "channel", "PresenceChannel")
@@ -628,37 +788,37 @@ fn room_subscribe(a: Allocator, io: Io, inout s: Session, identifier: []u8, para
     a.append_str(&stream, if (presence) "presence:" else if (typing) "typing_notifications:" else "room:")
     turbo.gid(a, &stream, class, room)
     const kind = if (presence) PRESENCE else if (typing) TYPING else OTHER
-    a.push(&s.subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = kind, .room = room })
+    a.push(&l.conns[ci].subs, Sub{ .identifier = a.concat(identifier, ""), .stream = a.concat(stream, ""), .kind = kind, .room = room })
     // present before the confirmation, as on_subscribe does; the other
     // windows hear of the room read after it, as Rails' pub/sub delivers.
     var present = false
     if (presence) {
-        present = membership(a, io, &s, room, PRESENT)
+        present = membership(a, io, &l, ci, room, PRESENT)
     }
-    listen(a, &s, identifier, stream)
+    listen(a, &l, ci, identifier, stream)
     if (present) {
-        read_room(a, &s, room)
+        read_room(a, &l, ci, room)
     }
 }
 
 // broadcast_read_room: the user's other windows hear the room is read.
-fn read_room(a: Allocator, inout s: Session, room: i64) void {
+fn read_room(a: Allocator, inout l: Loop, ci: i64, room: i64) void {
     var stream: Buf(u8) = .empty
     defer a.free(stream)
     a.append_str(&stream, "user_")
-    a.append_int(&stream, s.user)
+    a.append_int(&stream, l.conns[ci].user)
     a.append_str(&stream, "_reads")
     var msg: Buf(u8) = .empty
     defer a.free(msg)
     a.append_str(&msg, "{\"room_id\":")
     a.append_int(&msg, room)
     a.append_str(&msg, "}")
-    s.to_hub.send(cmd(a, CAST, 0, stream, msg))
+    broadcast(a, l.to_hub, stream, msg)
 }
 
 // A message to a subscription: {"command":"message","data":"<JSON with
 // an action>"}, the action being one of the channel's public methods.
-fn perform(a: Allocator, io: Io, inout s: Session, at: i64, data: Buf(json.Member)) void {
+fn perform(a: Allocator, io: Io, inout l: Loop, ci: i64, at: i64, data: Buf(json.Member)) void {
     const di = json.find(data, "data")
     var payload: Buf(json.Member) = .empty
     defer a.free(payload)
@@ -666,42 +826,38 @@ fn perform(a: Allocator, io: Io, inout s: Session, at: i64, data: Buf(json.Membe
         io.eprint("cable: Could not execute command: invalid data")
         return
     }
-    const kind = s.subs[at].kind
-    const room = s.subs[at].room
+    const kind = l.conns[ci].subs[at].kind
+    const room = l.conns[ci].subs[at].room
     if (kind == PRESENCE and (is(payload, "action", "present") or is(payload, "action", "absent") or is(payload, "action", "refresh"))) {
         const op = if (is(payload, "action", "present")) PRESENT else if (is(payload, "action", "absent")) ABSENT else REFRESH
-        if (membership(a, io, &s, room, op) and op == PRESENT) {
-            read_room(a, &s, room)
+        if (membership(a, io, &l, ci, room, op) and op == PRESENT) {
+            read_room(a, &l, ci, room)
         }
     } else if (kind == TYPING and (is(payload, "action", "start") or is(payload, "action", "stop"))) {
         // broadcast_to @room, action:, user: current_user.slice(:id, :name)
-        if (@len(s.name) == 0) {
-            user_name(a, io, &s)
+        if (@len(l.conns[ci].name) == 0) {
+            user_name(a, io, &l, ci)
         }
         var msg: Buf(u8) = .empty
         defer a.free(msg)
         a.append_str(&msg, if (is(payload, "action", "start")) "{\"action\":\"start\",\"user\":{\"id\":" else "{\"action\":\"stop\",\"user\":{\"id\":")
-        a.append_int(&msg, s.user)
+        a.append_int(&msg, l.conns[ci].user)
         a.append_str(&msg, ",\"name\":")
-        json.encode_string(a, &msg, s.name)
+        json.encode_string(a, &msg, l.conns[ci].name)
         a.append_str(&msg, "}}")
-        s.to_hub.send(cmd(a, CAST, 0, s.subs[at].stream, msg))
+        broadcast(a, l.to_hub, l.conns[ci].subs[at].stream, msg)
     } else {
         io.eprint("cable: Unable to process an action")
     }
 }
 
 // The user's name, once.
-fn user_name(a: Allocator, io: Io, inout s: Session) void {
-    const p = s.pool.recv() orelse {
-        return
-    }
-    defer s.back.send(p)
-    var st = p.db.prepare("SELECT name FROM users WHERE id = ?") catch {
+fn user_name(a: Allocator, io: Io, inout l: Loop, ci: i64) void {
+    var st = l.db.prepare("SELECT name FROM users WHERE id = ?") catch {
         return
     }
     defer st.finalize()
-    st.bind_int(1, s.user) catch {
+    st.bind_int(1, l.conns[ci].user) catch {
         return
     }
     const found = st.next() catch |e| {
@@ -709,25 +865,21 @@ fn user_name(a: Allocator, io: Io, inout s: Session) void {
         return
     }
     if (found) {
-        a.free(@replace(&s.name, st.text(a, 0)))
+        a.free(@replace(&l.conns[ci].name, st.text(a, 0)))
     }
 }
 
 // The class (Rooms::Open and the like) of the room id, if the user is a
 // member of it; null if not.
-fn room_class(a: Allocator, io: Io, inout s: Session, room: i64) ?Buf(u8) {
-    const p = s.pool.recv() orelse {
-        return null
-    }
-    defer s.back.send(p)
-    var st = p.db.prepare("SELECT rooms.type FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1") catch {
+fn room_class(a: Allocator, io: Io, inout l: Loop, ci: i64, room: i64) ?Buf(u8) {
+    var st = l.db.prepare("SELECT rooms.type FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.id = ? AND memberships.user_id = ? LIMIT 1") catch {
         return null
     }
     defer st.finalize()
     st.bind_int(1, room) catch {
         return null
     }
-    st.bind_int(2, s.user) catch {
+    st.bind_int(2, l.conns[ci].user) catch {
         return null
     }
     const found = st.next() catch |e| {
@@ -742,12 +894,12 @@ fn room_class(a: Allocator, io: Io, inout s: Session, room: i64) ?Buf(u8) {
 
 // RoomMessagesChannel.subscribable_room: is the room the message stream
 // names one the user is a member of (and of the class the name says)?
-fn member_of_room(a: Allocator, io: Io, inout s: Session, stream: []u8) bool {
+fn member_of_room(a: Allocator, io: Io, inout l: Loop, ci: i64, stream: []u8) bool {
     const ref = turbo.room_stream(a, stream) orelse {
         return false
     }
     defer ref.deinit(a)
-    const class = room_class(a, io, &s, ref.id) orelse {
+    const class = room_class(a, io, &l, ci, ref.id) orelse {
         return false
     }
     defer a.free(class)
@@ -763,32 +915,28 @@ const REFRESH = 3
 // told the room is read, by the caller), absent (disconnected), or refresh
 // (still here). A connection counts for CONNECTION_TTL after it was last
 // seen. Whether present took.
-fn membership(a: Allocator, io: Io, inout s: Session, room: i64, op: i64) bool {
-    const p = s.pool.recv() orelse {
-        return false
-    }
-    defer s.back.send(p)
-    _ = s.lock_rx.recv()
-    defer s.lock_tx.send(true)
-    const now_ns = s.clock.now()
+fn membership(a: Allocator, io: Io, inout l: Loop, ci: i64, room: i64, op: i64) bool {
+    _ = l.lock_rx.recv()
+    defer l.lock_tx.send(true)
+    const now_ns = l.clock.now()
     var now: Buf(u8) = .empty
     defer a.free(now)
     tf.db_time(a, &now, now_ns)
     var cutoff: Buf(u8) = .empty
     defer a.free(cutoff)
     tf.db_time(a, &cutoff, now_ns - CONNECTION_TTL_NS)
-    p.db.exec("BEGIN IMMEDIATE") catch |e| {
+    l.db.exec("BEGIN IMMEDIATE") catch |e| {
         io.eprint("cable: ", @errorName(e))
         return false
     }
-    const found = connect_change(a, p.db, s.user, room, op, now, cutoff) catch |e| {
+    const found = connect_change(a, l.db, l.conns[ci].user, room, op, now, cutoff) catch |e| {
         io.eprint("cable: ", @errorName(e))
-        p.db.exec("ROLLBACK") catch {}
+        l.db.exec("ROLLBACK") catch {}
         return false
     }
-    p.db.exec("COMMIT") catch |e| {
+    l.db.exec("COMMIT") catch |e| {
         io.eprint("cable: ", @errorName(e))
-        p.db.exec("ROLLBACK") catch {}
+        l.db.exec("ROLLBACK") catch {}
         return false
     }
     if (!found) {

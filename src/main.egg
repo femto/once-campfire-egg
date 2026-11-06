@@ -88,14 +88,14 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     const lock = threads.channel(bool, 1)
     const lock_tx = lock.sender()
     lock_tx.send(true)
-    // WebSockets, once signed in, go to cable's thread, which starts two
-    // threads for each.
+    // WebSockets, once signed in, go to cable's event loops
+    // (CAMPFIRE_CABLE_LOOPS of them, 4 if not set).
     const upgrades = threads.channel(cable.Upgrade, 64)
     const cable_tx = upgrades.sender()
     const cmds = threads.channel(cable.Cmd, 1024)
     const hub_tx = cmds.sender()
-    threads.spawn(cable.hub, cmds, a).detach()
-    threads.spawn(cable.run, upgrades, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, a, threads, clock, cfg.db_path).detach()
+    const loops = text.parse_int(args.env("CAMPFIRE_CABLE_LOOPS") orelse "4") orelse 4
+    threads.spawn(cable.run, upgrades, cmds, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, net, a, threads, clock, cfg.db_path, if (loops < 1) 1 else loops).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty

@@ -195,3 +195,92 @@ fn read_message(c: TcpConn, a: Allocator, inout part: Partial, inout data: Buf(u
     }
     return PROTOCOL_ERROR
 }
+
+// What take gives when inbox does not hold a whole frame yet.
+const NEED_MORE = -1
+
+// The next message from the bytes received so far (inbox, from which it
+// takes what it reads), as read_message gives it from a connection:
+// NEED_MORE until a whole frame has come; a frame of a fragmented message
+// goes to part and the next is looked at.
+fn take(a: Allocator, inout inbox: Buf(u8), inout part: Partial, inout data: Buf(u8)) i64 {
+    a.free(@replace(&data, .empty))
+    while (true) {
+        const n_in = @len(inbox)
+        if (n_in < 2) {
+            return NEED_MORE
+        }
+        const fin = (inbox[0] & 0x80) != 0
+        const opcode = @as(i64, inbox[0] & 0x0F)
+        var n = @as(i64, inbox[1] & 0x7F)
+        if ((inbox[0] & 0x70) != 0 or (inbox[1] & 0x80) == 0) {
+            return PROTOCOL_ERROR
+        }
+        var at = 2
+        if (n == 126) {
+            if (n_in < 4) {
+                return NEED_MORE
+            }
+            n = @as(i64, inbox[2]) << 8 | @as(i64, inbox[3])
+            at = 4
+        } else if (n == 127) {
+            if (n_in < 10) {
+                return NEED_MORE
+            }
+            if ((inbox[2] & 0x80) != 0) {
+                return PROTOCOL_ERROR
+            }
+            n = 0
+            var i = 2
+            while (i < 10) {
+                n = n << 8 | @as(i64, inbox[i])
+                i = i + 1
+            }
+            at = 10
+        }
+        const control = opcode >= CLOSE
+        if (opcode >= 3 and opcode <= 7 or opcode > PONG) {
+            return PROTOCOL_ERROR
+        }
+        if (control and (!fin or n > 125)) {
+            return PROTOCOL_ERROR
+        }
+        if (!control and (opcode == CONTINUATION) == (part.kind < 0)) {
+            return PROTOCOL_ERROR
+        }
+        if (!control and @len(part.data) + n > MAX_MESSAGE) {
+            return TOO_BIG
+        }
+        if (n_in < at + 4 + n) {
+            return NEED_MORE
+        }
+        const mask = at
+        const from = at + 4
+        var i = 0
+        while (i < n) {
+            const b = inbox[from + i] ^ inbox[mask + i % 4]
+            if (control) {
+                a.push(&data, b)
+            } else {
+                a.push(&part.data, b)
+            }
+            i = i + 1
+        }
+        // What is left of the bytes, without this frame.
+        const rest = a.concat(inbox[from + n..], "")
+        a.free(@replace(&inbox, rest))
+        if (control) {
+            return opcode
+        }
+        if (part.kind < 0) {
+            part.kind = opcode
+        }
+        if (fin) {
+            const kind = part.kind
+            part.kind = -1
+            a.free(@replace(&data, @replace(&part.data, .empty)))
+            return kind
+        }
+    }
+    return NEED_MORE
+}
