@@ -9,6 +9,7 @@ const tf = @import("timefmt.egg")
 const signed_id = @import("signed_id.egg")
 const emoji = @import("emoji.egg")
 const richtext = @import("richtext.egg")
+const sanitize = @import("sanitize.egg")
 
 const PAGE_SIZE = 40
 
@@ -139,7 +140,11 @@ fn read_messages(a: Allocator, db: sqlite.Db, sid_key: []u8, inout st: sqlite.St
     var newest_first: Buf(MessageView) = .empty
     defer a.free(newest_first)
     while (try st.next()) {
-        const body = st.text(a, 5)
+        var body = st.text(a, 5)
+        if (sanitize.has_markup(body)) {
+            const clean = sanitize.sanitize(a, body)
+            a.free(@replace(&body, clean))
+        }
         const all_emoji = emoji.all_emoji_html(body)
         a.push(&newest_first, MessageView{
             .id = st.int(0),

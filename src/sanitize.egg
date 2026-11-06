@@ -1,0 +1,394 @@
+// What a message's body may show: ContentFilters::SanitizeTags and
+// SanitizeAttributes, the Rails::HTML::PermitScrubber allowlists the Rust
+// app runs when it presents a body. A tag not on the list goes and its
+// contents stay (SVG and MathML go with their contents); an attribute not on
+// it goes, and so does a URL attribute whose protocol is not allowed.
+//
+// This reads the HTML with a tokenizer, not an HTML5 tree builder: allowed
+// markup comes out as it went in, tags are not closed or moved as Nokogiri
+// would, and comments and doctypes go.
+uses alloc
+
+const text = @import("std/text")
+
+// ContentFilters::SanitizeTags::ALLOWED_TAGS, space-separated and padded.
+const TAGS = " a abbr acronym address b big blockquote br cite code dd del dfn div dl dt em h1 h2 h3 h4 h5 h6 hr i ins kbd li ol p pre samp small span strong sub sup time tt ul var s u mark table thead tbody tfoot tr th td action-text-attachment figure figcaption "
+
+// The attributes both lists allow: SanitizeAttributes' (Action Text's, with
+// the attachment's) and MessagesHelper::AUTO_LINK_ALLOWED_ATTRIBUTES, which
+// presentation applies after it and which drops style.
+const ATTRIBUTES = " abbr alt cite class datetime height href lang src title width xml:lang data-language sgid content-type url filename filesize previewable presentation caption content "
+
+// Loofah::HTML5::SafeList::ATTR_VAL_IS_URI
+const URI_ATTRIBUTES = " action cite href longdesc poster preload src xlink:href xml:base "
+
+const PROTOCOLS = " afs aim callto data ed2k fax ftp gopher http https irc line mailto modem news nntp rsync rtsp sftp sms ssh tag tel telnet urn webcal xmpp "
+
+const DATA_TYPES = " image/gif image/jpeg image/png text/css text/plain "
+
+// Elements whose contents are text, not markup, to their end tag.
+const RAW = " script style xmp iframe noembed noframes noscript textarea title plaintext "
+
+// Elements that go with all they hold.
+const FOREIGN = " svg math "
+
+// Whether word is one of list's space-separated words.
+fn listed(a: Allocator, list: str, word: []u8) bool {
+    const padded = a.concat(" ", word, " ")
+    defer a.free(padded)
+    return text.contains(list, padded)
+}
+
+fn is_alpha(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+}
+
+fn is_space(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12
+}
+
+fn lower(a: Allocator, s: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    for (s) |c| {
+        if (c >= 'A' and c <= 'Z') {
+            a.push(&out, c + 32)
+        } else {
+            a.push(&out, c)
+        }
+    }
+    return out
+}
+
+// Whether the body needs sanitizing at all: text alone does not.
+fn has_markup(body: []u8) bool {
+    for (body) |c| {
+        if (c == '<') {
+            return true
+        }
+    }
+    return false
+}
+
+// The body with only what is allowed.
+fn sanitize(a: Allocator, html: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    var i = 0
+    const n = @len(html)
+    while (i < n) {
+        const c = html[i]
+        if (c != '<') {
+            a.push(&out, c)
+            i = i + 1
+        } else if (i + 3 < n and html[i + 1] == '!' and html[i + 2] == '-' and html[i + 3] == '-') {
+            // A comment, to its end or the body's.
+            const end = text.find_from(html, "-->", i + 4) orelse n - 3
+            i = end + 3
+        } else if (i + 1 < n and (html[i + 1] == '!' or html[i + 1] == '?')) {
+            const end = text.find_from(html, ">", i) orelse n - 1
+            i = end + 1
+        } else if (i + 1 < n and (is_alpha(html[i + 1]) or (html[i + 1] == '/' and i + 2 < n and is_alpha(html[i + 2])))) {
+            i = tag(a, &out, html, i)
+        } else {
+            // A < that starts no tag is text.
+            a.append_str(&out, "&lt;")
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// The tag at html[i] ('<'), kept or dropped, and where the html goes on.
+fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64) i64 {
+    const n = @len(html)
+    var i = at + 1
+    const closing = html[i] == '/'
+    if (closing) {
+        i = i + 1
+    }
+    const name_from = i
+    while (i < n and !is_space(html[i]) and html[i] != '/' and html[i] != '>') {
+        i = i + 1
+    }
+    const name = lower(a, html[name_from..i])
+    defer a.free(name)
+    var attrs: Buf(u8) = .empty
+    defer a.free(attrs)
+    var self_closing = false
+    // The attributes, each kept or not as it is read.
+    while (i < n and html[i] != '>') {
+        if (is_space(html[i])) {
+            i = i + 1
+        } else if (html[i] == '/') {
+            self_closing = i + 1 < n and html[i + 1] == '>'
+            i = i + 1
+        } else {
+            i = attribute(a, &attrs, html, i)
+        }
+    }
+    const end = if (i < n) i + 1 else n
+    if (!closing and listed(a, RAW, name)) {
+        // Its contents are text: escaped, as the unwrapped element leaves it.
+        const close = a.concat("</", name)
+        defer a.free(close)
+        const stop = find_ci(html, close, end) orelse n
+        escape_text(a, &out, html[end..stop])
+        const after = text.find_from(html, ">", stop) orelse n - 1
+        return if (stop < n) after + 1 else n
+    }
+    if (!closing and listed(a, FOREIGN, name)) {
+        if (self_closing) {
+            return end
+        }
+        return skip_element(a, html, name, end)
+    }
+    if (!listed(a, TAGS, name)) {
+        return end
+    }
+    a.push(&out, '<')
+    if (closing) {
+        a.push(&out, '/')
+    }
+    a.append_str(&out, name)
+    if (!closing) {
+        a.append_str(&out, attrs)
+    }
+    a.push(&out, '>')
+    return end
+}
+
+// One attribute at html[i], added to attrs as ` name="value"` if allowed;
+// where the tag goes on.
+fn attribute(a: Allocator, inout attrs: Buf(u8), html: []u8, at: i64) i64 {
+    const n = @len(html)
+    var i = at
+    while (i < n and !is_space(html[i]) and html[i] != '/' and html[i] != '>' and html[i] != '=') {
+        i = i + 1
+    }
+    if (i == at) {
+        // A stray = or the like.
+        return i + 1
+    }
+    const name = lower(a, html[at..i])
+    defer a.free(name)
+    while (i < n and is_space(html[i])) {
+        i = i + 1
+    }
+    var value: Buf(u8) = .empty
+    defer a.free(value)
+    // Whether value is already escaped for a double-quoted attribute.
+    var quoted = false
+    if (i < n and html[i] == '=') {
+        i = i + 1
+        while (i < n and is_space(html[i])) {
+            i = i + 1
+        }
+        if (i < n and (html[i] == '"' or html[i] == '\'')) {
+            const q = html[i]
+            const from = i + 1
+            i = from
+            while (i < n and html[i] != q) {
+                i = i + 1
+            }
+            a.append_str(&value, html[from..i])
+            quoted = q == '"'
+            if (i < n) {
+                i = i + 1
+            }
+        } else {
+            const from = i
+            while (i < n and !is_space(html[i]) and html[i] != '>') {
+                i = i + 1
+            }
+            a.append_str(&value, html[from..i])
+        }
+    }
+    if (!listed(a, ATTRIBUTES, name)) {
+        return i
+    }
+    if (listed(a, URI_ATTRIBUTES, name) and !allowed_uri(a, value)) {
+        return i
+    }
+    a.push(&attrs, ' ')
+    a.append_str(&attrs, name)
+    a.append_str(&attrs, "=\"")
+    if (quoted) {
+        a.append_str(&attrs, value)
+    } else {
+        for (value) |c| {
+            if (c == '"') {
+                a.append_str(&attrs, "&quot;")
+            } else {
+                a.push(&attrs, c)
+            }
+        }
+    }
+    a.push(&attrs, '"')
+    return i
+}
+
+// Loofah's allowed_uri?: the value with entities decoded and controls and
+// spaces gone, lowercased; a protocol, if it has one before any / ? or #,
+// must be allowed, and data: only for a few media types.
+fn allowed_uri(a: Allocator, value: []u8) bool {
+    var plain: Buf(u8) = .empty
+    defer a.free(plain)
+    decode_entities(a, &plain, value)
+    var squeezed: Buf(u8) = .empty
+    defer a.free(squeezed)
+    for (plain) |c| {
+        if (c > ' ' and c != 127) {
+            a.push(&squeezed, c)
+        }
+    }
+    const v = lower(a, squeezed)
+    defer a.free(v)
+    var i = 0
+    while (i < @len(v)) {
+        const c = v[i]
+        if (c == ':') {
+            const scheme = v[0..i]
+            if (!listed(a, PROTOCOLS, scheme)) {
+                return false
+            }
+            if (scheme == "data") {
+                const rest = v[i + 1..]
+                var j = 0
+                while (j < @len(rest) and rest[j] != ';' and rest[j] != ',') {
+                    j = j + 1
+                }
+                return listed(a, DATA_TYPES, rest[0..j])
+            }
+            return true
+        }
+        if (c == '/' or c == '?' or c == '#') {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Numeric entities and the few named ones URLs carry, decoded.
+fn decode_entities(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    var i = 0
+    while (i < @len(s)) {
+        if (s[i] == '&' and i + 2 < @len(s) and s[i + 1] == '#') {
+            var j = i + 2
+            var hex = false
+            if (s[j] == 'x' or s[j] == 'X') {
+                hex = true
+                j = j + 1
+            }
+            var cp = 0
+            const from = j
+            while (j < @len(s) and digit(s[j], hex) >= 0 and cp < 0x110000) {
+                cp = cp * (if (hex) 16 else 10) + digit(s[j], hex)
+                j = j + 1
+            }
+            if (j > from) {
+                if (cp < 128) {
+                    a.push(&out, @as(u8, cp))
+                } else {
+                    a.push(&out, '?')
+                }
+                i = if (j < @len(s) and s[j] == ';') j + 1 else j
+                continue
+            }
+        }
+        if (s[i] == '&' and i + 1 < @len(s)) {
+            if (text.starts_with(s[i..], "&colon;")) {
+                a.push(&out, ':')
+                i = i + 7
+                continue
+            } else if (text.starts_with(s[i..], "&Tab;") or text.starts_with(s[i..], "&tab;")) {
+                i = i + 5
+                continue
+            } else if (text.starts_with(s[i..], "&NewLine;")) {
+                i = i + 9
+                continue
+            } else if (text.starts_with(s[i..], "&amp;")) {
+                a.push(&out, '&')
+                i = i + 5
+                continue
+            }
+        }
+        a.push(&out, s[i])
+        i = i + 1
+    }
+}
+
+fn digit(c: u8, hex: bool) i64 {
+    if (c >= '0' and c <= '9') {
+        return @as(i64, c - '0')
+    }
+    if (hex and c >= 'a' and c <= 'f') {
+        return @as(i64, c - 'a') + 10
+    }
+    if (hex and c >= 'A' and c <= 'F') {
+        return @as(i64, c - 'A') + 10
+    }
+    return -1
+}
+
+fn escape_text(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    for (s) |c| {
+        if (c == '&') {
+            a.append_str(&out, "&amp;")
+        } else if (c == '<') {
+            a.append_str(&out, "&lt;")
+        } else if (c == '>') {
+            a.append_str(&out, "&gt;")
+        } else {
+            a.push(&out, c)
+        }
+    }
+}
+
+// Where needle (lowercase) starts in html at or after from, any case.
+fn find_ci(html: []u8, needle: []u8, from: i64) ?i64 {
+    var i = from
+    while (i + @len(needle) <= @len(html)) {
+        var j = 0
+        while (j < @len(needle)) {
+            var c = html[i + j]
+            if (c >= 'A' and c <= 'Z') {
+                c = c + 32
+            }
+            if (c != needle[j]) {
+                break
+            }
+            j = j + 1
+        }
+        if (j == @len(needle)) {
+            return i
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// Past the end of the element name (its start tag ends before from), with
+// any of the same name nested in it.
+fn skip_element(a: Allocator, html: []u8, name: []u8, from: i64) i64 {
+    const open = a.concat("<", name)
+    defer a.free(open)
+    const close = a.concat("</", name)
+    defer a.free(close)
+    var depth = 1
+    var i = from
+    while (depth > 0) {
+        const next_close = find_ci(html, close, i) orelse {
+            return @len(html)
+        }
+        const next_open = find_ci(html, open, i) orelse @len(html)
+        if (next_open < next_close) {
+            depth = depth + 1
+            i = next_open + @len(open)
+        } else {
+            depth = depth - 1
+            i = next_close + @len(close)
+        }
+    }
+    const gt = text.find_from(html, ">", i) orelse @len(html) - 1
+    return gt + 1
+}
