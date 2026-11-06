@@ -8,6 +8,7 @@ const http = @import("http.egg")
 const app = @import("app.egg")
 const cable = @import("cable.egg")
 const turbo = @import("turbo.egg")
+const sys = @import("sys.egg")
 
 const Worker = owned struct {
     t: Thread
@@ -77,9 +78,10 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .cache = (args.env("CAMPFIRE_CACHE") orelse "0") == "1",
         .response_cache = (args.env("CAMPFIRE_RESPONSE_CACHE") orelse "1") != "0",
     }
+    const open_files = sys.raise_open_files()
     const listener = try net.tcp_listen("0.0.0.0", port)
     defer listener.close()
-    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (!cfg.cache) "" else if (cfg.response_cache) ", caching responses" else ", caching messages")
+    io.eprint("campfire listening on ", listener.port(), " with ", workers, " workers", if (!cfg.cache) "" else if (cfg.response_cache) ", caching responses" else ", caching messages", "; open files: ", open_files)
 
     // The database's writers take turns through this one token, rather than
     // wait on SQLite's lock, which lets some wait for seconds under load.
@@ -109,7 +111,18 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     lock_tx.close()
     cable_tx.close()
     hub_tx.close()
+    // A connection that cannot be taken (out of descriptors, say) is
+    // logged, and the next tried a moment later; the server goes on.
+    const pause = threads.channel(bool, 1)
+    defer pause.close()
+    const awake = pause.sender()
+    defer awake.close()
     while (true) {
-        queue.send(try listener.accept())
+        const c = listener.accept() catch |e| {
+            io.eprint("accept failed: ", @errorName(e))
+            _ = pause.recv_timeout(100)
+            continue
+        }
+        queue.send(c)
     }
 }

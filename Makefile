@@ -7,7 +7,7 @@ OPENSSL ?= $(shell test -d /usr/local/opt/openssl@3 && echo /usr/local/opt/opens
 # EXTRA_LIBDIRS: another zlib, say (the Docker image links zlib-ng).
 LIBDIRS = -L build $(EXTRA_LIBDIRS) $(if $(OPENSSL),-L $(OPENSSL)/lib)
 
-build/campfire: build/libcfbcrypt.a src/views.egg $(wildcard src/*.egg src/*/*.egg)
+build/campfire: build/libcfbcrypt.a build/libcfsys.a src/views.egg $(wildcard src/*.egg src/*/*.egg)
 	$(EGGC) build src/main.egg -o build/campfire $(LIBDIRS)
 
 src/views.egg: script/templates.rb $(wildcard templates/*)
@@ -18,6 +18,11 @@ build/libcfbcrypt.a: vendor/crypt_blowfish/crypt_blowfish.c vendor/crypt_blowfis
 	$(CC) -O2 -c vendor/crypt_blowfish/crypt_blowfish.c -o build/crypt_blowfish.o
 	$(CC) -O2 -c vendor/crypt_blowfish/bcrypt.c -o build/bcrypt.o
 	ar rcs $@ build/crypt_blowfish.o build/bcrypt.o
+
+build/libcfsys.a: vendor/sys/nofile.c
+	mkdir -p build
+	$(CC) -O2 -c vendor/sys/nofile.c -o build/nofile.o
+	ar rcs $@ build/nofile.o
 
 check: src/views.egg
 	$(EGGC) check src/main.egg

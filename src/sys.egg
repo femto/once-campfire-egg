@@ -1,0 +1,11 @@
+// What the process asks of the system at start (vendor/sys).
+allow unsafe
+link "cfsys"
+
+extern fn cf_raise_nofile() i64
+
+// The soft limit on open files raised to the hard limit; the limit now, or
+// -1 if it cannot be read.
+fn raise_open_files() i64 {
+    return cf_raise_nofile()
+}
