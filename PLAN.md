@@ -183,17 +183,28 @@ Why: each socket is two threads (2000 on 4 cores), and the hub, one
 thread, builds each listener's JSON and frame anew (about 10 KB each, over
 10 MB copied per message), where Rust encodes a frame once and shares it.
 
-To do, the first one first:
+Done since (`aa35d59`, Egg `8f14ee6`): egg #82 added `net.poller()`, a
+readiness poller (epoll, kqueue, WSAPoll or poll), and cable now runs on
+`CAMPFIRE_CABLE_LOOPS` event loops (4), each a thread with a Poller serving
+its sockets: frames are taken from what has come in, what a socket cannot
+take waits in its outbox, a socket 4 MB behind is let go (so no one can
+hold the others up), and a broadcast's frame is made once per
+subscription identifier. The same profile, Egg and Rust in turn the same
+hour (two runs of Egg, one of Rust; runs on this VM differ by 10-20%):
 
-1. **poll/epoll and an event loop in Egg** (a language and std change:
-   design first, then an egg PR), so that a socket is not two threads and
-   one thread serves many sockets; then cable on it.
-2. Until then, in the hub: build a cast's frame once per distinct
-   identifier (all 1000 clients here share one) and copy it per listener;
-   let a writer send what is queued in one write.
-3. A socket that stops reading can hold the hub for up to its 60 s write
-   timeout once its 256-frame queue is full: drop it instead, as the Rust
-   app drops a socket that lags.
+| | Rust | Egg, event loops |
+| --- | ---: | ---: |
+| clients ready / failed | 1000 / 0 | 1000 / 0 |
+| paced: to every client, p50 / p99 | 12.4 / 33.8 ms | 13.0-13.4 / 20.4-40.4 ms |
+| saturated: posts a second | 178 | 195-222 |
+| saturated: messages delivered whole a second | 178 | 195-222 |
+| saturated: to every client, p50 / p99 | 37 / 185 ms | 51-56 / 166-196 ms |
+| saturated: messages not reaching every client | 0 | 0 |
+| memory, peak | 134 MiB | 35-39 MiB |
+| threads (tasks), peak | 18 | 39 |
+
+Level with Rust: every message reaches every client, about as fast, on a
+quarter of the memory.
 
 The script: ~/bench/cable.sh in the VM (`cable.sh APP IMAGE PORT`).
 
@@ -218,7 +229,7 @@ Recorded as they come up; each becomes an egg issue or PR.
   close-on-exec
 - `threads.spawn(m.f, ...)` with another module's function crashed code
   generation: egg #81
-- no poll/epoll, no event loop: every blocking socket needs a thread of
-  its own (see Action Cable fan-out); to do, design first
+- no poll/epoll, no event loop: every blocking socket needed a thread of
+  its own (see Action Cable fan-out): egg #82 (`net.poller()`)
 
-All but the last are merged; `make` builds with egg main.
+All are merged; `make` builds with egg main.
