@@ -152,13 +152,56 @@ response_cache but not shared between workers):
 | sidebar | 11274 | 26406 | 1.10 | 0.40 |
 | search | 10183 | 26275 | 1.16 | 0.41 |
 
-Not yet cached: message fragments and their precompressed pieces (the
-Rust app's fragment_cache and splice deflater), which matter only once
-writes empty the response cache (the mixed profile).
+Message fragments and their precompressed pieces (the Rust app's
+fragment_cache and splice deflater) are cached too since `392eda3`
+(src/fragcache.egg, src/splice.egg); they matter once writes empty the
+response cache (the mixed profile).
+
+## Action Cable fan-out
+
+`loadgen cable` (once-campfire-verification), 2026-11-06, in the OrbStack
+Ubuntu VM: the app on CPUs 0-3, the load generator on 4-7, host networking,
+a fresh seed each; 1000 clients on the busy room's messages, presence,
+unread rooms and heartbeat; 30 paced posts, then 4 posters for 15 s. Egg at
+`4dbf4a5`, Rust's published image `6dae2fd`.
+
+| | Rust | Egg |
+| --- | ---: | ---: |
+| clients ready / failed | 1000 / 0 | 1000 / 0 |
+| paced: reached every client | 30 / 30 | 30 / 30 |
+| paced: to every client, p50 / p99 | 11.7 / 19.6 ms | 13.1 / 102.9 ms |
+| saturated: posts a second | 181 | 69 |
+| saturated: messages delivered whole a second | 181 | 50 |
+| saturated: to every client, p50 / p99 | 41 / 157 ms | 4.9 / 5.8 s |
+| saturated: messages not reaching every client | 0 | 0 |
+| memory, peak | 142 MiB | 90 MiB |
+| threads (tasks), peak | 18 | 2035 |
+
+Both deliver every message to every client. Under load Egg delivers a
+quarter of what Rust does, and posts queue up behind the fan-out (5 s).
+Why: each socket is two threads (2000 on 4 cores), and the hub, one
+thread, builds each listener's JSON and frame anew (about 10 KB each, over
+10 MB copied per message), where Rust encodes a frame once and shares it.
+
+To do, the first one first:
+
+1. **poll/epoll and an event loop in Egg** (a language and std change:
+   design first, then an egg PR), so that a socket is not two threads and
+   one thread serves many sockets; then cable on it.
+2. Until then, in the hub: build a cast's frame once per distinct
+   identifier (all 1000 clients here share one) and copy it per listener;
+   let a writer send what is queued in one write.
+3. A socket that stops reading can hold the hub for up to its 60 s write
+   timeout once its 256-frame queue is full: drop it instead, as the Rust
+   app drops a socket that lags.
+
+The script: ~/bench/cable.sh in the VM (`cable.sh APP IMAGE PORT`).
 
 ## Later
 
-Action Cable (WebSocket), the rest of the app, attachments and media, Web Push.
+The rest of the app (see README: editing, boosts, rooms, accounts, bots,
+invitations...), what bin/browser walks through first; attachments and
+media; Web Push.
 
 ## Egg pain points found
 
@@ -170,4 +213,12 @@ Recorded as they come up; each becomes an egg issue or PR.
 - no top-level value constants: egg #76 (`const MAX = 8192`)
 - no wall clock, no random bytes: egg #77 (`uses time` Clock, `uses rand` Random)
 
-All four are merged; `make` builds with egg main.
+- no way for two threads to use one socket (a WebSocket's reader and
+  writer): egg #79 (`TcpConn.clone()`), with sockets and (egg #80) files
+  close-on-exec
+- `threads.spawn(m.f, ...)` with another module's function crashed code
+  generation: egg #81
+- no poll/epoll, no event loop: every blocking socket needs a thread of
+  its own (see Action Cable fan-out); to do, design first
+
+All but the last are merged; `make` builds with egg main.
