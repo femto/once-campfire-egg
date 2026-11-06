@@ -26,6 +26,7 @@ extern fn sqlite3_column_type(stmt: *u8, i: i32) i32
 extern fn sqlite3_last_insert_rowid(db: *u8) i64
 extern fn sqlite3_changes(db: *u8) i32
 extern fn sqlite3_errmsg(db: *u8) *u8
+extern fn sqlite3_exec(db: *u8, sql: *u8, callback: *u8, arg: *u8, errmsg: *u8) i32
 
 const OK: i32 = 0
 const ROW: i32 = 100
@@ -112,6 +113,15 @@ const Db = owned struct {
         var st = try self.prepare(sql)
         defer st.finalize()
         while (try st.next()) {}
+    }
+
+    // Every statement of sql, one after another (a schema, say).
+    fn exec_script(self: Db, a: Allocator, sql: []u8) !void {
+        const z = a.concat(sql, "\0")
+        defer a.free(z)
+        if (sqlite3_exec(self.handle, @strPtr(z), null, null, null) != OK) {
+            return error.Sql
+        }
     }
 
     fn last_id(self: Db) i64 {
@@ -230,6 +240,16 @@ fn configure(db: Db) !void {
     try db.exec("PRAGMA synchronous = NORMAL")
     try db.exec("PRAGMA journal_size_limit = 67108864")
     try db.exec("PRAGMA cache_size = 2000")
+}
+
+// The same, making the file if there is none (SQLITE_OPEN_CREATE).
+fn create(a: Allocator, path: []u8) !Db {
+    const db = try open_with(a, path, OPEN_FLAGS | 0x4)
+    configure(db) catch |e| {
+        db.close()
+        return e
+    }
+    return db
 }
 
 // The same, read-only (SQLITE_OPEN_READONLY).

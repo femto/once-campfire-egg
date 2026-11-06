@@ -682,3 +682,100 @@ fn find_message(a: Allocator, db: sqlite.Db, sid_key: []u8, id: i64, room_name: 
     try st.bind_int(1, id)
     return read_messages(a, db, sid_key, &st, room_name)
 }
+
+// Account.any?
+fn account_exists(db: sqlite.Db) !bool {
+    var st = try db.prepare("SELECT 1 FROM accounts LIMIT 1")
+    defer st.finalize()
+    return st.next()
+}
+
+const ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// An account's join code: 12 random letters and digits, as XXXX-XXXX-XXXX
+// (Account#generate_join_code).
+fn join_code(a: Allocator, rng: Random) Buf(u8) {
+    var out: Buf(u8) = .empty
+    var bytes: Buf(u8) = a.alloc(32, 0)
+    defer a.free(bytes)
+    var n = 0
+    while (n < 12) {
+        rng.fill(&bytes)
+        for (bytes) |b| {
+            // 248 is 4 * 62: every character equally likely.
+            if (b < 248 and n < 12) {
+                if (n == 4 or n == 8) {
+                    a.push(&out, '-')
+                }
+                a.push(&out, ALPHANUMERIC[@as(i64, b % 62)])
+                n = n + 1
+            }
+        }
+    }
+    return out
+}
+
+// FirstRun.create!: the account, its administrator, and the first room,
+// All Talk, open, with the administrator (and any other active user) in
+// it. The administrator's id.
+fn first_run(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, name: []u8, email: []u8, digest: []u8) !i64 {
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try db.exec("BEGIN IMMEDIATE")
+    const user = first_run_rows(a, db, rng, name, email, digest, now) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+    return user
+}
+
+fn first_run_rows(a: Allocator, db: sqlite.Db, rng: Random, name: []u8, email: []u8, digest: []u8, now: []u8) !i64 {
+    const code = join_code(a, rng)
+    defer a.free(code)
+    var st = try db.prepare("INSERT INTO \"accounts\" (\"created_at\", \"custom_styles\", \"join_code\", \"name\", \"settings\", \"singleton_guard\", \"updated_at\") VALUES (?, NULL, ?, 'Campfire', '{\"restrict_room_creation_to_administrators\":false}', 0, ?)")
+    defer st.finalize()
+    try st.bind(1, now)
+    try st.bind(2, code)
+    try st.bind(3, now)
+    while (try st.next()) {}
+    // An administrator (role 1), active (status 0).
+    var su = try db.prepare("INSERT INTO \"users\" (\"bio\", \"bot_token\", \"created_at\", \"email_address\", \"name\", \"password_digest\", \"role\", \"status\", \"updated_at\") VALUES (NULL, NULL, ?, ?, ?, ?, 1, 0, ?) RETURNING \"id\"")
+    defer su.finalize()
+    try su.bind(1, now)
+    try su.bind(2, email)
+    try su.bind(3, name)
+    try su.bind(4, digest)
+    try su.bind(5, now)
+    if (!try su.next()) {
+        return error.Sql
+    }
+    const user = su.int(0)
+    while (try su.next()) {}
+    var sr = try db.prepare("INSERT INTO \"rooms\" (\"created_at\", \"creator_id\", \"name\", \"type\", \"updated_at\") VALUES (?, ?, 'All Talk', 'Rooms::Open', ?) RETURNING \"id\"")
+    defer sr.finalize()
+    try sr.bind(1, now)
+    try sr.bind_int(2, user)
+    try sr.bind(3, now)
+    if (!try sr.next()) {
+        return error.Sql
+    }
+    const room = sr.int(0)
+    while (try sr.next()) {}
+    // An open room grants itself to every active user (mentions, its
+    // default involvement); then the administrator's own grant finds it
+    // there.
+    var sm = try db.prepare("INSERT INTO \"memberships\" (\"created_at\",\"involvement\",\"room_id\",\"updated_at\",\"user_id\") SELECT STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), 'mentions', ?, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), \"users\".\"id\" FROM \"users\" WHERE \"users\".\"status\" = 0 ON CONFLICT DO NOTHING")
+    defer sm.finalize()
+    try sm.bind_int(1, room)
+    while (try sm.next()) {}
+    return user
+}
+
+// User.any?
+fn users_exist(db: sqlite.Db) !bool {
+    var st = try db.prepare("SELECT 1 FROM users LIMIT 1")
+    defer st.finalize()
+    return st.next()
+}

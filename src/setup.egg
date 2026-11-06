@@ -1,0 +1,75 @@
+// bin/rails db:prepare, at start: an empty database gets the schema (and
+// is marked migrated, as db:schema:load marks it); one already set up must
+// have every migration; either way, the indexes once-campfire-rust adds.
+uses alloc, time
+
+const sqlite = @import("sqlite.egg")
+const schema = @import("schema.egg")
+const tf = @import("timefmt.egg")
+const text = @import("std/text")
+
+fn table_exists(db: sqlite.Db, name: str) !bool {
+    var st = try db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    defer st.finalize()
+    try st.bind(1, name)
+    return st.next()
+}
+
+fn prepare(a: Allocator, db: sqlite.Db, clock: Clock) !void {
+    if (try table_exists(db, "schema_migrations")) {
+        // Every migration there: else this database is not one this app
+        // knows.
+        const versions = text.split(a, schema.VERSIONS, ",")
+        defer a.free(versions)
+        var i = 0
+        while (i < @len(versions)) {
+            var st = try db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+            defer st.finalize()
+            try st.bind(1, versions[i])
+            if (!try st.next()) {
+                return error.PendingMigrations
+            }
+            i = i + 1
+        }
+    } else {
+        try db.exec("BEGIN IMMEDIATE")
+        load(a, db, clock) catch |e| {
+            db.exec("ROLLBACK") catch {}
+            return e
+        }
+        try db.exec("COMMIT")
+    }
+    try db.exec_script(a, schema.ADDITIONS)
+}
+
+// db:schema:load: the schema, the migrations as done (assume_migrated_upto_version
+// inserts the newest, then the rest newest first), and the environment
+// and schema digest in ar_internal_metadata.
+fn load(a: Allocator, db: sqlite.Db, clock: Clock) !void {
+    try db.exec_script(a, schema.SQL)
+    const versions = text.split(a, schema.VERSIONS, ",")
+    defer a.free(versions)
+    var i = @len(versions) - 1
+    while (i >= 0) {
+        var st = try db.prepare("INSERT INTO \"schema_migrations\" (\"version\") VALUES (?)")
+        defer st.finalize()
+        try st.bind(1, versions[i])
+        while (try st.next()) {}
+        i = i - 1
+    }
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try metadata(db, "environment", "production", now)
+    try metadata(db, "schema_sha1", schema.SHA1, now)
+}
+
+fn metadata(db: sqlite.Db, key: str, value: str, now: []u8) !void {
+    var st = try db.prepare("INSERT INTO \"ar_internal_metadata\" (\"key\", \"value\", \"created_at\", \"updated_at\") VALUES (?, ?, ?, ?)")
+    defer st.finalize()
+    try st.bind(1, key)
+    try st.bind(2, value)
+    try st.bind(3, now)
+    try st.bind(4, now)
+    while (try st.next()) {}
+}

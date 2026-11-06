@@ -6,6 +6,8 @@ uses alloc, args, fs, net, rand, thread, time, io
 const text = @import("std/text")
 const http = @import("http.egg")
 const app = @import("app.egg")
+const sqlite = @import("sqlite.egg")
+const setup = @import("setup.egg")
 const cable = @import("cable.egg")
 const turbo = @import("turbo.egg")
 const sys = @import("sys.egg")
@@ -49,6 +51,32 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
     }
 }
 
+// The database's directory and file if there are none, and the schema in
+// it (see setup).
+fn prepare_database(a: Allocator, files: Fs, clock: Clock, path: str) !void {
+    var dir_end = @len(path)
+    while (dir_end > 0 and path[dir_end - 1] != '/') {
+        dir_end = dir_end - 1
+    }
+    if (dir_end > 1) {
+        make_dirs(files, path[0..dir_end - 1])
+    }
+    const db = try sqlite.create(a, path)
+    defer db.close()
+    try setup.prepare(a, db, clock)
+}
+
+// mkdir -p: each directory of path that is missing.
+fn make_dirs(files: Fs, path: []u8) void {
+    var i = 1
+    while (i <= @len(path)) {
+        if (i == @len(path) or path[i] == '/') {
+            files.make_dir(path[0..i]) catch {}
+        }
+        i = i + 1
+    }
+}
+
 fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs) !void {
     const port_text = args.env("HTTP_PORT") orelse "3000"
     const port = text.parse_int(port_text) orelse -1
@@ -69,6 +97,11 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     const default_files = a.concat(storage, "/files")
     const files_dir = args.env("CAMPFIRE_FILES_PATH") orelse a.leak(default_files)
     a.free(default_files)
+    // db:prepare: a fresh install starts from an empty database.
+    prepare_database(a, files, clock, db_path) catch |e| {
+        io.eprint("cannot prepare ", db_path, ": ", @errorName(e))
+        return
+    }
     const cfg = app.Config{
         .db_path = db_path,
         .secret = secret,

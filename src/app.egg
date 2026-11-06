@@ -21,6 +21,7 @@ const splice = @import("splice.egg")
 const ws = @import("ws.egg")
 const cable = @import("cable.egg")
 const json = @import("json.egg")
+const crypto = @import("crypto.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
@@ -201,13 +202,25 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
         return http.respond(c, a, req, "200 OK", HTML, "<!DOCTYPE html><html><body style=\"background-color: green\"></body></html>")
     }
     if (req.method == "GET" and req.path == "/session/new") {
+        if (!try model.users_exist(ctx.db)) {
+            return redirect(c, a, req, "/first_run")
+        }
         return http.respond(c, a, req, "200 OK", HTML, SIGN_IN)
+    }
+    if (req.method == "GET" and req.path == "/first_run") {
+        return first_run_page(c, a, &ctx, req)
+    }
+    if (req.method == "GET" and req.path == "/") {
+        return welcome(c, a, &ctx, req)
     }
     if (req.method == "POST" and !same_origin(a, req)) {
         return http.respond(c, a, req, "422 Unprocessable Content", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.UNPROCESSABLE)
     }
     if (req.method == "POST" and req.path == "/session") {
         return sign_in(c, a, &ctx, req)
+    }
+    if (req.method == "POST" and req.path == "/first_run") {
+        return first_run(c, a, &ctx, req)
     }
     if (req.method == "POST" and text.starts_with(req.path, "/rooms/") and text.ends_with(req.path, "/messages")) {
         if (text.parse_int(req.path[@len("/rooms/")..@len(req.path) - @len("/messages")])) |room| {
@@ -256,6 +269,18 @@ fn to_root(c: TcpConn, a: Allocator, req: http.Request) !void {
     a.append_str(&headers, "Location: http://")
     a.append_str(&headers, req.host)
     a.append_str(&headers, "/\r\n")
+    a.append_str(&headers, HTML)
+    return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+// 302 to this host's path.
+fn redirect(c: TcpConn, a: Allocator, req: http.Request, path: []u8) !void {
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: http://")
+    a.append_str(&headers, req.host)
+    a.append_str(&headers, path)
+    a.append_str(&headers, "\r\n")
     a.append_str(&headers, HTML)
     return http.respond(c, a, req, "302 Found", headers, "")
 }
@@ -423,6 +448,86 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     var headers: Buf(u8) = .empty
     defer a.free(headers)
     a.append_str(&headers, "Location: /\r\n")
+    session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
+    a.append_str(&headers, HTML)
+    return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+// GET /: the room last visited, or the first; signed out, sign in.
+fn welcome(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    var last_room = 0
+    if (codec.cookie_value(a, req.cookie, "last_room")) |v| {
+        last_room = text.parse_int(v) orelse 0
+        a.free(v)
+    }
+    const room = try model.return_room(ctx.db, user_id, last_room)
+    if (room == 0) {
+        return not_found(c, a, req)
+    }
+    var path: Buf(u8) = .empty
+    defer a.free(path)
+    a.append_str(&path, "/rooms/")
+    a.append_int(&path, room)
+    return redirect(c, a, req, path)
+}
+
+// GET /first_run: setting up, until there is an account.
+fn first_run_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    if (try model.account_exists(ctx.db)) {
+        return to_root(c, a, req)
+    }
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.first_run_show(a, &body, ctx.vapid, "/account/logo")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+// POST /first_run: the account, its administrator, signed in, and All
+// Talk; back to the start if someone was first.
+fn first_run(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    if (try model.account_exists(ctx.db)) {
+        return to_root(c, a, req)
+    }
+    const name = http.field(a, req, "user[name]") orelse {
+        return error.MissingName
+    }
+    defer a.free(name)
+    const email = http.field(a, req, "user[email_address]") orelse a.concat("", "")
+    defer a.free(email)
+    const password = http.field(a, req, "user[password]") orelse a.concat("", "")
+    defer a.free(password)
+    const digest = crypto.bcrypt_hash(a, ctx.rng, password) orelse {
+        return error.Bcrypt
+    }
+    defer a.free(digest)
+    _ = ctx.lock_rx.recv()
+    // RecordNotUnique: another request set up first.
+    const taken = model.account_exists(ctx.db) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    if (taken) {
+        ctx.lock_tx.send(true)
+        return to_root(c, a, req)
+    }
+    const user = model.first_run(a, ctx.db, ctx.clock, ctx.rng, name, email, digest) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    defer a.free(token)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: http://")
+    a.append_str(&headers, req.host)
+    a.append_str(&headers, "/\r\n")
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
     return http.respond(c, a, req, "302 Found", headers, "")
