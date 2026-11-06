@@ -1,9 +1,11 @@
 // What Action Text does to a message body, for bodies of text: assigning a
 // string stores ActionText::Content.new(body, canonicalize: true).to_html,
-// and the search index holds its plain text. A body with tags is stored as
-// it came and its plain text is the text between them; parsing and
-// re-serializing HTML as Nokogiri does is not done yet.
+// and the search index holds its plain text. A body with tags is stored
+// with them rewritten as sanitize.normalize does (not a full HTML5 parse)
+// and its plain text is the text between them.
 uses alloc
+
+const sanitize = @import("sanitize.egg")
 
 // The character an entity at s[i..] stands for and its length, of the
 // ones HTML text commonly holds; 0 if none.
@@ -55,7 +57,7 @@ fn canonical(a: Allocator, body: []u8) Buf(u8) {
     for (body) |c| {
         if (c == '<') {
             a.free(out)
-            return a.concat(body, "")
+            return sanitize.normalize(a, body)
         }
     }
     // Text only: parsed (entities decoded) and serialized (& < > escaped).

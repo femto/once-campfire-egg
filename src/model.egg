@@ -809,3 +809,143 @@ fn invitation(a: Allocator, inout code: Buf(u8), db: sqlite.Db, room: i64) !bool
     }
     return true
 }
+
+// The creator of the room's message id, or 0 if the room has no such
+// message (@room.messages.find).
+fn message_creator(db: sqlite.Db, room: i64, id: i64) !i64 {
+    var st = try db.prepare("SELECT creator_id FROM messages WHERE room_id = ? AND id = ?")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    try st.bind_int(2, id)
+    if (try st.next()) {
+        return st.int(0)
+    }
+    return 0
+}
+
+// The message's stored body, as the editor gets it back.
+fn stored_body(a: Allocator, db: sqlite.Db, id: i64) !Buf(u8) {
+    var st = try db.prepare("SELECT body FROM action_text_rich_texts WHERE record_type = 'Message' AND record_id = ? AND name = 'body'")
+    defer st.finalize()
+    try st.bind_int(1, id)
+    if (try st.next() and !st.is_null(0)) {
+        return st.text(a, 0)
+    }
+    return .empty
+}
+
+// message.update!(body:): the body if it changed, the message's and its
+// room's touch, and the search index, in one transaction.
+fn update_body(a: Allocator, db: sqlite.Db, clock: Clock, room: i64, id: i64, body: []u8) !void {
+    try db.exec("BEGIN IMMEDIATE")
+    write_body(a, db, clock, room, id, body) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+}
+
+fn write_body(a: Allocator, db: sqlite.Db, clock: Clock, room: i64, id: i64, body: []u8) !void {
+    const stored = richtext.canonical(a, body)
+    defer a.free(stored)
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
+    var find = try db.prepare("SELECT id, body FROM action_text_rich_texts WHERE record_type = 'Message' AND record_id = ? AND name = 'body'")
+    defer find.finalize()
+    try find.bind_int(1, id)
+    if (try find.next()) {
+        const old = find.text(a, 1)
+        defer a.free(old)
+        if (old == stored) {
+            return
+        }
+        _ = db_now(a, &stamp, clock)
+        var up = try db.prepare("UPDATE action_text_rich_texts SET body = ?, updated_at = ? WHERE id = ?")
+        defer up.finalize()
+        try up.bind(1, stored)
+        try up.bind(2, stamp)
+        try up.bind_int(3, find.int(0))
+        while (try up.next()) {}
+    } else {
+        _ = db_now(a, &stamp, clock)
+        var rt = try db.prepare("INSERT INTO action_text_rich_texts (body, created_at, name, record_id, record_type, updated_at) VALUES (?, ?, 'body', ?, 'Message', ?)")
+        defer rt.finalize()
+        try rt.bind(1, stored)
+        try rt.bind(2, stamp)
+        try rt.bind_int(3, id)
+        try rt.bind(4, stamp)
+        while (try rt.next()) {}
+    }
+    _ = db_now(a, &stamp, clock)
+    var touch = try db.prepare("UPDATE messages SET updated_at = ? WHERE id = ?")
+    defer touch.finalize()
+    try touch.bind(1, stamp)
+    try touch.bind_int(2, id)
+    while (try touch.next()) {}
+    _ = db_now(a, &stamp, clock)
+    var rs = try db.prepare("UPDATE rooms SET updated_at = ? WHERE id = ?")
+    defer rs.finalize()
+    try rs.bind(1, stamp)
+    try rs.bind_int(2, room)
+    while (try rs.next()) {}
+    const plain = richtext.plain_text(a, stored)
+    defer a.free(plain)
+    var ix = try db.prepare("UPDATE message_search_index SET body = ? WHERE rowid = ?")
+    defer ix.finalize()
+    try ix.bind(1, plain)
+    try ix.bind_int(2, id)
+    while (try ix.next()) {}
+}
+
+// message.destroy: its boosts, body and row, the room's touch, and its
+// search index entry.
+fn destroy_message(a: Allocator, db: sqlite.Db, clock: Clock, room: i64, id: i64) !void {
+    try db.exec("BEGIN IMMEDIATE")
+    delete_rows(a, db, clock, room, id) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+}
+
+fn delete_rows(a: Allocator, db: sqlite.Db, clock: Clock, room: i64, id: i64) !void {
+    var b = try db.prepare("DELETE FROM boosts WHERE message_id = ?")
+    defer b.finalize()
+    try b.bind_int(1, id)
+    while (try b.next()) {}
+    var t = try db.prepare("DELETE FROM action_text_rich_texts WHERE record_type = 'Message' AND record_id = ? AND name = 'body'")
+    defer t.finalize()
+    try t.bind_int(1, id)
+    while (try t.next()) {}
+    var m = try db.prepare("DELETE FROM messages WHERE id = ?")
+    defer m.finalize()
+    try m.bind_int(1, id)
+    while (try m.next()) {}
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
+    _ = db_now(a, &stamp, clock)
+    var rs = try db.prepare("UPDATE rooms SET updated_at = ? WHERE id = ?")
+    defer rs.finalize()
+    try rs.bind(1, stamp)
+    try rs.bind_int(2, room)
+    while (try rs.next()) {}
+    var ix = try db.prepare("DELETE FROM message_search_index WHERE rowid = ?")
+    defer ix.finalize()
+    try ix.bind_int(1, id)
+    while (try ix.next()) {}
+}
+
+// "closed", "open" or "direct": the room's kind, as RoomView has it.
+fn room_kind(a: Allocator, db: sqlite.Db, room: i64) !Buf(u8) {
+    var st = try db.prepare("SELECT type FROM rooms WHERE id = ?")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    var out: Buf(u8) = .empty
+    errdefer a.free(out)
+    if (try st.next()) {
+        const t = st.text(a, 0)
+        defer a.free(t)
+        a.append_str(&out, if (t == "Rooms::Closed") "closed" else if (t == "Rooms::Direct") "direct" else "open")
+    }
+    return out
+}

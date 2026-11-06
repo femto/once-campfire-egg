@@ -249,6 +249,21 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
     if (req.method == "GET" and req.path == "/users/me/sidebar") {
         return sidebar_page(c, a, &ctx, req)
     }
+    if (text.starts_with(req.path, "/rooms/")) {
+        // /rooms/:room_id/messages/:id, and /edit
+        var room = 0
+        var id = 0
+        var edit = false
+        if (message_path(req.path[@len("/rooms/")..], &room, &id, &edit)) {
+            if (req.method == "GET" and edit) {
+                return edit_message(c, a, &ctx, req, room, id)
+            } else if (req.method == "GET") {
+                return show_message(c, a, &ctx, req, room, id)
+            } else if ((req.method == "POST" or req.method == "PATCH" or req.method == "PUT" or req.method == "DELETE") and !edit) {
+                return change_message(c, a, &ctx, req, room, id)
+            }
+        }
+    }
     if (req.method == "GET" and text.starts_with(req.path, "/rooms/")) {
         const rest = req.path[@len("/rooms/")..]
         if (text.parse_int(rest)) |room| {
@@ -464,6 +479,187 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
     return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+// Whether rest (after /rooms/) is :room_id/messages/:id or that and /edit.
+fn message_path(rest: []u8, inout room: i64, inout id: i64, inout edit: bool) bool {
+    const slash = text.find(rest, "/messages/") orelse {
+        return false
+    }
+    room = text.parse_int(rest[0..slash]) orelse 0
+    const tail = rest[slash + @len("/messages/")..]
+    edit = text.ends_with(tail, "/edit")
+    const cut = if (edit) @len(tail) - @len("/edit") else @len(tail)
+    id = text.parse_int(tail[0..cut]) orelse 0
+    return room > 0 and id > 0
+}
+
+// The signed-in user's room's message for /rooms/:room_id/messages/:id:
+// its view (room name as anyone sees it), or a 404 sent and false.
+fn room_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, user_id: i64, room_id: i64, id: i64, inout found: Buf(model.MessageView)) !bool {
+    const room = try model.room_for(a, ctx.db, user_id, room_id) orelse {
+        try not_found(c, a, req)
+        return false
+    }
+    defer room.deinit(a)
+    if (try model.message_creator(ctx.db, room.id, id) == 0) {
+        try not_found(c, a, req)
+        return false
+    }
+    const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
+    defer a.free(others)
+    a.free(@replace(&found, try model.find_message(a, ctx.db, ctx.sid_key, id, others)))
+    return @len(found) == 1
+}
+
+// head :forbidden unless Current.user.can_administer?(@message)
+fn can_administer(db: sqlite.Db, user: i64, room: i64, id: i64) !bool {
+    return try model.message_creator(db, room, id) == user or try administrator(db, user)
+}
+
+// A page in the application layout around content, with no nav.
+fn plain_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, user_id: i64, content: []u8) !void {
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.app_top(a, &body, "Campfire", user, ctx.vapid, logo, "", try administrator(ctx.db, user_id), "", "")
+    a.append_str(&body, content)
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+// GET /rooms/:room_id/messages/:id: the message alone.
+fn show_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room_id: i64, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    var found: Buf(model.MessageView) = .empty
+    defer a.free(found)
+    if (!try room_message(c, a, &ctx, req, user_id, room_id, id, &found)) {
+        return
+    }
+    var content: Buf(u8) = .empty
+    defer a.free(content)
+    views.message(a, &content, found[0])
+    a.append_str(&content, "\n")
+    return plain_page(c, a, &ctx, req, user_id, content)
+}
+
+// GET /rooms/:room_id/messages/:id/edit: the message's editor.
+fn edit_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room_id: i64, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    var found: Buf(model.MessageView) = .empty
+    defer a.free(found)
+    if (!try room_message(c, a, &ctx, req, user_id, room_id, id, &found)) {
+        return
+    }
+    if (!try can_administer(ctx.db, user_id, room_id, id)) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    const editable = try model.stored_body(a, ctx.db, id)
+    defer a.free(editable)
+    const base = a.concat("http://", req.host)
+    defer a.free(base)
+    var content: Buf(u8) = .empty
+    defer a.free(content)
+    views.message_edit(a, &content, found[0], editable, base)
+    return plain_page(c, a, &ctx, req, user_id, content)
+}
+
+// PATCH (or POST with _method) /rooms/:room_id/messages/:id: the new body,
+// replaced in every open room page, then back to the message; DELETE: the
+// message gone, from every page too.
+fn change_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room_id: i64, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    var method: Buf(u8) = .empty
+    defer a.free(method)
+    a.append_str(&method, req.method)
+    if (req.method == "POST") {
+        if (http.field(a, req, "_method")) |m| {
+            a.resize(&method, 0, 0)
+            for (m) |ch| {
+                a.push(&method, if (ch >= 'a' and ch <= 'z') ch - 32 else ch)
+            }
+            a.free(m)
+        }
+    }
+    if (method != "PATCH" and method != "PUT" and method != "DELETE") {
+        return not_found(c, a, req)
+    }
+    var found: Buf(model.MessageView) = .empty
+    defer a.free(found)
+    if (!try room_message(c, a, &ctx, req, user_id, room_id, id, &found)) {
+        return
+    }
+    if (!try can_administer(ctx.db, user_id, room_id, id)) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    const kind = try model.room_kind(a, ctx.db, room_id)
+    defer a.free(kind)
+    turbo.gid(a, &stream, room_class(kind), room_id)
+    a.append_str(&stream, ":messages")
+    if (method == "DELETE") {
+        _ = ctx.lock_rx.recv()
+        model.destroy_message(a, ctx.db, ctx.clock, room_id, id) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+        ctx.lock_tx.send(true)
+        var out: Buf(u8) = .empty
+        defer a.free(out)
+        a.append_str(&out, "<turbo-stream action=\"remove\" target=\"message_")
+        html.escape(a, &out, found[0].client_id)
+        a.append_str(&out, "\"></turbo-stream>")
+        var frame: Buf(u8) = .empty
+        defer a.free(frame)
+        json.encode_string(a, &frame, out)
+        cable.broadcast(a, ctx.hub, stream, frame)
+        return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html; charset=utf-8\r\n", out)
+    }
+    if (http.field(a, req, "message[body]")) |body| {
+        defer a.free(body)
+        _ = ctx.lock_rx.recv()
+        model.update_body(a, ctx.db, ctx.clock, room_id, id, body) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+        ctx.lock_tx.send(true)
+    }
+    var now: Buf(model.MessageView) = .empty
+    defer a.free(now)
+    if (!try room_message(c, a, &ctx, req, user_id, room_id, id, &now)) {
+        return
+    }
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    a.append_str(&out, "<turbo-stream maintain_scroll=\"true\" action=\"replace\" target=\"presentation_message_")
+    html.escape(a, &out, now[0].client_id)
+    a.append_str(&out, "\"><template>")
+    views.presentation(a, &out, now[0])
+    a.append_str(&out, "</template></turbo-stream>")
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    json.encode_string(a, &frame, out)
+    cable.broadcast(a, ctx.hub, stream, frame)
+    var path: Buf(u8) = .empty
+    defer a.free(path)
+    a.append_str(&path, "/rooms/")
+    a.append_int(&path, room_id)
+    a.append_str(&path, "/messages/")
+    a.append_int(&path, id)
+    return redirect(c, a, req, path)
 }
 
 // GET /: the room last visited, or the first; signed out, sign in.

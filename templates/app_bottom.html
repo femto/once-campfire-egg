@@ -1,0 +1,9 @@
+<%fn app_bottom(a: Allocator, inout out: Buf(u8), footer: []u8, sidebar: []u8) %>
+      <footer id="footer">
+<%- footer %>      </footer>
+    </main>
+
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+<%- sidebar %>    </aside>
+
+<% layout_bottom(a, &out) %>

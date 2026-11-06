@@ -1,0 +1,14 @@
+<%fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) %>
+<% layout_top(a, &out, title, user, vapid, logo_v) %>
+
+
+<%- head %>  </head>
+
+  <body class="<%- body_class %><% if (admin) { %><% if (@len(body_class) > 0) { %> <% } %>admin<% } %>" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+
+    <nav id="nav">
+<%- nav %>    </nav>
+
+
+    <main id="main-content">

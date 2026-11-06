@@ -118,6 +118,34 @@ fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache
     a.push(&cuts, m.id)
 }
 
+// app_bottom.html
+fn app_bottom(a: Allocator, inout out: Buf(u8), footer: []u8, sidebar: []u8) void {
+    a.append_str(&out, "      <footer id=\"footer\">\n")
+    a.append_str(&out, footer)
+    a.append_str(&out, "      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n")
+    a.append_str(&out, sidebar)
+    a.append_str(&out, "    </aside>\n\n")
+    layout_bottom(a, &out)
+}
+
+// app_top.html
+fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) void {
+    layout_top(a, &out, title, user, vapid, logo_v)
+    a.append_str(&out, "\n\n")
+    a.append_str(&out, head)
+    a.append_str(&out, "  </head>\n\n  <body class=\"")
+    a.append_str(&out, body_class)
+    if (admin) {
+    if (@len(body_class) > 0) {
+    a.append_str(&out, " ")
+    }
+    a.append_str(&out, "admin")
+    }
+    a.append_str(&out, "\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n")
+    a.append_str(&out, nav)
+    a.append_str(&out, "    </nav>\n\n\n    <main id=\"main-content\">\n")
+}
+
 // avatar_svg.html
 fn avatar_svg(a: Allocator, inout out: Buf(u8), color: []u8, letters: []u8, wide: bool) void {
     a.append_str(&out, "<svg version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"\n  viewBox=\"0 0 512 512\" class=\"avatar\" aria-hidden=\"true\">\n  <defs>\n    <clipPath id=\"porthole\">\n      <circle cx=\"50%\" cy=\"50%\" r=\"50%\" />\n    </clipPath>\n  </defs>\n\n  <g>\n    <rect width=\"100%\" height=\"100%\" rx=\"50\" fill=\"")
@@ -343,12 +371,62 @@ fn message(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
     a.append_str(&out, "/boosts/new\">\n          <img aria-hidden=\"true\" src=\"/assets/boost-4a7bab66.svg\" width=\"20\" height=\"20\" />\n          <span class=\"for-screen-reader\">Add a boost</span>\n</a>      </div>\n</turbo-frame>  </div>\n</turbo-frame>\n        </div>\n      </div>\n    </turbo-frame>\n</div>")
 }
 
+// message_edit.html
+fn message_edit(a: Allocator, inout out: Buf(u8), m: model.MessageView, editable: []u8, base: []u8) void {
+    a.append_str(&out, "<turbo-frame id=\"edit_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\">\n  <div class=\"message__body position-relative\" data-controller=\"scroll-into-view\">\n    <div class=\"message__body-content message__body-content--editing gap\">\n        <div class=\"composer--edit composer--rich-text\">\n          <form id=\"form_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" data-controller=\"form\" data-action=\"lexxy:file-accept-&gt;form#preventAttachment keydown.esc-&gt;form#cancel keydown.ctrl+enter-&gt;form#submit:prevent keydown.meta+enter-&gt;form#submit:prevent\" action=\"/rooms/")
+    a.append_int(&out, m.room_id)
+    a.append_str(&out, "/messages/")
+    a.append_int(&out, m.id)
+    a.append_str(&out, "\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n            <div class=\"full-width input input--actor min-width fill-white\">\n              <lexxy-editor rows=\"1\" class=\"input lexxy-content\" aria-multiline=\"true\" aria-label=\"Edit message\" autofocus=\"autofocus\" permitted-attachment-types=\"application/vnd.campfire.mention application/vnd.actiontext.opengraph-embed\" data-action=\"lexxy:change-&gt;typing-notifications#start keydown-&gt;composer#submitByKeyboard:capture\" data-direct-upload-url=\"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/rails/active_storage/direct_uploads\" data-blob-url-template=\"")
+    a.append_str(&out, base)
+    a.append_str(&out, "/rails/active_storage/blobs/redirect/:signed_id/:filename\" id=\"message_body\" input=\"message_body_trix_input_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" name=\"message[body]\" value=\"")
+    html.escape(a, &out, editable)
+    a.append_str(&out, "\">\n                <lexxy-prompt trigger=\"@\" name=\"mention\" src=\"/autocompletable/users?room_id=")
+    a.append_int(&out, m.room_id)
+    a.append_str(&out, "\" remote-filtering=\"true\" empty-results=\"No matches\"></lexxy-prompt>\n</lexxy-editor>            </div>\n\n            <a data-form-target=\"cancel\" hidden=\"hidden\" href=\"/rooms/")
+    a.append_int(&out, m.room_id)
+    a.append_str(&out, "/messages/")
+    a.append_int(&out, m.id)
+    a.append_str(&out, "\">Close editor and discard changes</a>\n\n            <div class=\"message__edit-btns flex align-center justify-space-between gap full-width pad-block-start-half\">\n              <button name=\"button\" type=\"submit\" class=\"btn btn--reversed\">\n                <img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" />\n                <span class=\"for-screen-reader\">Save changes</span>\n</button>\n              <button name=\"button\" type=\"submit\" class=\"btn btn--negative\" form=\"delete_form_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" data-turbo-confirm=\"Are you sure you want to delete this message?\">\n                <img aria-hidden=\"true\" src=\"/assets/trash-708c7eb2.svg\" />\n                <span class=\"for-screen-reader\">Delete message</span>\n</button>            </div>\n</form>        </div>\n    </div>\n\n    <div class=\"message__actions flex flex-wrap\">\n      <a class=\"message__action-btn message__edit-close-btn txt-small btn btn--borderless\" href=\"/rooms/")
+    a.append_int(&out, m.room_id)
+    a.append_str(&out, "/messages/")
+    a.append_int(&out, m.id)
+    a.append_str(&out, "\">\n        <img class=\"colorize--black\" aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n        <span class=\"for-screen-reader\">Close editor and discard changes</span>\n</a>    </div>\n\n    <form id=\"delete_form_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" data-turbo-frame=\"edit_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" action=\"/rooms/")
+    a.append_int(&out, m.room_id)
+    a.append_str(&out, "/messages/")
+    a.append_int(&out, m.id)
+    a.append_str(&out, "\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"delete\" />\n  </div>\n</turbo-frame>\n")
+}
+
 // messages.html
 fn messages_index(a: Allocator, inout out: Buf(u8), messages: Buf(model.MessageView), inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
     for (messages) |m| {
     a.append_str(&out, "\n")
     cached_message(a, &out, &frags, &cuts, m)
     }
+}
+
+// presentation.html
+fn presentation(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
+    a.append_str(&out, "<div id=\"presentation_message_")
+    html.escape(a, &out, m.client_id)
+    a.append_str(&out, "\" dir=\"auto\" data-reply-target=\"body\" data-messages-target=\"body\">\n  <div class=\"lexxy-content\">\n  ")
+    a.append_str(&out, m.body)
+    a.append_str(&out, "\n</div>\n\n</div>\n")
 }
 
 // quick_boost.html

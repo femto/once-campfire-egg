@@ -71,6 +71,16 @@ fn has_markup(body: []u8) bool {
 
 // The body with only what is allowed.
 fn sanitize(a: Allocator, html: []u8) Buf(u8) {
+    return scrub(a, html, false)
+}
+
+// The body with all it holds, its tags written as Nokogiri writes them
+// back (attribute values double-quoted), as Action Text stores it.
+fn normalize(a: Allocator, html: []u8) Buf(u8) {
+    return scrub(a, html, true)
+}
+
+fn scrub(a: Allocator, html: []u8, all: bool) Buf(u8) {
     var out: Buf(u8) = .empty
     var i = 0
     const n = @len(html)
@@ -82,12 +92,18 @@ fn sanitize(a: Allocator, html: []u8) Buf(u8) {
         } else if (i + 3 < n and html[i + 1] == '!' and html[i + 2] == '-' and html[i + 3] == '-') {
             // A comment, to its end or the body's.
             const end = text.find_from(html, "-->", i + 4) orelse n - 3
+            if (all) {
+                a.append_str(&out, html[i..end + 3])
+            }
             i = end + 3
         } else if (i + 1 < n and (html[i + 1] == '!' or html[i + 1] == '?')) {
             const end = text.find_from(html, ">", i) orelse n - 1
+            if (all) {
+                a.append_str(&out, html[i..end + 1])
+            }
             i = end + 1
         } else if (i + 1 < n and (is_alpha(html[i + 1]) or (html[i + 1] == '/' and i + 2 < n and is_alpha(html[i + 2])))) {
-            i = tag(a, &out, html, i)
+            i = tag(a, &out, html, i, all)
         } else {
             // A < that starts no tag is text.
             a.append_str(&out, "&lt;")
@@ -98,7 +114,7 @@ fn sanitize(a: Allocator, html: []u8) Buf(u8) {
 }
 
 // The tag at html[i] ('<'), kept or dropped, and where the html goes on.
-fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64) i64 {
+fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64, all: bool) i64 {
     const n = @len(html)
     var i = at + 1
     const closing = html[i] == '/'
@@ -122,7 +138,7 @@ fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64) i64 {
             self_closing = i + 1 < n and html[i + 1] == '>'
             i = i + 1
         } else {
-            i = attribute(a, &attrs, html, i)
+            i = attribute(a, &attrs, html, i, all)
         }
     }
     const end = if (i < n) i + 1 else n
@@ -131,19 +147,32 @@ fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64) i64 {
         const close = a.concat("</", name)
         defer a.free(close)
         const stop = find_ci(html, close, end) orelse n
+        if (all) {
+            start_tag(a, &out, name, attrs, false)
+            a.append_str(&out, html[end..stop])
+            a.append_str(&out, close)
+            a.push(&out, '>')
+            const after = text.find_from(html, ">", stop) orelse n - 1
+            return if (stop < n) after + 1 else n
+        }
         escape_text(a, &out, html[end..stop])
         const after = text.find_from(html, ">", stop) orelse n - 1
         return if (stop < n) after + 1 else n
     }
-    if (!closing and listed(a, FOREIGN, name)) {
+    if (!all and !closing and listed(a, FOREIGN, name)) {
         if (self_closing) {
             return end
         }
         return skip_element(a, html, name, end)
     }
-    if (!listed(a, TAGS, name)) {
+    if (!all and !listed(a, TAGS, name)) {
         return end
     }
+    start_tag(a, &out, name, attrs, closing)
+    return end
+}
+
+fn start_tag(a: Allocator, inout out: Buf(u8), name: []u8, attrs: []u8, closing: bool) void {
     a.push(&out, '<')
     if (closing) {
         a.push(&out, '/')
@@ -153,12 +182,11 @@ fn tag(a: Allocator, inout out: Buf(u8), html: []u8, at: i64) i64 {
         a.append_str(&out, attrs)
     }
     a.push(&out, '>')
-    return end
 }
 
 // One attribute at html[i], added to attrs as ` name="value"` if allowed;
 // where the tag goes on.
-fn attribute(a: Allocator, inout attrs: Buf(u8), html: []u8, at: i64) i64 {
+fn attribute(a: Allocator, inout attrs: Buf(u8), html: []u8, at: i64, all: bool) i64 {
     const n = @len(html)
     var i = at
     while (i < n and !is_space(html[i]) and html[i] != '/' and html[i] != '>' and html[i] != '=') {
@@ -202,10 +230,10 @@ fn attribute(a: Allocator, inout attrs: Buf(u8), html: []u8, at: i64) i64 {
             a.append_str(&value, html[from..i])
         }
     }
-    if (!listed(a, ATTRIBUTES, name)) {
+    if (!all and !listed(a, ATTRIBUTES, name)) {
         return i
     }
-    if (listed(a, URI_ATTRIBUTES, name) and !allowed_uri(a, value)) {
+    if (!all and listed(a, URI_ATTRIBUTES, name) and !allowed_uri(a, value)) {
         return i
     }
     a.push(&attrs, ' ')

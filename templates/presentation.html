@@ -1,0 +1,7 @@
+<%fn presentation(a: Allocator, inout out: Buf(u8), m: model.MessageView) %>
+<div id="presentation_message_<%= m.client_id %>" dir="auto" data-reply-target="body" data-messages-target="body">
+  <div class="lexxy-content">
+  <%- m.body %>
+</div>
+
+</div>
