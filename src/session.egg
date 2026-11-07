@@ -15,6 +15,22 @@ const TOKEN_LENGTH = 24
 // such user; once-campfire-rust uses the same one.
 const DUMMY_DIGEST = "$2a$12$FiKmSp4UhLvSB4Sd/ZUjQunyKP6.NjDRHdr5LnKUVk.BUn4Mq12WS"
 
+fn allow_login(db: sqlite.Db, clock: Clock, ip: []u8) !bool {
+    const now = clock.now()
+    var prune = try db.prepare("DELETE FROM egg_login_limits WHERE expires_at <= ?")
+    defer prune.finalize()
+    try prune.bind_int(1, now)
+    while (try prune.next()) {}
+    var st = try db.prepare("INSERT INTO egg_login_limits (ip, attempts, expires_at) VALUES (?, 1, ?) ON CONFLICT(ip) DO UPDATE SET attempts = MIN(attempts + 1, 11) RETURNING attempts")
+    defer st.finalize()
+    try st.bind(1, ip)
+    try st.bind_int(2, now + 180 * tf.NS_PER_SEC)
+    if (!try st.next()) { return error.Sql }
+    const allowed = st.int(0) <= 10
+    while (try st.next()) {}
+    return allowed
+}
+
 // n random base58 characters, each from a byte below 232 (4 * 58), so all
 // are equally likely.
 fn base58(a: Allocator, rng: Random, n: i64) Buf(u8) {
@@ -55,19 +71,21 @@ fn authenticate(a: Allocator, db: sqlite.Db, email: []u8, password: []u8) !?i64 
 }
 
 // A new session for the user: its token.
-fn start(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, user: i64) !Buf(u8) {
+fn start(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, user: i64, ip: []u8, user_agent: []u8) !Buf(u8) {
     const token = base58(a, rng, TOKEN_LENGTH)
     errdefer a.free(token)
     var now: Buf(u8) = .empty
     defer a.free(now)
     tf.db_time(a, &now, clock.now())
-    var st = try db.prepare("INSERT INTO sessions (created_at, ip_address, last_active_at, token, updated_at, user_agent, user_id) VALUES (?, NULL, ?, ?, ?, NULL, ?)")
+    var st = try db.prepare("INSERT INTO sessions (created_at, ip_address, last_active_at, token, updated_at, user_agent, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
     defer st.finalize()
     try st.bind(1, now)
-    try st.bind(2, now)
-    try st.bind(3, token)
-    try st.bind(4, now)
-    try st.bind_int(5, user)
+    try st.bind(2, ip)
+    try st.bind(3, now)
+    try st.bind(4, token)
+    try st.bind(5, now)
+    try st.bind(6, user_agent)
+    try st.bind_int(7, user)
     while (try st.next()) {}
     return token
 }
@@ -83,6 +101,25 @@ fn set_cookie(a: Allocator, inout out: Buf(u8), key: []u8, clock: Clock, token: 
     a.append_str(&out, "; path=/; expires=")
     tf.http_date(a, &out, expires)
     a.append_str(&out, "; httponly; samesite=lax\r\n")
+}
+
+fn terminate(a: Allocator, db: sqlite.Db, key: []u8, clock: Clock, header: []u8, user: i64, endpoint: []u8) !void {
+    const raw = codec.cookie_value(a, header, "session_token") orelse { return }
+    defer a.free(raw)
+    const token = cookie.verify(a, key, "session_token", raw, clock.now()) orelse { return }
+    defer a.free(token)
+    var st = try db.prepare("DELETE FROM sessions WHERE token = ? AND user_id = ?")
+    defer st.finalize()
+    try st.bind(1, token)
+    try st.bind_int(2, user)
+    while (try st.next()) {}
+    if (@len(endpoint) > 0) {
+        var subscription = try db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?")
+        defer subscription.finalize()
+        try subscription.bind(1, endpoint)
+        try subscription.bind_int(2, user)
+        while (try subscription.next()) {}
+    }
 }
 
 // ApplicationCable::Connection's current_user: the user of the session the

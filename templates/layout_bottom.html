@@ -28,5 +28,22 @@
     <a href="https://once.com" id="app-logo" target="_blank" aria-label="Once software from 37signals home page">
       <img alt="Campfire logo" width="256" height="216" src="/assets/campfire-icon-3d9986c5.png" />
     </a>
+    <script>
+      if (!window.campfireFlashInstalled) {
+        window.campfireFlashInstalled = true;
+        document.addEventListener("turbo:load", async () => {
+          try {
+            const message = await fetch("/flash", { cache: "no-store" }).then(response => response.json());
+            document.getElementById("flash-notice")?.remove();
+            if (message) {
+              const notice = document.createElement("div");
+              notice.id = "flash-notice"; notice.className = "flash notice"; notice.role = "status";
+              notice.textContent = message;
+              document.querySelector("#main-content")?.prepend(notice);
+            }
+          } catch {}
+        });
+      }
+    </script>
   </body>
 </html>

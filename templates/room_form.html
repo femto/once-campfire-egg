@@ -1,0 +1,11 @@
+<%fn room_form(a: Allocator, inout out: Buf(u8), room_id: i64, name: []u8) %>
+<section class="panel txt-align-center" style="view-transition-name: <% if (room_id == 0) { %>new-room<% } else { %>edit-room-<%d room_id %><% } %>">
+  <form action="/rooms/opens<% if (room_id != 0) { %>/<%d room_id %><% } %>" method="post"><% if (room_id != 0) { %><input type="hidden" name="_method" value="patch" /><% } %>
+    <div class="flex align-center gap">
+      <label class="flex-item-grow txt-large"><input name="room[name]" id="room_name" class="input full-width" required="required" autofocus="autofocus" placeholder="Name the room" type="text" value="<%= name %>" /><span class="for-screen-reader">Name this room</span></label>
+    </div>
+    <hr class="margin-block borderless" />
+    <section class="room-access margin-block pad-inline fill-shade border-radius">Everyone</section>
+    <button name="button" type="submit" class="btn btn--reversed txt-large center"><img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" /><span class="for-screen-reader">Save</span></button>
+  </form>
+</section>

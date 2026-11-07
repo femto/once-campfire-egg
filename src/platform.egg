@@ -1,0 +1,21 @@
+// Common browser and operating-system names for notification settings.
+const text = @import("std/text")
+
+fn browser(ua: []u8) str {
+    if (text.contains(ua, "Edg/") or text.contains(ua, "Edge/") or text.contains(ua, "EdgiOS/") or text.contains(ua, "EdgA/")) { return "Edge" }
+    if (text.contains(ua, "OPR/") or text.contains(ua, "Opera/")) { return "Opera" }
+    if (text.contains(ua, "Firefox/") or text.contains(ua, "FxiOS/")) { return "Firefox" }
+    if (text.contains(ua, "Chrome/") or text.contains(ua, "CriOS/")) { return "Chrome" }
+    if (text.contains(ua, "Safari/")) { return "Safari" }
+    return "web browser"
+}
+
+fn operating_system(ua: []u8) str {
+    if (text.contains(ua, "iPhone") or text.contains(ua, "iPad") or text.contains(ua, "iPod")) { return "iOS" }
+    if (text.contains(ua, "Android")) { return "Android" }
+    if (text.contains(ua, "Windows")) { return "Windows" }
+    if (text.contains(ua, "CrOS")) { return "ChromeOS" }
+    if (text.contains(ua, "Macintosh") or text.contains(ua, "Mac OS X")) { return "macOS" }
+    if (text.contains(ua, "Linux")) { return "Linux" }
+    return "system"
+}

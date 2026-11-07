@@ -1,0 +1,13 @@
+<%fn bots_index(a: Allocator, inout out: Buf(u8), bots: Buf(model.BotView), base: []u8) %>
+<section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: chat-bots">
+  <div class="flex align-center gap"><div class="pad-inline-double center"><h1 class="margin-none">Chat bots</h1><p>With Chat bots, other sites and services can post updates directly to Campfire.</p><a class="btn btn--reversed txt-large" aria-label="Add a chat bot" href="/account/bots/new">Add a chat bot</a></div></div>
+  <div class="pad-inline pad-block-start"><menu class="flex flex-column gap margin-none pad">
+<% for (bots) |bot| { %>
+    <li class="flex flex-column gap flush fill-shade border-radius pad-block pad-inline-double"><div class="flex align-center gap"><strong class="txt-large"><%= bot.name %></strong><a class="btn flex-item-justify-end" href="/account/bots/<%d bot.id %>/edit"><span class="for-screen-reader">Edit <%= bot.name %></span><img aria-hidden="true" src="/assets/pencil-cf9d28aa.svg" width="20" height="20" /></a></div>
+<% for (bot.rooms) |room| { %>
+      <fieldset class="gap max-width pad border border-radius"><legend><strong><%= room.name %></strong></legend><input type="text" class="input full-width fill-white" aria-label="curl command for posting messages" value="curl -d 'Your message' <%- base %>/rooms/<%d room.id %>/<%- bot.key %>/messages" readonly /></fieldset>
+<% } %>
+    </li>
+<% } %>
+  </menu></div>
+</section>

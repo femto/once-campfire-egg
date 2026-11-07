@@ -4,8 +4,8 @@
 # The assets come from the build context: run script/assets.sh build/assets
 # first.
 ARG DEBIAN_RELEASE=trixie
-# egg main with #74-#77 (FFI bytes, args.env, constants, time and rand).
-ARG EGG_REF=8f14ee6
+# egg main with #83 (TcpConn.peer_ip).
+ARG EGG_REF=2dd9984
 # gzip through zlib-ng's zlib-compatible build, linked statically: the Rust
 # app deflates with zlib-rs, of the same speed, and stock zlib is slower.
 ARG ZLIB_NG_VERSION=2.2.4
@@ -17,7 +17,7 @@ ARG ZLIB_NG_VERSION
 ARG ZLIB_NG_SHA256
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
-      ca-certificates curl cmake git ruby gcc libc6-dev make libsqlite3-dev libssl-dev
+      ca-certificates curl cmake git ruby gcc libc6-dev make libsqlite3-dev libssl-dev libcurl4-openssl-dev
 RUN curl -sfL -o /tmp/zlib-ng.tar.gz https://github.com/zlib-ng/zlib-ng/archive/refs/tags/${ZLIB_NG_VERSION}.tar.gz && \
     echo "${ZLIB_NG_SHA256}  /tmp/zlib-ng.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/zlib-ng.tar.gz -C /tmp && \
@@ -36,7 +36,7 @@ RUN make EGG_DIR=/egg OPENSSL= EXTRA_LIBDIRS="-L /opt/zlib-ng/lib" && install -D
 
 FROM docker.io/library/debian:${DEBIAN_RELEASE}-slim
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y libsqlite3-0 libssl3t64 && \
+    apt-get install --no-install-recommends -y libsqlite3-0 libssl3t64 libcurl4t64 ca-certificates imagemagick ffmpeg && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 RUN groupadd --system --gid 1000 rails && \
     useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash

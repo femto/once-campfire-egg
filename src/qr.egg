@@ -1,0 +1,52 @@
+// QR Code Model 2, encoded by Project Nayuki's MIT-licensed qrcodegen.
+uses alloc
+allow unsafe
+link "cfqr"
+
+extern fn qrcodegen_encodeBinary(data: *u8, len: usize, qr: *u8, ecc: i32, min_version: i32, max_version: i32, mask: i32, boost: bool) bool
+extern fn qrcodegen_getSize(qr: *u8) i32
+extern fn qrcodegen_getModule(qr: *u8, x: i32, y: i32) bool
+
+fn svg(a: Allocator, url: []u8) ?Buf(u8) {
+    if (@len(url) > 2953) { return null }
+    var temp: Buf(u8) = a.alloc(3918, 0)
+    defer a.free(temp)
+    const matrix: Buf(u8) = a.alloc(3918, 0)
+    defer a.free(matrix)
+    var i = 0
+    while (i < @len(url)) {
+        temp[i] = url[i]
+        i = i + 1
+    }
+    if (!qrcodegen_encodeBinary(@bufPtr(temp), @as(usize, @len(url)), @bufPtr(matrix), 0, 1, 40, -1, true)) {
+        return null
+    }
+    const n = qrcodegen_getSize(@bufPtr(matrix))
+    var out: Buf(u8) = .empty
+    a.append_str(&out, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ")
+    a.append_int(&out, @as(i64, n) + 8)
+    a.push(&out, ' ')
+    a.append_int(&out, @as(i64, n) + 8)
+    a.append_str(&out, "\" shape-rendering=\"crispEdges\"><path fill=\"#fff\" d=\"M0 0h")
+    a.append_int(&out, @as(i64, n) + 8)
+    a.push(&out, 'v')
+    a.append_int(&out, @as(i64, n) + 8)
+    a.append_str(&out, "H0z\"/><path d=\"")
+    var y = 0
+    while (y < @as(i64, n)) {
+        var x = 0
+        while (x < @as(i64, n)) {
+            if (qrcodegen_getModule(@bufPtr(matrix), @as(i32, x), @as(i32, y))) {
+                a.push(&out, 'M')
+                a.append_int(&out, @as(i64, x) + 4)
+                a.push(&out, ' ')
+                a.append_int(&out, @as(i64, y) + 4)
+                a.append_str(&out, "h1v1h-1z")
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    a.append_str(&out, "\"/></svg>")
+    return out
+}

@@ -8,6 +8,7 @@ uses alloc
 const text = @import("std/text")
 const codec = @import("codec.egg")
 const crypto = @import("crypto.egg")
+const tf = @import("timefmt.egg")
 
 const SALT = "active_record/signed_id"
 const DIGEST_HEX = 64
@@ -31,6 +32,61 @@ fn generate(a: Allocator, inout out: Buf(u8), k: []u8, id: i64, purpose: str) vo
     defer a.free(mac)
     a.append_str(&out, "--")
     codec.hex_encode(a, &out, mac)
+}
+
+fn transfer(a: Allocator, inout out: Buf(u8), k: []u8, id: i64, now: i64) void {
+    var payload: Buf(u8) = .empty
+    defer a.free(payload)
+    a.append_str(&payload, "{\"_rails\":{\"data\":")
+    a.append_int(&payload, id)
+    a.append_str(&payload, ",\"exp\":\"")
+    tf.iso8601_ms(a, &payload, now + 4 * 3600 * 1000000000)
+    a.append_str(&payload, "\",\"pur\":\"user/transfer\"}}")
+    const start = @len(out)
+    codec.base64url_encode(a, &out, payload)
+    const mac = crypto.hmac_sha256(a, k, out[start..])
+    defer a.free(mac)
+    a.append_str(&out, "--")
+    codec.hex_encode(a, &out, mac)
+}
+
+fn verify_transfer(a: Allocator, k: []u8, token: []u8, now: i64) ?i64 {
+    if (@len(token) < DIGEST_HEX + 3) { return null }
+    const cut = @len(token) - DIGEST_HEX - 2
+    if (token[cut..cut + 2] != "--") { return null }
+    const mac = crypto.hmac_sha256(a, k, token[0..cut])
+    defer a.free(mac)
+    var want: Buf(u8) = .empty
+    defer a.free(want)
+    codec.hex_encode(a, &want, mac)
+    if (!codec.same_secret(want, token[cut + 2..])) { return null }
+    var payload: Buf(u8) = .empty
+    defer a.free(payload)
+    if (!codec.base64_decode(a, &payload, token[0..cut])) { return null }
+    const head = "{\"_rails\":{\"data\":"
+    const mid = ",\"exp\":\""
+    const tail = "\",\"pur\":\"user/transfer\"}}"
+    if (!text.starts_with(payload, head) or !text.ends_with(payload, tail)) { return null }
+    const at = text.find(payload, mid) orelse { return null }
+    if (at <= @len(head) or at + @len(mid) + @len(tail) >= @len(payload)) { return null }
+    var current: Buf(u8) = .empty
+    defer a.free(current)
+    tf.iso8601_ms(a, &current, now)
+    const expiry = payload[at + @len(mid)..@len(payload) - @len(tail)]
+    if (@len(expiry) != @len(current)) { return null }
+    // UTC ISO 8601 milliseconds sorts in time order.
+    var later = false
+    var i = 0
+    while (i < @len(expiry)) {
+        if (expiry[i] > current[i]) {
+            later = true
+            break
+        }
+        if (expiry[i] < current[i]) { break }
+        i = i + 1
+    }
+    if (!later) { return null }
+    return text.parse_int(payload[@len(head)..at])
 }
 
 // The id a signed id for purpose names, or null if it is forged or for

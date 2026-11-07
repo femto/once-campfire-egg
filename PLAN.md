@@ -80,23 +80,14 @@ checks Sec-Fetch-Site), and the copy-link button carries a path, which two of
 Rust's JS files expect. So the assets to serve are Rust's, not the Rails
 image's (script/assets.sh still copies Rails').
 
-Not yet like Rust (none of it is in the benchmark's rooms): the invitation in the first room while
-it has under a page of messages, notification help for a User-Agent (the
-page has the text for none), attachments and rich text rendering (bodies go
-out as stored, which matches every message in the benchmark room), the
-`last_room` cookie, the account's custom styles. The sidebar is always a
-whole page (Rust sends only the frame to a Turbo-Frame request), and
-initials upper-case ASCII only. Search's [[:word:]] is approximated with
-ranges outside ASCII. Avatars without a processed variant (initials and bot SVGs) are 404s.
-No ETag or 304s yet. Posting a message does not broadcast it over Action
-Cable, send Web Push or call bots' webhooks (Rust does all three after the
-response), and a body with HTML tags is stored as it came rather than
-re-serialized as Nokogiri would. Sign-in has no rate limit yet (Rails and
-Rust allow 10 tries in 3 minutes). `all_emoji` approximates the Unicode properties with
-code point ranges.
-
-Rust caches whole responses and message fragments (response_cache,
-fragment_cache); the Egg app renders every request.
+Remaining differences from Rust: Flash uses a dedicated encrypted Campfire
+cookie instead of Rails' encrypted session envelope. PDF thumbnails and remote
+link-card images are not provided. Search's [[:word:]] is approximated with
+ranges outside ASCII, as are `all_emoji` Unicode properties. ETag/304 validators
+cover ordinary responses, cached pages and files. Messages broadcast over
+Action Cable and queue bot webhooks and Web Push. Sign-in allows 10 tries per
+IP in 3 minutes, shared across workers. Rust and Egg both cache responses and
+message fragments when caching is enabled.
 
 ## Measurements
 
@@ -183,39 +174,61 @@ Done:
 - [x] Message edit, show, update (replace broadcast, search reindex) and
   delete.
 
-To do, in the order bin/browser needs them:
+Completed in the order bin/browser needs them:
 
-- [ ] Profile: /users/me/profile and PATCH (name, email, password, bio);
+- [x] Profile: /users/me/profile and PATCH (name, email, password, bio);
   memberships with involvement buttons; GET and PUT /rooms/:id/involvement.
-  Templates started (profile*.html, involvement_button.html), not wired.
-- [ ] Session transfer: the link on the profile (signed id, purpose
+- [x] Session transfer: the link on the profile (signed id, purpose
   "transfer", 4 h), GET /session/transfers/:id (auto-submit form), POST.
-- [ ] QR codes: /qr_code/:base64url (an SVG or PNG of the URL).
-- [ ] Account: /account/edit and update (name); custom styles
+- [x] QR codes: /qr_code/:base64url (SVG of the URL).
+- [x] Account: /account/edit and update (name); custom styles
   (/account/custom_styles/edit, the style tag in every layout); join code
   regenerate; /join/:code signup; members see no admin controls.
-- [ ] Rooms: /rooms/opens/new and create, room settings and rename,
+- [x] Rooms: /rooms/opens/new and create, room settings and rename,
   #shared_rooms broadcasts to other sidebars.
-- [ ] Bots: /account/bots new/create/edit/update, the curl command, and the
+- [x] Bots: /account/bots new/create/edit/update, the curl command, and the
   bot message API (POST /rooms/:id/:bot_key/messages).
-- [ ] Direct pings: New Ping in the sidebar, /autocompletable/users, create
-  a direct room, the "Ping with ..." nav.
-- [ ] Run bin/browser (`node browser/smoke.mjs --base URL` in the
-  verification repo; Playwright 1.63 installed there) until it passes.
+- [x] Direct pings: New Ping in the sidebar, /autocompletable/users, create
+  a direct room, the "Ping with ..." nav; all selected recipients are included,
+  duplicate selections removed, and an exact existing member set reused.
+- [x] Run bin/browser (`node browser/smoke.mjs --base URL` in the
+  verification repo; Playwright 1.63 installed there): passed on a fresh database.
+- [x] Session metadata and authentication: IP/User-Agent saved on session
+  creation, sign-out revokes the current session, and sign-in limits all workers
+  together to 10 attempts per IP in 3 minutes. `make test-accounts` checks these
+  contracts, password preservation and group Ping membership.
 
-Known gaps, not checked by bin/browser:
+- [x] Notification help names common browsers and operating systems from the
+  User-Agent; page cache keys include that header. Instructions remain generic.
+- [x] ETag/304 for GET responses, including page and file cache hits, weak
+  validators, lists and wildcard matching. Regression checks run with caching
+  enabled and disabled, and verify invalidation after a message write.
 
-- Flash notices: Rails keeps them in its encrypted session cookie, which
-  Egg does not write yet.
-- The notifications help names the browser from the User-Agent; Egg always
-  says Mozilla (the benchmark's agent).
-- Sessions do not record the IP address and User-Agent.
-- Uploaded account logos; rich text attachments (mentions, embeds) in
-  bodies are not rendered.
+- [x] Bot webhook configuration and asynchronous delivery: transactional SQLite
+  outbox, active direct-room bots and signed mentions, JSON payloads, text replies
+  and downloadable binary attachments, live reply/unread broadcasts.
+  `make test-webhooks` checks restart recovery, timeout/transport failures,
+  targeting and attachment access. Binary thumbnails are still missing.
+
+- [x] Avatar and account Logo multipart uploads: raster decoding, bounded
+  conversion, WebP avatars, 192/512 PNG PWA icons and cache-version updates.
+- [x] User message attachments, protected downloads, image thumbnails, video
+  posters, audio/video controls and single byte-range requests.
+- [x] Rich-text signed mentions and sanitized Action Text link-card contents;
+  public HTTP(S) link unfurling with private-address rejection and bounded fetches.
+- [x] One-use encrypted Flash notices for profile/account updates and notification
+  management; authenticated ciphertext and expiry checks.
+- [x] Web Push subscriptions, test notifications, VAPID ES256 and RFC 8291
+  encryption, durable delivery/retries, recipient involvement and presence rules,
+  expired-subscription cleanup. A stable default key pair is derived from the
+  app secret; deployments may supply matching VAPID keys.
+- [x] `make test-features`: real uploads/media requests, independent Web Push
+  decryption and VAPID verification, notice tampering and endpoint guards.
 
 ## Later
 
-Attachments and media; Web Push.
+PDF thumbnails, remote link-card images and Rails encrypted-session cookie
+interoperability. The custom Flash cookie provides notices in the Egg UI.
 
 ## Egg pain points found
 
@@ -235,4 +248,7 @@ Recorded as they come up; each becomes an egg issue or PR.
 - no poll/epoll, no event loop: every blocking socket needed a thread of
   its own (see Action Cable fan-out): egg #82 (`net.poller()`)
 
-All are merged; `make` builds with egg main.
+- no way to learn a connection's peer address, for sessions' IP and the
+  sign-in rate limit: egg #83 (`TcpConn.peer_ip(a)`)
+
+The numbered issues are merged.

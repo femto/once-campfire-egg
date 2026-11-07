@@ -1,0 +1,9 @@
+<%fn custom_styles(a: Allocator, inout out: Buf(u8), css: []u8) %>
+<section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: custom-styles">
+  <form action="/account/custom_styles" method="post" class="flex flex-column gap" data-controller="form"><input type="hidden" name="_method" value="patch" />
+    <h1 class="margin-none">Custom CSS</h1>
+    <p>Add custom CSS styles.</p>
+    <label class="flex align-start gap flex-item-grow"><textarea class="input input--code txt--small" placeholder="Add CSS styles…" rows="16" name="account[custom_styles]"><%= css %></textarea></label>
+    <button class="btn btn--reversed center txt-large" type="submit"><img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" /><span class="for-screen-reader">Save changes</span></button>
+  </form>
+</section>

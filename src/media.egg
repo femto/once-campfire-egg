@@ -1,0 +1,43 @@
+uses alloc
+allow unsafe
+link "cfmedia"
+extern fn cf_image_convert(input: *u8, output: *u8) i32
+fn image(a: Allocator, input: []u8, output: []u8) !void {
+    const from = a.concat(input, "\0")
+    defer a.free(from)
+    const to = a.concat(output, "\0")
+    defer a.free(to)
+    if (cf_image_convert(@bufPtr(from), @bufPtr(to)) != 0) { return error.InvalidImage }
+}
+fn image_format(data: []u8) ?str {
+    if (@len(data) >= 8 and data[0] == 137 and data[1..8] == "PNG\r\n\x1a\n") { return "png" }
+    if (@len(data) >= 3 and data[0] == 255 and data[1] == 216 and data[2] == 255) { return "jpeg" }
+    if (@len(data) >= 6 and (data[0..6] == "GIF87a" or data[0..6] == "GIF89a")) { return "gif" }
+    if (@len(data) >= 12 and data[0..4] == "RIFF" and data[8..12] == "WEBP") { return "webp" }
+    return null
+}
+extern fn cf_video_preview(input: *u8, output: *u8, format: *u8) i32
+fn video(a: Allocator, input: []u8, output: []u8, format: str) !void {
+    const from = a.concat(input, "\0")
+    defer a.free(from)
+    const to = a.concat(output, "\0")
+    defer a.free(to)
+    const decoder = a.concat(format, "\0")
+    defer a.free(decoder)
+    if (cf_video_preview(@bufPtr(from), @bufPtr(to), @bufPtr(decoder)) != 0) { return error.InvalidVideo }
+}
+
+fn video_format(data: []u8) ?str {
+    if (@len(data) > 12 and data[4..8] == "ftyp") { return "mov" }
+    if (@len(data) > 4 and data[0] == 26 and data[1] == 69 and data[2] == 223 and data[3] == 163) { return "matroska" }
+    if (@len(data) > 12 and data[0..4] == "RIFF" and data[8..12] == "AVI ") { return "avi" }
+    return null
+}
+extern fn cf_image_icon(input: *u8, output: *u8, size: i32) i32
+fn icon(a: Allocator, input: []u8, output: []u8, size: i64) !void {
+    const from = a.concat(input, "\0")
+    defer a.free(from)
+    const to = a.concat(output, "\0")
+    defer a.free(to)
+    if (cf_image_icon(@bufPtr(from), @bufPtr(to), @as(i32, size)) != 0) { return error.InvalidImage }
+}

@@ -1,0 +1,123 @@
+<%fn profile(a: Allocator, inout out: Buf(u8), user: model.UserView, has_email: bool, email: []u8, bio: []u8, shared: Buf(model.ProfileMembership), direct: Buf(model.ProfileMembership), transfer: []u8, qr: []u8) %>
+<section class="panel flex flex-column gap" style="view-transition-name: avatar-<%d user.id %>">
+    <a href="/users/me/push_subscriptions">Manage notification devices</a>
+    <details class="notifications-help pwa__instructions hide-in-pwa" data-controller="pwa-install" data-pwa-install-prompting-class="pwa--can-install" data-notifications-target="details">
+    <summary class="btn">
+      <img aria-hidden="true" src="/assets/external/install-f762b3be.svg" width="20" height="20" />
+      <strong>Install Campfire as a web app.</strong>
+      <img aria-hidden="true" class="disclosure" src="/assets/disclosure-26d63471.svg" width="10" height="10" />
+    </summary>
+
+        <p>Some platforms require you to install Campfire as a web app to receive push notifications.</p>
+
+    <div class="margin-block-start txt-align-center pwa__installer">
+      <hr class="separator margin-block">
+      <button class="btn btn--reversed center" data-action="pwa-install#promptInstall">
+        <img aria-hidden="true" src="/assets/external/install-f762b3be.svg" />
+        Install now
+      </button>
+    </div>
+  </details>
+
+
+  <div class="align-center center avatar__form gap" data-controller="upload-preview">
+    <form class="txt-medium" data-controller="form" enctype="multipart/form-data" action="/users/me/profile" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="patch" />
+      <label class="btn input--file">
+        <img aria-hidden="true" src="/assets/camera-927323b8.svg" width="20" height="20" />
+        <input id="file" class="input" accept="image/*" data-upload-preview-target="input" data-action="upload-preview#previewImage change-&gt;form#submit" type="file" name="user[avatar]" />
+        <span class="for-screen-reader">Upload avatar</span>
+      </label>
+</form>
+    <form data-controller="form" enctype="multipart/form-data" action="/users/me/profile" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="patch" />
+      <label class="btn avatar input--file txt-xx-large">
+        <img aria-hidden="true" data-upload-preview-target="image" src="<%- user.avatar %>" width="300" height="300" />
+        <input id="file" class="input" accept="image/*" data-upload-preview-target="input" data-action="upload-preview#previewImage change-&gt;form#submit" type="file" name="user[avatar]" />
+        <span class="for-screen-reader">Avatar</span>
+      </label>
+</form>
+  </div>
+
+  <form data-controller="form" action="/users/me/profile" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="patch" />
+    <div class="flex flex-column gap">
+      <div class="flex align-center gap">
+        <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Enter your name</dd><dt>🇪🇸</dt><dd class="margin-none">Introduce tu nombre</dd><dt>🇫🇷</dt><dd class="margin-none">Entrez votre nom</dd><dt>🇮🇳</dt><dd class="margin-none">अपना नाम दर्ज करें</dd><dt>🇩🇪</dt><dd class="margin-none">Geben Sie Ihren Namen ein</dd><dt>🇧🇷</dt><dd class="margin-none">Insira seu nome</dd><dt>🇯🇵</dt><dd class="margin-none">お名前を入力してください</dd></dl></div></details>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <input class="input txt-large " autocomplete="name" placeholder="Enter your name" autofocus="autofocus" required="required" data-1p-ignore="true" type="text" value="<%= user.name %>" name="user[name]" id="user_name" />
+          <img aria-hidden="true" class="colorize--black" src="/assets/person-da193438.svg" width="24" height="24" />
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Enter your email address</dd><dt>🇪🇸</dt><dd class="margin-none">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class="margin-none">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class="margin-none">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class="margin-none">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class="margin-none">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class="margin-none">メールアドレスを入力してください</dd></dl></div></details>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <input class="input txt-large"<% if (has_email) { %> value="<%= email %>"<% } %> autocomplete="username" placeholder="Enter your email address" type="email" name="user[email_address]" id="user_email_address" />
+          <img aria-hidden="true" class="colorize--black" src="/assets/email-6c595bc5.svg" width="24" height="24" />
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Change password</dd><dt>🇪🇸</dt><dd class="margin-none">Cambiar contraseña</dd><dt>🇫🇷</dt><dd class="margin-none">Changer le mot de passe</dd><dt>🇮🇳</dt><dd class="margin-none">पासवर्ड बदलें</dd><dt>🇩🇪</dt><dd class="margin-none">Passwort ändern</dd><dt>🇧🇷</dt><dd class="margin-none">Alterar senha</dd><dt>🇯🇵</dt><dd class="margin-none">パスワードを変更</dd></dl></div></details>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <input class="input txt-large" autocomplete="new-password" placeholder="Change password" maxlength="72" size="72" type="password" name="user[password]" id="user_password" />
+          <img aria-hidden="true" class="colorize--black" src="/assets/password-0896da4e.svg" width="24" height="24" />
+        </label>
+      </div>
+
+      <div class="flex align-start gap">
+        <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Enter a few words about yourself.</dd><dt>🇪🇸</dt><dd class="margin-none">Ingresa algunas palabras sobre ti mismo.</dd><dt>🇫🇷</dt><dd class="margin-none">Saisissez quelques mots à propos de vous-même.</dd><dt>🇮🇳</dt><dd class="margin-none">अपने बारे में कुछ शब्द लिखें.</dd><dt>🇩🇪</dt><dd class="margin-none">Geben Sie ein paar Worte über sich selbst ein.</dd><dt>🇧🇷</dt><dd class="margin-none">Insira alguma palavras sobre você.</dd><dt>🇯🇵</dt><dd class="margin-none">ご自分について簡単に記入してください。</dd></dl></div></details>
+
+        <label class="flex align--center gap flex-item--grow input input--actor">
+          <textarea class="input txt-large" placeholder="A few words about yourself…" maxlength="200" rows="3" name="user[bio]" id="user_bio">
+<%= bio %></textarea>
+          <img aria-hidden="true" class="colorize--black" src="/assets/bio-567a6005.svg" width="24" height="24" />
+        </label>
+      </div>
+
+      <button class="btn btn--reversed center txt-large" type="submit"><img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" /><span class="for-screen-reader">Save changes</span></button>
+    </div>
+</form>
+  <div class="margin-block pad-inline pad-block fill-shade border-radius">
+    <menu class="flex flex-column gap margin-none pad">
+      <% for (shared) |m| { %><% profile_membership(a, &out, m.room_id, m.name, m.param_key, m.direct, m.involvement) %><% } %>
+<% if (@len(direct) > 0 and @len(shared) > 0) { %>
+        <hr class="separator full-width" style="--border-style: solid">
+<% } %>
+
+      <% for (direct) |m| { %><% profile_membership(a, &out, m.room_id, m.name, m.param_key, m.direct, m.involvement) %><% } %>    </menu>
+  </div>
+
+  
+<fieldset>
+  <legend class="gap">
+    <img aria-hidden="true" class="colorize--black" src="/assets/laptop-cf35e6d4.svg" width="36" height="36" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/transfer-3ec4f61b.svg" width="36" height="36" />
+    <img aria-hidden="true" class="colorize--black" src="/assets/mobile-phone-d0d2301d.svg" width="36" height="36" />
+  </legend>
+
+
+  <div class="flex flex-column gap">
+      <label for="session_transfer_url" class="for-screen-reader">Use this link to login automatically on another device</label>
+
+    <input type="text" class="input" value="<%= transfer %>" id="session_transfer_url" readonly>
+
+    <div class="flex align-center center gap">
+      <a class="btn" data-lightbox-target="image" data-action="lightbox#open" data-lightbox-url-value="/qr_code/<%- qr %>" href="/qr_code/<%- qr %>">
+        <span class="for-screen-reader">Show auto-login QR code</span>
+        <img aria-hidden="true" class="colorize--black" src="/assets/qr-code-dac3b273.svg" width="20" height="20" />
+</a>
+      <button class="btn" data-controller="copy-to-clipboard" data-action="copy-to-clipboard#copy" data-copy-to-clipboard-success-class="btn--success" data-copy-to-clipboard-content-value="<%= transfer %>">
+        <span class="for-screen-reader">Copy auto-login link</span>
+        <img aria-hidden="true" class="flex-item-no-shrink colorize--black" src="/assets/copy-paste-4c379063.svg" width="20" height="20" />
+</button>
+      <button class="btn" hidden="hidden" data-controller="web-share" data-action="web-share#share" data-web-share-url-value="<%= transfer %>" data-web-share-text-value="This is your own private sign-in URL, DO NOT SHARE IT. Use it to sign-in on another device or if you get locked out." data-web-share-title-value="Your sign-in link">
+        <span class="for-screen-reader">Share auto-login link</span>
+        <img aria-hidden="true" class="flex-item-no-shrink colorize--black" src="/assets/share-bf28da4f.svg" width="20" height="20" />
+</button>    </div>
+  </div>
+</fieldset>
+
+</section>
+

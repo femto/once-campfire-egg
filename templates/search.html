@@ -1,5 +1,5 @@
-<%fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
-<% layout_top(a, &out, "Search", user, vapid, logo_v) %>
+<%fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
+<% layout_top(a, &out, "Search", user, vapid, logo_v, css) %>
 
 
   </head>

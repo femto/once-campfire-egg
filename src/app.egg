@@ -23,12 +23,25 @@ const cable = @import("cable.egg")
 const json = @import("json.egg")
 const crypto = @import("crypto.egg")
 const gzip = @import("gzip.egg")
+const platform = @import("platform.egg")
+const push = @import("push.egg")
+const flash = @import("flash.egg")
+const uploads = @import("uploads.egg")
+const sanitize = @import("sanitize.egg")
+const richtext = @import("richtext.egg")
+const media = @import("media.egg")
+const bot_hooks = @import("webhook.egg")
+const webhook_http = @import("webhook_http.egg")
+const qrcode = @import("qr.egg")
 
 // What main reads from the environment for the workers.
 const Config = struct {
     db_path: str
     secret: str
     vapid: str
+    push_private: str
+    push_subject: str
+    push_allow_local: bool
     // Active Storage's root, and the precompiled assets.
     files: str
     assets: str
@@ -43,9 +56,14 @@ const Context = owned struct {
     // Keys derived from SECRET_KEY_BASE once: signed cookies, signed ids
     // (avatar URLs) and signed stream names.
     key: Buf(u8)
+    flash_key: Buf(u8)
+    mention_key: Buf(u8)
     sid_key: Buf(u8)
     stream_key: Buf(u8)
     vapid: Buf(u8)
+    push_private: Buf(u8)
+    push_subject: str
+    push_allow_local: bool
     clock: Clock
     rng: Random
     fs: Fs
@@ -74,8 +92,11 @@ const Context = owned struct {
         self.frags.close(a)
         self.pieces.close(a)
         a.free(self.key)
+        a.free(self.flash_key)
+        a.free(self.mention_key)
         a.free(self.sid_key)
         a.free(self.stream_key)
+        a.free(self.push_private)
         a.free(self.vapid)
         @forget(self)
     }
@@ -101,9 +122,14 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
     return Context{
         .db = db,
         .key = cookie.key(a, secret),
+        .flash_key = flash.key(a, secret),
+        .mention_key = bot_hooks.key(a, secret),
         .sid_key = signed_id.key(a, secret),
         .stream_key = turbo.key(a, secret),
         .vapid = a.concat(cfg.vapid, ""),
+        .push_private = a.concat(cfg.push_private, ""),
+        .push_subject = cfg.push_subject,
+        .push_allow_local = cfg.push_allow_local,
         .clock = clock,
         .rng = rng,
         .fs = files,
@@ -217,20 +243,47 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
     if (req.method == "GET" and req.path == "/service-worker.js") {
         return service_worker(c, a, req)
     }
+    if (req.method == "GET" and text.starts_with(req.path, "/qr_code/")) {
+        return qr_code(c, a, req)
+    }
     if (req.method == "GET" and req.path == "/first_run") {
         return first_run_page(c, a, &ctx, req)
     }
     if (req.method == "GET" and req.path == "/") {
         return welcome(c, a, &ctx, req)
     }
-    if (req.method == "POST" and !same_origin(a, req)) {
+    if ((req.method == "POST" or req.method == "PATCH" or req.method == "PUT" or req.method == "DELETE") and !same_origin(a, req)) {
         return http.respond(c, a, req, "422 Unprocessable Content", "Content-Type: text/html; charset=UTF-8\r\n", public_pages.UNPROCESSABLE)
     }
     if (req.method == "POST" and req.path == "/session") {
+        if (http.field(a, req, "_method")) |method| {
+            defer a.free(method)
+            if (method == "delete" or method == "DELETE") { return sign_out(c, a, &ctx, req) }
+        }
         return sign_in(c, a, &ctx, req)
+    }
+    if (req.method == "DELETE" and req.path == "/session") {
+        if (!same_origin(a, req)) {
+            return http.respond(c, a, req, "422 Unprocessable Content", HTML, public_pages.UNPROCESSABLE)
+        }
+        return sign_out(c, a, &ctx, req)
     }
     if (req.method == "POST" and req.path == "/first_run") {
         return first_run(c, a, &ctx, req)
+    }
+    if (text.starts_with(req.path, "/join/")) {
+        return join_account(c, a, &ctx, req)
+    }
+    if (req.method == "POST" and text.starts_with(req.path, "/rooms/") and text.ends_with(req.path, "/messages")) {
+        const rest = req.path[@len("/rooms/")..@len(req.path) - @len("/messages")]
+        if (text.find(rest, "/")) |slash| {
+            if (text.parse_int(rest[0..slash])) |room| {
+                return bot_message(c, a, &ctx, req, room, rest[slash + 1..])
+            }
+        }
+    }
+    if (text.starts_with(req.path, "/session/transfers/")) {
+        return session_transfer(c, a, &ctx, req)
     }
     if (req.method == "POST" and text.starts_with(req.path, "/rooms/") and text.ends_with(req.path, "/messages")) {
         if (text.parse_int(req.path[@len("/rooms/")..@len(req.path) - @len("/messages")])) |room| {
@@ -249,7 +302,75 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
     if (req.method == "GET" and req.path == "/users/me/sidebar") {
         return sidebar_page(c, a, &ctx, req)
     }
+    if (req.path == "/users/me/profile") {
+        if (req.method == "GET") {
+            return profile_page(c, a, &ctx, req)
+        }
+        return update_profile(c, a, &ctx, req)
+    }
+    if (req.path == "/account/edit" and req.method == "GET") {
+        return account_page(c, a, &ctx, req, false)
+    }
+    if (req.path == "/account" and (req.method == "POST" or req.method == "PATCH" or req.method == "PUT")) {
+        return account_update(c, a, &ctx, req, false)
+    }
+    if (req.path == "/account/join_code" and req.method == "POST") {
+        return reset_join_code(c, a, &ctx, req)
+    }
+    if (req.path == "/account/custom_styles/edit" and req.method == "GET") {
+        return account_page(c, a, &ctx, req, true)
+    }
+    if (req.path == "/account/custom_styles" and (req.method == "POST" or req.method == "PATCH" or req.method == "PUT")) {
+        return account_update(c, a, &ctx, req, true)
+    }
+    if (req.path == "/account/bots" and req.method == "GET") { return bots_page(c, a, &ctx, req, 0, false) }
+    if (req.path == "/account/bots/new" and req.method == "GET") { return bots_page(c, a, &ctx, req, 0, true) }
+    if (req.path == "/account/bots" and req.method == "POST") { return save_bot(c, a, &ctx, req, 0) }
+    if (text.starts_with(req.path, "/account/bots/")) {
+        const rest = req.path[@len("/account/bots/")..]
+        if (text.ends_with(rest, "/edit")) {
+            if (text.parse_int(rest[0..@len(rest) - @len("/edit")])) |id| {
+                if (req.method == "GET") { return bots_page(c, a, &ctx, req, id, true) }
+            }
+        }
+        if (text.parse_int(rest)) |id| {
+            if (req.method == "POST" or req.method == "PATCH" or req.method == "PUT") {
+                return save_bot(c, a, &ctx, req, id)
+            }
+        }
+    }
+    if (req.path == "/rooms/opens/new" and req.method == "GET") {
+        return open_room_form(c, a, &ctx, req, 0)
+    }
+    if (req.path == "/rooms/directs/new" and req.method == "GET") { return direct_room_new(c, a, &ctx, req) }
+    if (req.path == "/rooms/directs" and req.method == "POST") { return create_direct_room(c, a, &ctx, req) }
+    if (req.method == "GET" and text.starts_with(req.path, "/attachments/")) { return download_attachment(c, a, &ctx, req) }
+    if (req.method == "GET" and req.path == "/flash") { return flash_notice(c, a, &ctx, req) }
+    if (text.starts_with(req.path, "/users/me/push_subscriptions")) { return push_subscriptions(c, a, &ctx, req) }
+    if (req.method == "POST" and req.path == "/unfurl_link") { return unfurl_link(c, a, &ctx, req) }
+    if (req.path == "/autocompletable/users" and req.method == "GET") { return autocompletable_users(c, a, &ctx, req) }
+    if (req.path == "/rooms/opens" and req.method == "POST") {
+        return create_open_room(c, a, &ctx, req)
+    }
+    if (text.starts_with(req.path, "/rooms/opens/")) {
+        const rest = req.path[@len("/rooms/opens/")..]
+        if (text.ends_with(rest, "/edit")) {
+            if (text.parse_int(rest[0..@len(rest) - @len("/edit")])) |id| {
+                if (req.method == "GET") { return open_room_form(c, a, &ctx, req, id) }
+            }
+        }
+        if (text.parse_int(rest)) |id| {
+            if (req.method == "POST" or req.method == "PATCH" or req.method == "PUT") {
+                return update_open_room(c, a, &ctx, req, id)
+            }
+        }
+    }
     if (text.starts_with(req.path, "/rooms/")) {
+        if (text.ends_with(req.path, "/involvement")) {
+            if (text.parse_int(req.path[@len("/rooms/")..@len(req.path) - @len("/involvement")])) |room| {
+                return involvement(c, a, &ctx, req, room)
+            }
+        }
         // /rooms/:room_id/messages/:id, and /edit
         var room = 0
         var id = 0
@@ -339,6 +460,13 @@ fn logo_stamp(a: Allocator, inout out: Buf(u8), db: sqlite.Db) !void {
     }
 }
 
+fn custom_css(a: Allocator, db: sqlite.Db) !Buf(u8) {
+    var st = try db.prepare("SELECT custom_styles FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (try st.next() and !st.is_null(0)) { return st.text(a, 0) }
+    return a.concat("", "")
+}
+
 // The cache's key for this response: the route, the user, and all the
 // request carries that a page can depend on (target, host, encoding and
 // cookies, the session's among them).
@@ -355,6 +483,8 @@ fn cache_key(a: Allocator, route: str, user: i64, req: http.Request) Buf(u8) {
     a.append_str(&k, req.host)
     a.append_str(&k, if (req.gzip) "\ngzip\n" else "\nidentity\n")
     a.append_str(&k, req.cookie)
+    a.append_str(&k, "\n")
+    a.append_str(&k, req.user_agent)
     return k
 }
 
@@ -365,7 +495,7 @@ fn cached(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: 
     if (i < 0) {
         return false
     }
-    try ctx.cache.send(c, a, i, own, req.keep)
+    try ctx.cache.send(c, a, i, own, req)
     return true
 }
 
@@ -378,13 +508,13 @@ fn page_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen
             defer a.free(z)
             const headers = a.concat(HTML, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
             defer a.free(headers)
-            try http.write_parts(c, a, "200 OK", own, headers, z, req.keep)
+            try http.conditional(c, a, req, own, headers, z)
             return ctx.cache.put(a, gen, key, headers, z, ctx.clock.now())
         }
     }
     const e = http.encode(a, req, HTML, body)
     defer e.deinit(a)
-    try http.write_parts(c, a, "200 OK", own, e.headers, e.body, req.keep)
+    try http.conditional(c, a, req, own, e.headers, e.body)
     try ctx.cache.put(a, gen, key, e.headers, e.body, ctx.clock.now())
 }
 
@@ -454,11 +584,22 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     var join_code: Buf(u8) = .empty
     defer a.free(join_code)
     const invite = try model.invitation(a, &join_code, ctx.db, room.id)
-    views.room_show(a, &body, user, room, messages, base, ctx.vapid, logo, admin, tf.epoch_ms(room.updated_ns), stream, invite, join_code, &ctx.frags, &cuts)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.room_show(a, &body, user, room, messages, base, platform.browser(req.user_agent), platform.operating_system(req.user_agent), ctx.vapid, logo, css, admin, tf.epoch_ms(room.updated_ns), stream, invite, join_code, &ctx.frags, &cuts)
     return page_out(c, a, &ctx, req, gen, key, own, body, cuts)
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    _ = ctx.lock_rx.recv()
+    const allowed = session.allow_login(ctx.db, ctx.clock, req.peer_ip) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    if (!allowed) {
+        return http.respond(c, a, req, "429 Too Many Requests", HTML, SIGN_IN)
+    }
     const email = codec.form_value(a, req.body, "email_address") orelse a.concat("", "")
     defer a.free(email)
     const password = codec.form_value(a, req.body, "password") orelse a.concat("", "")
@@ -467,7 +608,7 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
         return http.respond(c, a, req, "401 Unauthorized", HTML, SIGN_IN)
     }
     _ = ctx.lock_rx.recv()
-    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user) catch |e| {
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -479,6 +620,69 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
     return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+fn sign_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const endpoint = http.field(a, req, "push_subscription_endpoint") orelse a.concat("", "")
+    defer a.free(endpoint)
+    _ = ctx.lock_rx.recv()
+    session.terminate(a, ctx.db, ctx.key, ctx.clock, req.cookie, user, endpoint) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    return http.respond(c, a, req, "302 Found", "Location: /\r\nSet-Cookie: session_token=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; httponly; samesite=lax\r\n", "")
+}
+
+fn session_transfer(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    if (req.method == "GET") {
+        var body: Buf(u8) = .empty
+        defer a.free(body)
+        a.append_str(&body, "<!DOCTYPE html><html><head><title>Campfire</title></head><body><form id=\"transfer\" action=\"")
+        html.escape(a, &body, req.path)
+        a.append_str(&body, "\" method=\"post\" data-controller=\"auto-submit\"><input type=\"hidden\" name=\"_method\" value=\"put\"></form><script>document.getElementById('transfer').submit()</script></body></html>")
+        return http.respond(c, a, req, "200 OK", HTML, body)
+    }
+    if (req.method != "POST" and req.method != "PUT") {
+        return not_found(c, a, req)
+    }
+    const token = req.path[@len("/session/transfers/")..]
+    const user = signed_id.verify_transfer(a, ctx.sid_key, token, ctx.clock.now()) orelse {
+        return http.respond(c, a, req, "400 Bad Request", "", "")
+    }
+    var st = try ctx.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 0 LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    if (!try st.next()) {
+        return http.respond(c, a, req, "400 Bad Request", "", "")
+    }
+    _ = ctx.lock_rx.recv()
+    const session_token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    defer a.free(session_token)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: /\r\n")
+    session.set_cookie(a, &headers, ctx.key, ctx.clock, session_token)
+    a.append_str(&headers, HTML)
+    return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+fn qr_code(c: TcpConn, a: Allocator, req: http.Request) !void {
+    var url: Buf(u8) = .empty
+    defer a.free(url)
+    if (!codec.base64_decode(a, &url, req.path[@len("/qr_code/")..])) {
+        return http.respond(c, a, req, "422 Unprocessable Content", "", "")
+    }
+    const image = qrcode.svg(a, url) orelse {
+        return http.respond(c, a, req, "422 Unprocessable Content", "", "")
+    }
+    defer a.free(image)
+    return http.respond(c, a, req, "200 OK", "Content-Type: image/svg+xml; charset=utf-8\r\n", image)
 }
 
 // Whether rest (after /rooms/) is :room_id/messages/:id or that and /edit.
@@ -528,7 +732,9 @@ fn plain_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, u
     try logo_stamp(a, &logo, ctx.db)
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.app_top(a, &body, "Campfire", user, ctx.vapid, logo, "", try administrator(ctx.db, user_id), "", "")
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.app_top(a, &body, "Campfire", user, ctx.vapid, logo, css, "", try administrator(ctx.db, user_id), "", "")
     a.append_str(&body, content)
     views.app_bottom(a, &body, "", "")
     return http.respond(c, a, req, "200 OK", HTML, body)
@@ -726,7 +932,7 @@ fn first_run(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !v
         ctx.lock_tx.send(true)
         return e
     }
-    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user) catch |e| {
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -813,10 +1019,894 @@ fn sidebar_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     turbo.record_stream(a, &user_stream, ctx.stream_key, "User", user_id, "rooms")
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, admin, can_create, rooms_stream, user_stream)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.sidebar_show(a, &body, user, sb, ctx.vapid, logo, css, admin, can_create, rooms_stream, user_stream)
     const none: Buf(i64) = .empty
     defer a.free(none)
     return page_out(c, a, &ctx, req, gen, key, "", body, none)
+}
+
+fn profile_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    var st = try ctx.db.prepare("SELECT email_address, bio FROM users WHERE id = ?")
+    defer st.finalize()
+    try st.bind_int(1, user_id)
+    if (!try st.next()) {
+        return not_found(c, a, req)
+    }
+    const has_email = !st.is_null(0)
+    const email = if (has_email) st.text(a, 0) else a.concat("", "")
+    defer a.free(email)
+    const bio = if (!st.is_null(1)) st.text(a, 1) else a.concat("", "")
+    defer a.free(bio)
+    const shared = try model.profile_memberships(a, ctx.db, user_id, false)
+    defer a.free(shared)
+    const direct = try model.profile_memberships(a, ctx.db, user_id, true)
+    defer a.free(direct)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    const admin = try administrator(ctx.db, user_id)
+    var token: Buf(u8) = .empty
+    defer a.free(token)
+    signed_id.transfer(a, &token, ctx.sid_key, user_id, ctx.clock.now())
+    var transfer_url: Buf(u8) = .empty
+    defer a.free(transfer_url)
+    a.append_str(&transfer_url, "http://")
+    a.append_str(&transfer_url, req.host)
+    a.append_str(&transfer_url, "/session/transfers/")
+    a.append_str(&transfer_url, token)
+    var qr: Buf(u8) = .empty
+    defer a.free(qr)
+    codec.base64url_encode(a, &qr, transfer_url)
+    var nav: Buf(u8) = .empty
+    defer a.free(nav)
+    views.profile_nav(a, &nav, "/")
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.app_top(a, &body, user.name, user, ctx.vapid, logo, css, "", admin, "", nav)
+    views.profile(a, &body, user, has_email, email, bio, shared, direct, transfer_url, qr)
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn account_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, styles: bool) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const admin = try administrator(ctx.db, user_id)
+    if (styles and !admin) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse {
+        return to_sign_in(c, a, req)
+    }
+    defer user.deinit(a)
+    var st = try ctx.db.prepare("SELECT name, join_code, custom_styles FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (!try st.next()) { return not_found(c, a, req) }
+    const name = st.text(a, 0)
+    defer a.free(name)
+    const code = st.text(a, 1)
+    defer a.free(code)
+    const css = if (st.is_null(2)) a.concat("", "") else st.text(a, 2)
+    defer a.free(css)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var invite: Buf(u8) = .empty
+    defer a.free(invite)
+    a.append_str(&invite, "http://")
+    a.append_str(&invite, req.host)
+    a.append_str(&invite, "/join/")
+    a.append_str(&invite, code)
+    var nav: Buf(u8) = .empty
+    defer a.free(nav)
+    views.profile_nav(a, &nav, if (styles) "/account/edit" else "/")
+    if (!styles and admin) {
+        a.append_str(&nav, "<div class=\"flex align-center gap flex-item-justify-end\"><a class=\"btn\" href=\"/account/bots\">Set up chat bots</a><a class=\"btn\" href=\"/account/custom_styles/edit\">Custom styles</a></div>")
+    }
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    if (styles) {
+        views.app_top(a, &body, "Custom CSS", user, ctx.vapid, logo, css, "", admin, "", nav)
+    } else {
+        views.app_top(a, &body, name, user, ctx.vapid, logo, css, "", admin, "", nav)
+    }
+    if (styles) { views.custom_styles(a, &body, css) } else { views.account_edit(a, &body, name, invite, code, admin, logo) }
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn reset_join_code(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    if (!try administrator(ctx.db, user_id)) { return http.respond(c, a, req, "403 Forbidden", HTML, "") }
+    const code = model.join_code(a, ctx.rng)
+    defer a.free(code)
+    _ = ctx.lock_rx.recv()
+    var st = ctx.db.prepare("UPDATE accounts SET join_code = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')") catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    defer st.finalize()
+    try st.bind(1, code)
+    while (try st.next()) {}
+    ctx.lock_tx.send(true)
+    return redirect(c, a, req, "/account/edit")
+}
+
+fn join_account(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const code = req.path[@len("/join/")..]
+    var st = try ctx.db.prepare("SELECT name FROM accounts WHERE join_code = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind(1, code)
+    if (!try st.next()) { return not_found(c, a, req) }
+    const account = st.text(a, 0)
+    defer a.free(account)
+    if (try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie)) |signed_in| {
+        _ = signed_in
+        return to_root(c, a, req)
+    }
+    if (req.method == "GET") {
+        var body: Buf(u8) = .empty
+        defer a.free(body)
+        views.join_page(a, &body, code, account)
+        return http.respond(c, a, req, "200 OK", HTML, body)
+    }
+    if (req.method != "POST") { return not_found(c, a, req) }
+    const name = http.field(a, req, "user[name]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(name)
+    const email = http.field(a, req, "user[email_address]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(email)
+    const password = http.field(a, req, "user[password]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(password)
+    if (@len(name) == 0 or @len(email) == 0 or @len(password) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    const digest = crypto.bcrypt_hash(a, ctx.rng, password) orelse { return error.Bcrypt }
+    defer a.free(digest)
+    _ = ctx.lock_rx.recv()
+    const user_id = write_join(a, ctx.db, ctx.clock, name, email, digest) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user_id, req.peer_ip, req.user_agent) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    defer a.free(token)
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: /\r\n")
+    session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
+    a.append_str(&headers, HTML)
+    return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+fn write_join(a: Allocator, db: sqlite.Db, clock: Clock, name: []u8, email: []u8, digest: []u8) !i64 {
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try db.exec("BEGIN IMMEDIATE")
+    const id = insert_join(db, now, name, email, digest) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+    return id
+}
+
+fn insert_join(db: sqlite.Db, now: []u8, name: []u8, email: []u8, digest: []u8) !i64 {
+    var st = try db.prepare("INSERT INTO users (bio, bot_token, created_at, email_address, name, password_digest, role, status, updated_at) VALUES (NULL, NULL, ?, ?, ?, ?, 0, 0, ?) RETURNING id")
+    defer st.finalize()
+    try st.bind(1, now)
+    try st.bind(2, email)
+    try st.bind(3, name)
+    try st.bind(4, digest)
+    try st.bind(5, now)
+    if (!try st.next()) { return error.Sql }
+    const id = st.int(0)
+    while (try st.next()) {}
+    var grants = try db.prepare("INSERT INTO memberships (created_at, involvement, room_id, updated_at, user_id) SELECT ?, 'mentions', id, ?, ? FROM rooms WHERE type = 'Rooms::Open'")
+    defer grants.finalize()
+    try grants.bind(1, now)
+    try grants.bind(2, now)
+    try grants.bind_int(3, id)
+    while (try grants.next()) {}
+    return id
+}
+
+fn account_update(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, styles: bool) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    if (!try administrator(ctx.db, user_id)) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    if (!styles) {
+        if (http.file(a, req, "account[logo]")) |upload| {
+            defer upload.deinit(a)
+            const account = try account_id(ctx.db)
+            return upload_picture(c, a, &ctx, req, upload, "Account", account, "logo", "/account/edit")
+        }
+    }
+    const entry = (if (styles) http.field(a, req, "account[custom_styles]") else http.field(a, req, "account[name]")) orelse {
+        return http.respond(c, a, req, "422 Unprocessable Content", HTML, "")
+    }
+    defer a.free(entry)
+    if (!styles and @len(entry) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    _ = ctx.lock_rx.recv()
+    var st = ctx.db.prepare(if (styles) "UPDATE accounts SET custom_styles = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')" else "UPDATE accounts SET name = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')") catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    defer st.finalize()
+    try st.bind(1, entry)
+    while (try st.next()) {}
+    ctx.lock_tx.send(true)
+    return redirect_notice(c, a, &ctx, req, if (styles) "/account/custom_styles/edit" else "/account/edit", "Account updated")
+}
+
+fn bots_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64, form: bool) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    if (!try administrator(ctx.db, user_id)) { return http.respond(c, a, req, "403 Forbidden", HTML, "") }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse { return to_sign_in(c, a, req) }
+    defer user.deinit(a)
+    var bot_name: Buf(u8) = .empty
+    defer a.free(bot_name)
+    var webhook: Buf(u8) = .empty
+    defer a.free(webhook)
+    if (id > 0) {
+        var st = try ctx.db.prepare("SELECT users.name, webhooks.url FROM users LEFT JOIN webhooks ON webhooks.user_id = users.id WHERE users.id = ? AND users.role = 2 AND users.status = 0 LIMIT 1")
+        defer st.finalize()
+        try st.bind_int(1, id)
+        if (!try st.next()) { return not_found(c, a, req) }
+        const found_name = st.text(a, 0)
+        defer a.free(found_name)
+        a.append_str(&bot_name, found_name)
+        if (!st.is_null(1)) {
+            const found_webhook = st.text(a, 1)
+            defer a.free(found_webhook)
+            a.append_str(&webhook, found_webhook)
+        }
+    }
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var nav: Buf(u8) = .empty
+    defer a.free(nav)
+    views.profile_nav(a, &nav, if (form) "/account/bots" else "/account/edit")
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.app_top(a, &body, "Chat bots", user, ctx.vapid, logo, css, "", true, "", nav)
+    if (form) {
+        views.bot_form(a, &body, id, bot_name, webhook)
+    } else {
+        const bots = try model.bots(a, ctx.db)
+        defer a.free(bots)
+        const base = a.concat("http://", req.host)
+        defer a.free(base)
+        views.bots_index(a, &body, bots, base)
+    }
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn save_bot(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    if (!try administrator(ctx.db, user_id)) { return http.respond(c, a, req, "403 Forbidden", HTML, "") }
+    if (id != 0) {
+        var bot = try ctx.db.prepare("SELECT 1 FROM users WHERE id = ? AND role = 2 AND status = 0")
+        defer bot.finalize()
+        try bot.bind_int(1, id)
+        if (!try bot.next()) { return not_found(c, a, req) }
+    }
+    const name = http.field(a, req, "user[name]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(name)
+    if (@len(name) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    const webhook = http.field(a, req, "user[webhook_url]") orelse a.concat("", "")
+    defer a.free(webhook)
+    _ = ctx.lock_rx.recv()
+    if (id == 0) {
+        const token = session.base58(a, ctx.rng, 12)
+        defer a.free(token)
+        write_bot(a, ctx.db, ctx.clock, name, webhook, token) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+    } else {
+        update_bot(ctx.db, id, name, webhook) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+    }
+    ctx.lock_tx.send(true)
+    return redirect(c, a, req, "/account/bots")
+}
+
+fn write_bot(a: Allocator, db: sqlite.Db, clock: Clock, name: []u8, webhook: []u8, token: []u8) !void {
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try db.exec("BEGIN IMMEDIATE")
+    insert_bot(db, name, webhook, token, now) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+}
+
+fn insert_bot(db: sqlite.Db, name: []u8, webhook: []u8, token: []u8, now: []u8) !void {
+    var st = try db.prepare("INSERT INTO users (bio, bot_token, created_at, email_address, name, password_digest, role, status, updated_at) VALUES (NULL, ?, ?, NULL, ?, NULL, 2, 0, ?) RETURNING id")
+    defer st.finalize()
+    try st.bind(1, token)
+    try st.bind(2, now)
+    try st.bind(3, name)
+    try st.bind(4, now)
+    if (!try st.next()) { return error.Sql }
+    const id = st.int(0)
+    while (try st.next()) {}
+    var grants = try db.prepare("INSERT INTO memberships (created_at, involvement, room_id, updated_at, user_id) SELECT ?, 'mentions', id, ?, ? FROM rooms WHERE type = 'Rooms::Open'")
+    defer grants.finalize()
+    try grants.bind(1, now)
+    try grants.bind(2, now)
+    try grants.bind_int(3, id)
+    while (try grants.next()) {}
+    if (@len(webhook) > 0) {
+        var wh = try db.prepare("INSERT INTO webhooks (created_at, updated_at, url, user_id) VALUES (?, ?, ?, ?)")
+        defer wh.finalize()
+        try wh.bind(1, now)
+        try wh.bind(2, now)
+        try wh.bind(3, webhook)
+        try wh.bind_int(4, id)
+        while (try wh.next()) {}
+    }
+}
+
+fn update_bot(db: sqlite.Db, id: i64, name: []u8, webhook: []u8) !void {
+    try db.exec("BEGIN IMMEDIATE")
+    update_bot_rows(db, id, name, webhook) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+}
+
+fn update_bot_rows(db: sqlite.Db, id: i64, name: []u8, webhook: []u8) !void {
+    var st = try db.prepare("UPDATE users SET name = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ? AND role = 2 AND status = 0")
+    defer st.finalize()
+    try st.bind(1, name)
+    try st.bind_int(2, id)
+    while (try st.next()) {}
+    if (@len(webhook) == 0) {
+        var remove = try db.prepare("DELETE FROM webhooks WHERE user_id = ?")
+        defer remove.finalize()
+        try remove.bind_int(1, id)
+        while (try remove.next()) {}
+        return
+    }
+    var add = try db.prepare("INSERT INTO webhooks (created_at, updated_at, url, user_id) SELECT STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'), ?, ? WHERE NOT EXISTS (SELECT 1 FROM webhooks WHERE user_id = ?)")
+    defer add.finalize()
+    try add.bind(1, webhook)
+    try add.bind_int(2, id)
+    try add.bind_int(3, id)
+    while (try add.next()) {}
+    var wh = try db.prepare("UPDATE webhooks SET url = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE user_id = ?")
+    defer wh.finalize()
+    try wh.bind(1, webhook)
+    try wh.bind_int(2, id)
+    while (try wh.next()) {}
+}
+
+fn bot_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room: i64, key: []u8) !void {
+    const dash = text.find(key, "-") orelse { return http.respond(c, a, req, "401 Unauthorized", "", "") }
+    const bot = text.parse_int(key[0..dash]) orelse { return http.respond(c, a, req, "401 Unauthorized", "", "") }
+    var st = try ctx.db.prepare("SELECT 1 FROM users JOIN memberships ON memberships.user_id = users.id WHERE users.id = ? AND users.bot_token = ? AND users.role = 2 AND users.status = 0 AND memberships.room_id = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, bot)
+    try st.bind(2, key[dash + 1..])
+    try st.bind_int(3, room)
+    if (!try st.next()) { return http.respond(c, a, req, "401 Unauthorized", "", "") }
+    const trimmed = text.trim(a, req.body)
+    defer a.free(trimmed)
+    if (@len(trimmed) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", "", "") }
+    _ = ctx.lock_rx.recv()
+    const id = model.create_message_notify(a, ctx.db, ctx.clock, ctx.rng, room, bot, true, req.body, "", ctx.mention_key) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    const room_view = try model.room_for(a, ctx.db, bot, room) orelse { return not_found(c, a, req) }
+    defer room_view.deinit(a)
+    const messages = try model.find_message(a, ctx.db, ctx.sid_key, id, room_view.name)
+    defer a.free(messages)
+    var markup: Buf(u8) = .empty
+    defer a.free(markup)
+    views.create_stream(a, &markup, room_view, messages)
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    turbo.gid(a, &stream, room_class(room_view.kind), room)
+    a.append_str(&stream, ":messages")
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    json.encode_string(a, &frame, markup)
+    cable.broadcast(a, ctx.hub, stream, frame)
+    var unread: Buf(u8) = .empty
+    defer a.free(unread)
+    a.append_str(&unread, "{\"roomId\":")
+    a.append_int(&unread, room)
+    a.append_str(&unread, "}")
+    var members = try ctx.db.prepare("SELECT user_id FROM memberships WHERE room_id = ?")
+    defer members.finalize()
+    try members.bind_int(1, room)
+    while (try members.next()) {
+        var to: Buf(u8) = .empty
+        defer a.free(to)
+        a.append_str(&to, "user_")
+        a.append_int(&to, members.int(0))
+        a.append_str(&to, "_unreads")
+        cable.broadcast(a, ctx.hub, to, unread)
+    }
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: /messages/")
+    a.append_int(&headers, id)
+    a.append_str(&headers, "\r\n")
+    return http.respond(c, a, req, "201 Created", headers, "")
+}
+
+fn can_edit_room(db: sqlite.Db, user: i64, room: i64) !bool {
+    if (try administrator(db, user)) { return true }
+    var st = try db.prepare("SELECT 1 FROM rooms WHERE id = ? AND creator_id = ? LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, room)
+    try st.bind_int(2, user)
+    return st.next()
+}
+
+fn open_room_form(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    if (id == 0 and !try administrator(ctx.db, user_id) and try model.rooms_restricted(a, ctx.db)) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    var name: Buf(u8) = .empty
+    defer a.free(name)
+    if (id > 0) {
+        const room = try model.room_for(a, ctx.db, user_id, id) orelse { return to_root(c, a, req) }
+        defer room.deinit(a)
+        if (room.kind != "open") { return not_found(c, a, req) }
+        a.append_str(&name, room.name)
+    } else {
+        a.append_str(&name, "New room")
+    }
+    const user = try model.find_user(a, ctx.db, ctx.sid_key, user_id) orelse { return to_sign_in(c, a, req) }
+    defer user.deinit(a)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    var nav: Buf(u8) = .empty
+    defer a.free(nav)
+    views.profile_nav(a, &nav, if (id == 0) "/" else "/")
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.app_top(a, &body, if (id == 0) "New room" else "Room settings", user, ctx.vapid, logo, css, "", try administrator(ctx.db, user_id), "", nav)
+    views.room_form(a, &body, id, name)
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn create_open_room(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    if (!try administrator(ctx.db, user_id) and try model.rooms_restricted(a, ctx.db)) {
+        return http.respond(c, a, req, "403 Forbidden", HTML, "")
+    }
+    const name = http.field(a, req, "room[name]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(name)
+    if (@len(name) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    _ = ctx.lock_rx.recv()
+    const id = write_open_room(a, ctx.db, ctx.clock, user_id, name) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    broadcast_open_room(a, &ctx, id, name, false)
+    var path: Buf(u8) = .empty
+    defer a.free(path)
+    a.append_str(&path, "/rooms/")
+    a.append_int(&path, id)
+    return redirect(c, a, req, path)
+}
+
+fn write_open_room(a: Allocator, db: sqlite.Db, clock: Clock, user: i64, name: []u8) !i64 {
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try db.exec("BEGIN IMMEDIATE")
+    const id = insert_open_room(db, user, name, now) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+    return id
+}
+
+fn insert_open_room(db: sqlite.Db, user: i64, name: []u8, now: []u8) !i64 {
+    var st = try db.prepare("INSERT INTO rooms (created_at, creator_id, name, type, updated_at) VALUES (?, ?, ?, 'Rooms::Open', ?) RETURNING id")
+    defer st.finalize()
+    try st.bind(1, now)
+    try st.bind_int(2, user)
+    try st.bind(3, name)
+    try st.bind(4, now)
+    if (!try st.next()) { return error.Sql }
+    const id = st.int(0)
+    while (try st.next()) {}
+    var grants = try db.prepare("INSERT INTO memberships (created_at, involvement, room_id, updated_at, user_id) SELECT ?, 'mentions', ?, ?, id FROM users WHERE status = 0")
+    defer grants.finalize()
+    try grants.bind(1, now)
+    try grants.bind_int(2, id)
+    try grants.bind(3, now)
+    while (try grants.next()) {}
+    return id
+}
+
+fn update_open_room(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const room = try model.room_for(a, ctx.db, user_id, id) orelse { return to_root(c, a, req) }
+    defer room.deinit(a)
+    if (room.kind != "open" or !try can_edit_room(ctx.db, user_id, id)) { return http.respond(c, a, req, "403 Forbidden", HTML, "") }
+    const name = http.field(a, req, "room[name]") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    defer a.free(name)
+    if (@len(name) == 0) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    _ = ctx.lock_rx.recv()
+    var st = ctx.db.prepare("UPDATE rooms SET name = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ? AND type = 'Rooms::Open'") catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    defer st.finalize()
+    try st.bind(1, name)
+    try st.bind_int(2, id)
+    while (try st.next()) {}
+    ctx.lock_tx.send(true)
+    broadcast_open_room(a, &ctx, id, name, true)
+    var path: Buf(u8) = .empty
+    defer a.free(path)
+    a.append_str(&path, "/rooms/")
+    a.append_int(&path, id)
+    return redirect(c, a, req, path)
+}
+
+fn broadcast_open_room(a: Allocator, inout ctx: Context, id: i64, name: []u8, replace: bool) void {
+    const view = model.open_sidebar_room(a, id, name)
+    defer view.deinit(a)
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    a.append_str(&frame, "<turbo-stream action=\"")
+    a.append_str(&frame, if (replace) "replace\" target=\"list_rooms_open_" else "prepend\" target=\"shared_rooms")
+    if (replace) { a.append_int(&frame, id) }
+    a.append_str(&frame, "\"><template>")
+    views.sidebar_room(a, &frame, view)
+    a.append_str(&frame, "</template></turbo-stream>")
+    var message: Buf(u8) = .empty
+    defer a.free(message)
+    json.encode_string(a, &message, frame)
+    cable.broadcast(a, ctx.hub, "rooms", message)
+}
+
+fn direct_room_new(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    _ = user_id
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.direct_new(a, &body)
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn autocompletable_users(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    _ = user_id
+    const query = codec.form_value(a, req.query, "query") orelse a.concat("", "")
+    defer a.free(query)
+    const pattern = a.concat("%", query, "%")
+    defer a.free(pattern)
+    var st = try ctx.db.prepare("SELECT id FROM users WHERE status = 0 AND name LIKE ? ORDER BY LOWER(name) LIMIT 20")
+    defer st.finalize()
+    try st.bind(1, pattern)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    a.push(&body, '[')
+    var first = true
+    while (try st.next()) {
+        const user = try model.find_user(a, ctx.db, ctx.sid_key, st.int(0)) orelse { continue }
+        defer user.deinit(a)
+        if (!first) { a.push(&body, ',') }
+        first = false
+        a.append_str(&body, "{\"name\":")
+        var safe: Buf(u8) = .empty
+        defer a.free(safe)
+        html.escape(a, &safe, user.name)
+        json.encode_string(a, &body, safe)
+        a.append_str(&body, ",\"value\":")
+        a.append_int(&body, user.id)
+        a.append_str(&body, ",\"avatar_url\":")
+        const base = a.concat("http://", req.host, user.avatar)
+        defer a.free(base)
+        json.encode_string(a, &body, base)
+        a.append_str(&body, ",\"sgid\":")
+        var sgid: Buf(u8) = .empty
+        defer a.free(sgid)
+        bot_hooks.mention_id(a, &sgid, ctx.mention_key, user.id)
+        _ = ctx.lock_rx.recv()
+        uploads.register_user(ctx.db, sgid, user.id) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+        ctx.lock_tx.send(true)
+        json.encode_plain(a, &body, sgid)
+        a.push(&body, '}')
+    }
+    a.push(&body, ']')
+    return http.respond(c, a, req, "200 OK", "Content-Type: application/json; charset=utf-8\r\n", body)
+}
+
+fn create_direct_room(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const selected = http.fields(a, req, "user_ids[]")
+    defer a.free(selected)
+    var users: Buf(i64) = .empty
+    defer a.free(users)
+    a.push(&users, user_id)
+    var valid = try ctx.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 0 LIMIT 1")
+    defer valid.finalize()
+    var selected_index = 0
+    while (selected_index < @len(selected)) {
+        const candidate = text.parse_int(selected[selected_index]) orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        var duplicate = false
+        for (users) |member| { if (member == candidate) { duplicate = true } }
+        selected_index = selected_index + 1
+        if (duplicate) { continue }
+        valid.reset()
+        try valid.bind_int(1, candidate)
+        if (!try valid.next()) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        a.push(&users, candidate)
+    }
+    if (@len(users) < 2) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+    _ = ctx.lock_rx.recv()
+    const id = write_direct_room(a, ctx.db, ctx.clock, user_id, users) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    var member_index = 0
+    while (member_index < @len(users)) {
+        try broadcast_direct_room(a, &ctx, id, users[member_index])
+        member_index = member_index + 1
+    }
+    var path: Buf(u8) = .empty
+    defer a.free(path)
+    a.append_str(&path, "/rooms/")
+    a.append_int(&path, id)
+    return redirect(c, a, req, path)
+}
+
+fn broadcast_direct_room(a: Allocator, inout ctx: Context, room: i64, user: i64) !void {
+    const sb = try model.sidebar(a, ctx.db, ctx.sid_key, user)
+    defer sb.deinit(a)
+    for (sb.directs) |d| {
+        if (d.room_id == room) {
+            var markup: Buf(u8) = .empty
+            defer a.free(markup)
+            a.append_str(&markup, "<turbo-stream action=\"prepend\" target=\"direct_rooms\"><template>")
+            views.sidebar_direct(a, &markup, d)
+            a.append_str(&markup, "</template></turbo-stream>")
+            var stream: Buf(u8) = .empty
+            defer a.free(stream)
+            turbo.gid(a, &stream, "User", user)
+            a.append_str(&stream, ":rooms")
+            var frame: Buf(u8) = .empty
+            defer a.free(frame)
+            json.encode_string(a, &frame, markup)
+            cable.broadcast(a, ctx.hub, stream, frame)
+            break
+        }
+    }
+}
+
+fn write_direct_room(a: Allocator, db: sqlite.Db, clock: Clock, user: i64, users: Buf(i64)) !i64 {
+    var sql: Buf(u8) = .empty
+    defer a.free(sql)
+    a.append_str(&sql, "SELECT rooms.id FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE rooms.type = 'Rooms::Direct' GROUP BY rooms.id HAVING COUNT(*) = ")
+    a.append_int(&sql, @len(users))
+    a.append_str(&sql, " AND SUM(memberships.user_id IN (")
+    var first = true
+    for (users) |member| {
+        if (!first) { a.push(&sql, ',') }
+        first = false
+        a.append_int(&sql, member)
+    }
+    a.append_str(&sql, ")) = ")
+    a.append_int(&sql, @len(users))
+    a.append_str(&sql, " ORDER BY rooms.id LIMIT 1")
+    var exists = try db.prepare_text(sql)
+    defer exists.finalize()
+    if (try exists.next()) { return exists.int(0) }
+    var now: Buf(u8) = .empty
+    defer a.free(now)
+    tf.db_time(a, &now, clock.now())
+    try db.exec("BEGIN IMMEDIATE")
+    const id = insert_direct_room(db, now, user, users) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+    return id
+}
+
+fn insert_direct_room(db: sqlite.Db, now: []u8, user: i64, users: Buf(i64)) !i64 {
+    var st = try db.prepare("INSERT INTO rooms (created_at, creator_id, name, type, updated_at) VALUES (?, ?, NULL, 'Rooms::Direct', ?) RETURNING id")
+    defer st.finalize()
+    try st.bind(1, now)
+    try st.bind_int(2, user)
+    try st.bind(3, now)
+    if (!try st.next()) { return error.Sql }
+    const id = st.int(0)
+    while (try st.next()) {}
+    var grants = try db.prepare("INSERT INTO memberships (created_at, involvement, room_id, updated_at, user_id) VALUES (?, 'everything', ?, ?, ?)")
+    defer grants.finalize()
+    for (users) |member| {
+        grants.reset()
+        try grants.bind(1, now)
+        try grants.bind_int(2, id)
+        try grants.bind(3, now)
+        try grants.bind_int(4, member)
+        while (try grants.next()) {}
+    }
+    return id
+}
+
+fn update_profile(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    if (req.method != "POST" and req.method != "PATCH" and req.method != "PUT") {
+        return not_found(c, a, req)
+    }
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    if (http.file(a, req, "user[avatar]")) |upload| {
+        defer upload.deinit(a)
+        return upload_picture(c, a, &ctx, req, upload, "User", user_id, "avatar", "/users/me/profile")
+    }
+    const name = http.field(a, req, "user[name]") orelse {
+        return http.respond(c, a, req, "422 Unprocessable Content", HTML, "")
+    }
+    defer a.free(name)
+    const email = http.field(a, req, "user[email_address]") orelse a.concat("", "")
+    defer a.free(email)
+    const bio = http.field(a, req, "user[bio]") orelse a.concat("", "")
+    defer a.free(bio)
+    const password = http.field(a, req, "user[password]") orelse a.concat("", "")
+    defer a.free(password)
+    if (@len(name) == 0 or @len(bio) > 200 or @len(password) > 72) {
+        return http.respond(c, a, req, "422 Unprocessable Content", HTML, "")
+    }
+    const digest = if (@len(password) > 0) crypto.bcrypt_hash(a, ctx.rng, password) orelse a.concat("", "") else a.concat("", "")
+    defer a.free(digest)
+    _ = ctx.lock_rx.recv()
+    var st = ctx.db.prepare(if (@len(password) > 0) "UPDATE users SET name = ?, email_address = ?, bio = ?, password_digest = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?" else "UPDATE users SET name = ?, email_address = ?, bio = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?") catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    defer st.finalize()
+    try st.bind(1, name)
+    try st.bind(2, email)
+    try st.bind(3, bio)
+    if (@len(password) > 0) {
+        try st.bind(4, digest)
+        try st.bind_int(5, user_id)
+    } else {
+        try st.bind_int(4, user_id)
+    }
+    while (try st.next()) {}
+    ctx.lock_tx.send(true)
+    return redirect_notice(c, a, &ctx, req, "/users/me/profile", "Profile updated")
+}
+
+fn involvement(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room_id: i64) !void {
+    const user_id = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse {
+        return to_sign_in(c, a, req)
+    }
+    const room = try model.room_for(a, ctx.db, user_id, room_id) orelse {
+        return to_root(c, a, req)
+    }
+    defer room.deinit(a)
+    if (req.method == "POST" or req.method == "PUT") {
+        const next = codec.form_value(a, req.query, "involvement") orelse {
+            return http.respond(c, a, req, "422 Unprocessable Content", HTML, "")
+        }
+        defer a.free(next)
+        if (next != "mentions" and next != "everything" and next != "nothing" and next != "invisible") {
+            return http.respond(c, a, req, "422 Unprocessable Content", HTML, "")
+        }
+        var old_st = try ctx.db.prepare("SELECT involvement FROM memberships WHERE room_id = ? AND user_id = ?")
+        defer old_st.finalize()
+        try old_st.bind_int(1, room_id)
+        try old_st.bind_int(2, user_id)
+        if (!try old_st.next()) { return not_found(c, a, req) }
+        const old = old_st.text(a, 0)
+        defer a.free(old)
+        _ = ctx.lock_rx.recv()
+        var change = ctx.db.prepare("UPDATE memberships SET involvement = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE room_id = ? AND user_id = ?") catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+        defer change.finalize()
+        try change.bind(1, next)
+        try change.bind_int(2, room_id)
+        try change.bind_int(3, user_id)
+        while (try change.next()) {}
+        ctx.lock_tx.send(true)
+        if (room.kind != "direct" and (old == "invisible" or next == "invisible") and old != next) {
+            broadcast_involvement(a, &ctx, user_id, room, next == "invisible")
+        }
+        var path: Buf(u8) = .empty
+        defer a.free(path)
+        a.append_str(&path, "/rooms/")
+        a.append_int(&path, room_id)
+        a.append_str(&path, "/involvement")
+        return redirect(c, a, req, path)
+    }
+    if (req.method != "GET") {
+        return not_found(c, a, req)
+    }
+    var st = try ctx.db.prepare("SELECT involvement FROM memberships WHERE room_id = ? AND user_id = ?")
+    defer st.finalize()
+    try st.bind_int(1, room_id)
+    try st.bind_int(2, user_id)
+    if (!try st.next()) {
+        return not_found(c, a, req)
+    }
+    const setting = st.text(a, 0)
+    defer a.free(setting)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.involvement_frame(a, &body, room_id, room.kind, setting)
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+
+fn broadcast_involvement(a: Allocator, inout ctx: Context, user: i64, room: model.RoomView, hidden: bool) void {
+    var markup: Buf(u8) = .empty
+    defer a.free(markup)
+    a.append_str(&markup, if (hidden) "<turbo-stream action=\"remove\" target=\"list_rooms_" else "<turbo-stream action=\"prepend\" target=\"shared_rooms\"><template>")
+    if (hidden) {
+        a.append_str(&markup, if (room.kind == "closed") "closed_" else "open_")
+        a.append_int(&markup, room.id)
+        a.append_str(&markup, "\"></turbo-stream>")
+    } else {
+        const view = model.sidebar_room_view(a, room.id, room.name, room.kind)
+        defer view.deinit(a)
+        views.sidebar_room(a, &markup, view)
+        a.append_str(&markup, "</template></turbo-stream>")
+    }
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    turbo.gid(a, &stream, "User", user)
+    a.append_str(&stream, ":rooms")
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    json.encode_string(a, &frame, markup)
+    cable.broadcast(a, ctx.hub, stream, frame)
 }
 
 // Whether the code point is in [[:word:]] (letter, mark, decimal digit or
@@ -929,7 +2019,9 @@ fn search_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) 
     var cuts: Buf(i64) = .empty
     defer a.free(cuts)
     ctx.frags.begin(a, gen)
-    views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, admin, &ctx.frags, &cuts)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.search_index(a, &body, user, messages, recent, has_query, query, has_q, q, back, base, ctx.vapid, logo, css, admin, &ctx.frags, &cuts)
     return page_out(c, a, &ctx, req, gen, key, "", body, cuts)
 }
 
@@ -967,7 +2059,7 @@ fn asset(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void 
     defer a.free(key)
     const i = ctx.files_sent.find(key)
     if (i >= 0) {
-        return ctx.files_sent.send(c, a, i, req.keep)
+        return ctx.files_sent.send(c, a, i, req)
     }
     const body = ctx.fs.read(a, path) catch {
         return not_found(c, a, req)
@@ -985,7 +2077,7 @@ fn send_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, ke
     const e = http.encode(a, req, headers, body)
     defer e.deinit(a)
     ctx.files_sent.put(a, key, e.headers, e.body)
-    return http.write_parts(c, a, "200 OK", "", e.headers, e.body, req.keep)
+    return http.conditional(c, a, req, "", e.headers, e.body)
 }
 
 // ActiveStorage's digest of the :square variant (resize_to_limit
@@ -1005,8 +2097,7 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     try st.bind(1, SQUARE)
     try st.bind_int(2, user)
     if (!try st.next()) {
-        // No processed variant: the stock bot avatar, or initials.
-        return drawn_avatar(c, a, &ctx, req, user)
+        return uploaded_avatar(c, a, &ctx, req, user)
     }
     const key = st.text(a, 0)
     defer a.free(key)
@@ -1021,7 +2112,7 @@ fn avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, token
     defer a.free(sent)
     const i = ctx.files_sent.find(sent)
     if (i >= 0) {
-        return ctx.files_sent.send(c, a, i, req.keep)
+        return ctx.files_sent.send(c, a, i, req)
     }
     const body = ctx.fs.read(a, path) catch {
         return not_found(c, a, req)
@@ -1093,7 +2184,7 @@ fn stock_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, n
     defer a.free(key)
     const i = ctx.files_sent.find(key)
     if (i >= 0) {
-        return ctx.files_sent.send(c, a, i, req.keep)
+        return ctx.files_sent.send(c, a, i, req)
     }
     const body = ctx.fs.read(a, path) catch {
         return not_found(c, a, req)
@@ -1105,6 +2196,19 @@ fn stock_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, n
 // GET /account/logo: the stock app icon, public so it can be the PWA's
 // icon (an uploaded logo is not served yet).
 fn account_logo(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    var logo = try ctx.db.prepare("SELECT b.key, b.content_type, p.key FROM active_storage_blobs b LEFT JOIN egg_blob_previews p ON p.blob_id=b.id JOIN active_storage_attachments a ON a.blob_id=b.id AND a.record_type='Account' AND a.name='logo' JOIN accounts ac ON ac.id=a.record_id ORDER BY ac.id LIMIT 1")
+    defer logo.finalize()
+    if (try logo.next()) {
+        const key = logo.text(a, 0)
+        defer a.free(key)
+        const mime = logo.text(a, 1)
+        defer a.free(mime)
+        const small = logo.text(a, 2)
+        defer a.free(small)
+        const selected = if (text.contains(req.query, "size=small") and @len(small) > 0) a.concat(small, "") else a.concat(key, "")
+        defer a.free(selected)
+        return picture_file(c, a, &ctx, req, selected, mime)
+    }
     var small = false
     if (codec.form_value(a, req.query, "size")) |v| {
         small = v == "small"
@@ -1193,6 +2297,10 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
         return not_found(c, a, req)
     }
     defer room.deinit(a)
+    if (http.file(a, req, "message[attachment]")) |upload| {
+        defer upload.deinit(a)
+        return upload_message(c, a, &ctx, req, room, user_id, upload)
+    }
     var has_body = false
     var body: Buf(u8) = .empty
     defer a.free(body)
@@ -1206,11 +2314,15 @@ fn create_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
         a.free(@replace(&client_id, v))
     }
     _ = ctx.lock_rx.recv()
-    const message_id = model.create_message(a, ctx.db, ctx.clock, ctx.rng, room.id, user_id, has_body, body, client_id) catch |e| {
+    const message_id = model.create_message_notify(a, ctx.db, ctx.clock, ctx.rng, room.id, user_id, has_body, body, client_id, ctx.mention_key) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
     ctx.lock_tx.send(true)
+    return send_created_message(c, a, &ctx, req, room, message_id)
+}
+
+fn send_created_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room: model.RoomView, message_id: i64) !void {
     const others = try model.display_name(a, ctx.db, room.id, room.kind == "direct", room.name, 0)
     defer a.free(others)
     const messages = try model.find_message(a, ctx.db, ctx.sid_key, message_id, others)
@@ -1333,4 +2445,530 @@ fn room_class(kind: []u8) str {
         return "Rooms::Direct"
     }
     return "Rooms::Open"
+}
+
+// A single delivery thread reads the durable outbox. HTTP workers never wait
+// for remote services; database writes still use their shared write token.
+fn deliver_webhook(a: Allocator, inout ctx: Context) !bool {
+    const next = try bot_hooks.next_job(a, ctx.db) orelse { return false }
+    defer next.deinit(a)
+    const job = next.id
+    const room = next.room
+    const bot = next.bot
+    if (!try bot_hooks.active_bot(ctx.db, bot, room, next.message)) {
+        try finish_webhook_locked(&ctx, job)
+        return true
+    }
+    const reply = try webhook_http.post(a, next.url, next.payload)
+    defer reply.deinit(a)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    if (reply.code == 28) {
+        a.append_str(&body, "Failed to respond within ")
+        a.append_int(&body, reply.timeout)
+        a.append_str(&body, " seconds")
+    } else if (reply.code != 0) {
+        try finish_webhook_locked(&ctx, job)
+        return error.WebhookTransport
+    } else if (reply.status == 200 and (reply.content_type == "text/plain" or reply.content_type == "text/html")) {
+        a.append_str(&body, reply.body)
+    } else if (@len(reply.content_type) > 0) {
+        // Binary replies are stored as message attachments below.
+        return deliver_webhook_attachment(a, &ctx, job, room, bot, reply)
+    }
+    if (@len(body) > 0) {
+        _ = ctx.lock_rx.recv()
+        const id = write_webhook_text(a, &ctx, job, room, bot, body) catch |e| {
+            ctx.lock_tx.send(true)
+            return e
+        }
+        ctx.lock_tx.send(true)
+        try broadcast_bot_reply(a, &ctx, room, bot, id)
+    } else {
+        try finish_webhook_locked(&ctx, job)
+    }
+    return true
+}
+fn finish_webhook_locked(inout ctx: Context, job: i64) !void {
+    _ = ctx.lock_rx.recv()
+    finish_webhook(ctx.db, job) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+}
+fn finish_webhook(db: sqlite.Db, job: i64) !void {
+    var st = try db.prepare("DELETE FROM egg_webhook_jobs WHERE id=?")
+    defer st.finalize()
+    try st.bind_int(1, job)
+    while (try st.next()) {}
+}
+fn broadcast_bot_reply(a: Allocator, inout ctx: Context, room: i64, bot: i64, id: i64) !void {
+    const view = try model.room_for(a, ctx.db, bot, room) orelse { return }
+    defer view.deinit(a)
+    const messages = try model.find_message(a, ctx.db, ctx.sid_key, id, view.name)
+    defer a.free(messages)
+    var markup: Buf(u8) = .empty
+    defer a.free(markup)
+    views.create_stream(a, &markup, view, messages)
+    var stream: Buf(u8) = .empty
+    defer a.free(stream)
+    turbo.gid(a, &stream, room_class(view.kind), room)
+    a.append_str(&stream, ":messages")
+    var frame: Buf(u8) = .empty
+    defer a.free(frame)
+    json.encode_string(a, &frame, markup)
+    cable.broadcast(a, ctx.hub, stream, frame)
+    var unread: Buf(u8) = .empty
+    defer a.free(unread)
+    a.append_str(&unread, "{\"roomId\":")
+    a.append_int(&unread, room)
+    a.push(&unread, '}')
+    var members = try ctx.db.prepare("SELECT user_id FROM memberships WHERE room_id=?")
+    defer members.finalize()
+    try members.bind_int(1, room)
+    while (try members.next()) {
+        var to: Buf(u8) = .empty
+        defer a.free(to)
+        a.append_str(&to, "user_")
+        a.append_int(&to, members.int(0))
+        a.append_str(&to, "_unreads")
+        cable.broadcast(a, ctx.hub, to, unread)
+    }
+}
+
+fn deliver_webhook_attachment(a: Allocator, inout ctx: Context, job: i64, room: i64, bot: i64, reply: webhook_http.Reply) !bool {
+    const key = session.base58(a, ctx.rng, 28)
+    defer a.free(key)
+    const type = safe_attachment_type(a, reply.content_type)
+    defer a.free(type)
+    const filename = if (type == "image/png") "attachment.png" else if (type == "image/jpeg") "attachment.jpg" else if (type == "application/pdf") "attachment.pdf" else if (type == "text/plain") "attachment.txt" else "attachment.bin"
+    const dir = a.concat(ctx.files, "/", key[0..2], "/", key[2..4])
+    defer a.free(dir)
+    var i = 1
+    while (i <= @len(dir)) {
+        if (i == @len(dir) or dir[i] == '/') { ctx.fs.make_dir(dir[0..i]) catch {} }
+        i = i + 1
+    }
+    const path = a.concat(dir, "/", key)
+    defer a.free(path)
+    try ctx.fs.write(path, reply.body)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    a.append_str(&body, "<a href=\"/attachments/")
+    a.append_str(&body, key)
+    a.append_str(&body, "\">")
+    a.append_str(&body, filename)
+    a.append_str(&body, "</a>")
+    _ = ctx.lock_rx.recv()
+    const id = write_webhook_attachment(a, &ctx, job, room, bot, key, filename, type, reply.body, body) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    try broadcast_bot_reply(a, &ctx, room, bot, id)
+    return true
+}
+fn safe_attachment_type(a: Allocator, mime: []u8) Buf(u8) {
+    const end = text.find(mime, ";") orelse @len(mime)
+    const type = mime[0..end]
+    for (type) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '/' or c == '-' or c == '+' or c == '.' or c == '_')) { return a.concat("application/octet-stream", "") }
+    }
+    if (!text.contains(type, "/")) { return a.concat("application/octet-stream", "") }
+    return a.concat(type, "")
+}
+fn write_webhook_attachment(a: Allocator, inout ctx: Context, job: i64, room: i64, bot: i64, key: []u8, filename: str, type: []u8, data: []u8, body: []u8) !i64 {
+    try ctx.db.exec("BEGIN IMMEDIATE")
+    const id = insert_webhook_attachment(a, &ctx, job, room, bot, key, filename, type, data, body) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try ctx.db.exec("COMMIT")
+    return id
+}
+fn insert_webhook_attachment(a: Allocator, inout ctx: Context, job: i64, room: i64, bot: i64, key: []u8, filename: str, type: []u8, data: []u8, body: []u8) !i64 {
+    const client = model.uuid(a, ctx.rng)
+    defer a.free(client)
+    const id = try model.write_message(a, ctx.db, ctx.clock, room, bot, true, body, client)
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
+    tf.db_time(a, &stamp, ctx.clock.now())
+    const digest = crypto.md5(a, data)
+    defer a.free(digest)
+    var checksum: Buf(u8) = .empty
+    defer a.free(checksum)
+    codec.base64_encode(a, &checksum, digest)
+    var st = try ctx.db.prepare("INSERT INTO active_storage_blobs (key, filename, content_type, metadata, service_name, byte_size, created_at, checksum) VALUES (?, ?, ?, '{}', 'local', ?, ?, ?)")
+    defer st.finalize()
+    try st.bind(1, key)
+    try st.bind(2, filename)
+    try st.bind(3, type)
+    try st.bind_int(4, @len(data))
+    try st.bind(5, stamp)
+    try st.bind(6, checksum)
+    while (try st.next()) {}
+    const blob = ctx.db.last_id()
+    var attach = try ctx.db.prepare("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('attachment', 'Message', ?, ?, ?)")
+    defer attach.finalize()
+    try attach.bind_int(1, id)
+    try attach.bind_int(2, blob)
+    try attach.bind(3, stamp)
+    while (try attach.next()) {}
+    try push.enqueue(a, ctx.db, ctx.mention_key, id)
+    try finish_webhook(ctx.db, job)
+    return id
+}
+fn download_attachment(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const key = req.path[@len("/attachments/")..]
+    if (@len(key) < 4 or text.contains(key, "/") or text.contains(key, ".")) { return not_found(c, a, req) }
+    var st = try ctx.db.prepare("SELECT b.content_type, p.key, b.filename FROM active_storage_blobs b JOIN active_storage_attachments att ON att.blob_id=b.id AND att.record_type='Message' JOIN messages m ON m.id=att.record_id JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? LEFT JOIN egg_blob_previews p ON p.blob_id=b.id WHERE b.key=? AND ms.involvement!='invisible' LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    try st.bind(2, key)
+    if (!try st.next()) { return not_found(c, a, req) }
+    const raw_type = st.text(a, 0)
+    defer a.free(raw_type)
+    const preview = st.text(a, 1)
+    defer a.free(preview)
+    const want_preview = text.contains(req.query, "preview=1")
+    if (want_preview and @len(preview) == 0) { return not_found(c, a, req) }
+    const type = if (want_preview) a.concat("image/webp", "") else safe_attachment_type(a, raw_type)
+    defer a.free(type)
+    const path = if (want_preview) uploads.path(a, ctx.files, preview) else uploads.path(a, ctx.files, key)
+    defer a.free(path)
+    const data = ctx.fs.read(a, path) catch { return not_found(c, a, req) }
+    defer a.free(data)
+    const inline = want_preview or (text.contains(req.query, "inline=1") and (type == "image/png" or type == "image/jpeg" or type == "image/gif" or type == "image/webp" or text.starts_with(type, "video/") or text.starts_with(type, "audio/")))
+    const filename = st.text(a, 2)
+    defer a.free(filename)
+    var escaped: Buf(u8) = .empty
+    defer a.free(escaped)
+    codec.escape(a, &escaped, filename)
+    var encoded: Buf(u8) = .empty
+    defer a.free(encoded)
+    for (escaped) |ch| {
+        if (ch == '+') { a.append_str(&encoded, "%20") } else { a.push(&encoded, ch) }
+    }
+    const headers = a.concat("Content-Type: ", type, "\r\nContent-Disposition: ", if (inline) "inline" else "attachment", "; filename*=UTF-8''", encoded, "\r\nX-Content-Type-Options: nosniff\r\nCache-Control: private\r\n")
+    defer a.free(headers)
+    return http.file_response(c, a, req, headers, data)
+}
+
+fn write_webhook_text(a: Allocator, inout ctx: Context, job: i64, room: i64, bot: i64, body: []u8) !i64 {
+    const client = model.uuid(a, ctx.rng)
+    defer a.free(client)
+    try ctx.db.exec("BEGIN IMMEDIATE")
+    const id = model.write_message(a, ctx.db, ctx.clock, room, bot, true, body, client) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
+        return e
+    }
+    push.enqueue(a, ctx.db, ctx.mention_key, id) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
+        return e
+    }
+    finish_webhook(ctx.db, job) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try ctx.db.exec("COMMIT")
+    return id
+}
+
+fn account_id(db: sqlite.Db) !i64 {
+    var st = try db.prepare("SELECT id FROM accounts ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (!try st.next()) { return error.Sql }
+    return st.int(0)
+}
+fn upload_picture(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, upload: http.Upload, record: str, id: i64, name: str, location: str) !void {
+    var picture = uploads.picture(a, ctx.fs, ctx.rng, ctx.files, upload.data) catch {
+        return http.respond(c, a, req, "422 Unprocessable Content", HTML, "Please choose a valid PNG, JPEG, GIF or WebP image.")
+    }
+    defer a.free(picture)
+    var small_key: Buf(u8) = .empty
+    defer a.free(small_key)
+    if (record == "Account") {
+        const small = try uploads.icon(a, ctx.fs, ctx.rng, ctx.files, picture, 192)
+        defer a.free(small)
+        a.free(@replace(&small_key, try uploads.write(a, ctx.fs, ctx.rng, ctx.files, small)))
+        const large = try uploads.icon(a, ctx.fs, ctx.rng, ctx.files, picture, 512)
+        a.free(@replace(&picture, large))
+    }
+    const key = try uploads.write(a, ctx.fs, ctx.rng, ctx.files, picture)
+    defer a.free(key)
+    _ = ctx.lock_rx.recv()
+    uploads.replace_picture(a, ctx.db, ctx.clock, record, id, name, key, picture, small_key) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    return redirect_notice(c, a, &ctx, req, location, "Image updated")
+}
+fn uploaded_avatar(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, user: i64) !void {
+    var st = try ctx.db.prepare("SELECT b.key FROM active_storage_blobs b JOIN active_storage_attachments att ON att.blob_id=b.id WHERE att.record_type='User' AND att.record_id=? AND att.name='avatar' LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    if (!try st.next()) { return drawn_avatar(c, a, &ctx, req, user) }
+    const key = st.text(a, 0)
+    defer a.free(key)
+    return picture_file(c, a, &ctx, req, key, "image/webp")
+}
+fn picture_file(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, key: []u8, mime: []u8) !void {
+    const path = uploads.path(a, ctx.files, key)
+    defer a.free(path)
+    const data = ctx.fs.read(a, path) catch { return not_found(c, a, req) }
+    defer a.free(data)
+    const headers = a.concat("Content-Type: ", mime, "\r\nCache-Control: public, max-age=300\r\nX-Content-Type-Options: nosniff\r\n")
+    defer a.free(headers)
+    return http.respond(c, a, req, "200 OK", headers, data)
+}
+fn upload_message(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, room: model.RoomView, user: i64, upload: http.Upload) !void {
+    if (@len(upload.data) == 0 or @len(upload.filename) == 0 or @len(upload.filename) > 255) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "Invalid attachment") }
+    const key = try uploads.write(a, ctx.fs, ctx.rng, ctx.files, upload.data)
+    defer a.free(key)
+    var preview: Buf(u8) = .empty
+    defer a.free(preview)
+    if (media.image_format(upload.data)) |format| {
+        _ = format
+        const picture = uploads.picture(a, ctx.fs, ctx.rng, ctx.files, upload.data) catch { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "Invalid image") }
+        defer a.free(picture)
+        a.free(@replace(&preview, try uploads.write(a, ctx.fs, ctx.rng, ctx.files, picture)))
+    }
+    if (media.video_format(upload.data)) |format| {
+        const original = uploads.path(a, ctx.files, key)
+        defer a.free(original)
+        const thumbnail = a.concat(original, ".png")
+        defer a.free(thumbnail)
+        defer ctx.fs.remove_file(thumbnail) catch {}
+        media.video(a, original, thumbnail, format) catch {}
+        const picture = ctx.fs.read(a, thumbnail) catch a.concat("", "")
+        defer a.free(picture)
+        if (@len(picture) > 0) {
+            const webp = try uploads.picture(a, ctx.fs, ctx.rng, ctx.files, picture)
+            defer a.free(webp)
+            a.free(@replace(&preview, try uploads.write(a, ctx.fs, ctx.rng, ctx.files, webp)))
+        }
+    }
+    const body = http.field(a, req, "message[body]") orelse attachment_caption(a, upload.filename)
+    defer a.free(body)
+    const client = http.field(a, req, "message[client_message_id]") orelse model.uuid(a, ctx.rng)
+    defer a.free(client)
+    const mime = safe_attachment_type(a, upload.content_type)
+    defer a.free(mime)
+    _ = ctx.lock_rx.recv()
+    const id = write_user_attachment(a, &ctx, room.id, user, upload, key, preview, mime, body, client) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    return send_created_message(c, a, &ctx, req, room, id)
+}
+fn write_user_attachment(a: Allocator, inout ctx: Context, room: i64, user: i64, upload: http.Upload, key: []u8, preview: []u8, mime: []u8, body: []u8, client: []u8) !i64 {
+    try ctx.db.exec("BEGIN IMMEDIATE")
+    const id = insert_user_attachment(a, &ctx, room, user, upload, key, preview, mime, body, client) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try ctx.db.exec("COMMIT")
+    return id
+}
+fn insert_user_attachment(a: Allocator, inout ctx: Context, room: i64, user: i64, upload: http.Upload, key: []u8, preview: []u8, mime: []u8, body: []u8, client: []u8) !i64 {
+    const id = try model.write_message(a, ctx.db, ctx.clock, room, user, true, body, client)
+    const blob = try uploads.blob(a, ctx.db, ctx.clock, key, upload.filename, mime, upload.data)
+    try uploads.attach(ctx.db, "Message", id, "attachment", blob)
+    if (@len(preview) > 0) {
+        var st = try ctx.db.prepare("INSERT INTO egg_blob_previews (blob_id, key) VALUES (?, ?)")
+        defer st.finalize()
+        try st.bind_int(1, blob)
+        try st.bind(2, preview)
+        while (try st.next()) {}
+    }
+    try bot_hooks.enqueue(a, ctx.db, ctx.mention_key, id)
+    try push.enqueue(a, ctx.db, ctx.mention_key, id)
+    return id
+}
+
+fn redirect_notice(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, location: []u8, notice: str) !void {
+    var headers: Buf(u8) = .empty
+    defer a.free(headers)
+    a.append_str(&headers, "Location: ")
+    a.append_str(&headers, location)
+    a.append_str(&headers, "\r\n")
+    flash.set(a, &headers, ctx.flash_key, ctx.rng, ctx.clock, notice)
+    return http.respond(c, a, req, "302 Found", headers, "")
+}
+fn flash_notice(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const message = flash.consume(a, ctx.flash_key, req.cookie, ctx.clock)
+    defer a.free(message)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    json.encode_plain(a, &body, message)
+    return http.respond(c, a, req, "200 OK", "Content-Type: application/json\r\nCache-Control: no-store\r\nSet-Cookie: campfire_flash=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n", body)
+}
+fn deliver_push(a: Allocator, inout ctx: Context) !bool {
+    const job = try push.next_job(a, ctx.db, ctx.clock) orelse { return false }
+    defer job.deinit(a)
+    var public_bytes: Buf(u8) = .empty
+    defer a.free(public_bytes)
+    var auth: Buf(u8) = .empty
+    defer a.free(auth)
+    var status: i64 = 400
+    if (job.valid_source and @len(job.endpoint) > 0 and codec.base64_decode(a, &public_bytes, job.public_key) and codec.base64_decode(a, &auth, job.auth)) {
+        status = push.send(a, ctx.clock, job.endpoint, public_bytes, auth, job.payload, ctx.push_private, ctx.vapid, ctx.push_subject, ctx.push_allow_local) catch 400
+    }
+    _ = ctx.lock_rx.recv()
+    push.finish(ctx.db, ctx.clock, job.id, job.subscription, status, job.attempts) catch |e| {
+        ctx.lock_tx.send(true)
+        return e
+    }
+    ctx.lock_tx.send(true)
+    return true
+}
+fn push_subscriptions(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    const user = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const prefix = "/users/me/push_subscriptions"
+    if (req.path == prefix and req.method == "POST") {
+        const root = json.member(a, req.body, "push_subscription") orelse a.concat(req.body, "")
+        defer a.free(root)
+        const endpoint = json.member(a, root, "endpoint") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        defer a.free(endpoint)
+        const public_key = json.member(a, root, "p256dh_key") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        defer a.free(public_key)
+        const auth_key = json.member(a, root, "auth_key") orelse { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        defer a.free(auth_key)
+        var public_bytes: Buf(u8) = .empty
+        defer a.free(public_bytes)
+        var auth: Buf(u8) = .empty
+        defer a.free(auth)
+        if (!codec.base64_decode(a, &public_bytes, public_key) or !codec.base64_decode(a, &auth, auth_key) or !push.valid(a, endpoint, public_bytes, auth, ctx.push_allow_local)) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
+        _ = ctx.lock_rx.recv()
+        save_push(ctx.db, user, endpoint, public_key, auth_key, req.user_agent) catch |e| { ctx.lock_tx.send(true)
+            return e }
+        ctx.lock_tx.send(true)
+        return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html\r\n", "")
+    }
+    if (text.starts_with(req.path, "/users/me/push_subscriptions/")) {
+        const rest = req.path[@len(prefix) + 1..]
+        const slash = text.find(rest, "/") orelse @len(rest)
+        const id = text.parse_int(rest[0..slash]) orelse { return not_found(c, a, req) }
+        var own = try ctx.db.prepare("SELECT 1 FROM push_subscriptions WHERE id=? AND user_id=?")
+        defer own.finalize()
+        try own.bind_int(1, id)
+        try own.bind_int(2, user)
+        if (!try own.next()) { return not_found(c, a, req) }
+        if (slash < @len(rest) and rest[slash..] == "/test_notifications" and req.method == "POST") {
+            _ = ctx.lock_rx.recv()
+            enqueue_test_push(ctx.db, id) catch |e| { ctx.lock_tx.send(true)
+                return e }
+            ctx.lock_tx.send(true)
+            return redirect_notice(c, a, &ctx, req, prefix, "Test notification queued")
+        }
+        if (slash == @len(rest) and (req.method == "DELETE" or req.method == "POST")) {
+            _ = ctx.lock_rx.recv()
+            remove_push(ctx.db, user, id) catch |e| { ctx.lock_tx.send(true)
+                return e }
+            ctx.lock_tx.send(true)
+            return redirect_notice(c, a, &ctx, req, prefix, "Notification subscription removed")
+        }
+        return not_found(c, a, req)
+    }
+    if (req.method != "GET") { return not_found(c, a, req) }
+    const view = try model.find_user(a, ctx.db, ctx.sid_key, user) orelse { return to_sign_in(c, a, req) }
+    defer view.deinit(a)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    try logo_stamp(a, &logo, ctx.db)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    views.app_top(a, &body, "Notifications", view, ctx.vapid, logo, css, "", try administrator(ctx.db, user), "", "<a href=\"/users/me/profile\">Profile</a>")
+    a.append_str(&body, "<section class=\"panel\"><h1>Notifications</h1>")
+    var subscriptions = try ctx.db.prepare("SELECT id, user_agent FROM push_subscriptions WHERE user_id=? ORDER BY id")
+    defer subscriptions.finalize()
+    try subscriptions.bind_int(1, user)
+    while (try subscriptions.next()) {
+        const agent = subscriptions.text(a, 1)
+        defer a.free(agent)
+        a.append_str(&body, "<div><p>")
+        html.escape(a, &body, agent)
+        a.append_str(&body, "</p><form method=\"post\" action=\"/users/me/push_subscriptions/")
+        a.append_int(&body, subscriptions.int(0))
+        a.append_str(&body, "/test_notifications\"><button class=\"btn\">Send test notification</button></form><form method=\"post\" action=\"/users/me/push_subscriptions/")
+        a.append_int(&body, subscriptions.int(0))
+        a.append_str(&body, "\"><input type=\"hidden\" name=\"_method\" value=\"delete\" /><button class=\"btn\">Remove</button></form></div>")
+    }
+    a.append_str(&body, "</section>")
+    views.app_bottom(a, &body, "", "")
+    return http.respond(c, a, req, "200 OK", HTML, body)
+}
+fn save_push(db: sqlite.Db, user: i64, endpoint: []u8, public_key: []u8, auth: []u8, agent: []u8) !void {
+    var existing = try db.prepare("SELECT id FROM push_subscriptions WHERE user_id=? AND endpoint=? AND p256dh_key=? AND auth_key=? LIMIT 1")
+    defer existing.finalize()
+    try existing.bind_int(1, user)
+    try existing.bind(2, endpoint)
+    try existing.bind(3, public_key)
+    try existing.bind(4, auth)
+    if (try existing.next()) { return }
+    var st = try db.prepare("INSERT INTO push_subscriptions (user_id, endpoint, p256dh_key, auth_key, user_agent, created_at, updated_at) VALUES (?, ?, ?, ?, ?, STRFTIME('%Y-%m-%d %H:%M:%f','NOW'), STRFTIME('%Y-%m-%d %H:%M:%f','NOW'))")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    try st.bind(2, endpoint)
+    try st.bind(3, public_key)
+    try st.bind(4, auth)
+    try st.bind(5, agent)
+    while (try st.next()) {}
+}
+fn remove_push(db: sqlite.Db, user: i64, id: i64) !void {
+    var st = try db.prepare("DELETE FROM push_subscriptions WHERE user_id=? AND id=?")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    try st.bind_int(2, id)
+    while (try st.next()) {}
+}
+fn enqueue_test_push(db: sqlite.Db, id: i64) !void {
+    var st = try db.prepare("INSERT INTO egg_push_jobs (subscription_id, payload) VALUES (?, '{\"title\":\"Campfire Test\",\"options\":{\"body\":\"Notifications enabled\",\"data\":{\"path\":\"/users/me/push_subscriptions\",\"badge\":0}}}')")
+    defer st.finalize()
+    try st.bind_int(1, id)
+    while (try st.next()) {}
+}
+
+fn unfurl_link(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    _ = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }
+    const url = json.member(a, req.body, "url") orelse (http.field(a, req, "url") orelse { return http.respond(c, a, req, "204 No Content", "", "") })
+    defer a.free(url)
+    if (@len(url) > 2048 or (!text.starts_with(url, "https://") and !text.starts_with(url, "http://"))) { return http.respond(c, a, req, "204 No Content", "", "") }
+    const fetched = try webhook_http.get(a, url)
+    defer fetched.deinit(a)
+    if (fetched.code != 0 or fetched.status != 200 or !text.starts_with(fetched.content_type, "text/html")) { return http.respond(c, a, req, "204 No Content", "", "") }
+    var title = uploads.metadata(a, fetched.body, "og:title")
+    defer a.free(title)
+    if (@len(title) == 0) {
+        const begin = text.find(fetched.body, "<title>") orelse -1
+        if (begin >= 0) {
+            const end = text.find_from(fetched.body, "</title>", begin) orelse begin
+            if (end > begin) { a.free(@replace(&title, richtext.plain_text(a, fetched.body[begin + 7..end]))) }
+        }
+    }
+    if (@len(title) == 0) { return http.respond(c, a, req, "204 No Content", "", "") }
+    const description = uploads.metadata(a, fetched.body, "og:description")
+    defer a.free(description)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    a.append_str(&body, "{\"title\":")
+    json.encode_plain(a, &body, title)
+    a.append_str(&body, ",\"url\":")
+    json.encode_plain(a, &body, url)
+    a.append_str(&body, ",\"description\":")
+    json.encode_plain(a, &body, description)
+    a.append_str(&body, ",\"image\":null}")
+    return http.respond(c, a, req, "200 OK", "Content-Type: application/json\r\n", body)
+}
+
+fn attachment_caption(a: Allocator, filename: []u8) Buf(u8) {
+    var out: Buf(u8) = .empty
+    html.escape(a, &out, filename)
+    return out
 }

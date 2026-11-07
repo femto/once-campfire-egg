@@ -1,0 +1,28 @@
+<%fn account_edit(a: Allocator, inout out: Buf(u8), name: []u8, invite: []u8, code: []u8, admin: bool, logo_v: []u8) %>
+<section class="panel txt-align-center flex flex-column gap" style="view-transition-name: account-settings">
+<% if (admin) { %>
+  <form data-controller="form upload-preview" enctype="multipart/form-data" action="/account" method="post"><input type="hidden" name="_method" value="patch" />
+    <label class="btn input--file"><img src="/account/logo?v=<%- logo_v %>" width="96" height="96" alt="Account logo" data-upload-preview-target="image" /><span>Upload logo</span><input type="file" name="account[logo]" accept="image/png,image/jpeg,image/gif,image/webp" data-upload-preview-target="input" data-action="upload-preview#previewImage change-&gt;form#submit" /></label>
+  </form>
+  <form class="flex flex-column gap" data-controller="form" action="/account" method="post"><input type="hidden" name="_method" value="patch" />
+    <div class="flex align-center gap">
+      <label class="flex align-center gap flex-item-grow"><input class="input txt-large" autocomplete="off" placeholder="Name this account" autofocus="autofocus" name="account[name]" value="<%= name %>" /></label>
+      <button class="btn btn--reversed center" type="submit"><img aria-hidden="true" src="/assets/check-7897ff7e.svg" width="20" height="20" /><span class="for-screen-reader">Save changes</span></button>
+    </div>
+  </form>
+<% } else { %>
+  <img class="txt-xx-large center" src="/account/logo?v=<%- logo_v %>" alt="" width="48" height="48" />
+  <h1 class="flex-item-grow txt-x-large"><%= name %></h1>
+<% } %>
+  <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+    <div class="flex flex-column align-center gap">
+      <label class="flex flex-column gap full-width"><strong id="invite_label" class="invite-label">Share to invite more people</strong><input class="input" type="text" id="invite_url" value="<%= invite %>" aria-labelledby="invite_label" readonly /></label>
+      <div class="flex align-center gap">
+        <a class="btn" href="/join/<%= code %>">Join link</a>
+<% if (admin) { %>
+        <form method="post" action="/account/join_code"><button class="btn btn--regenerate" type="submit"><img aria-hidden="true" src="/assets/refresh-249f0509.svg" width="20" height="20" /><span class="for-screen-reader">Regenerate join link</span></button></form>
+<% } %>
+      </div>
+    </div>
+  </div>
+</section>

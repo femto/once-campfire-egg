@@ -118,6 +118,72 @@ fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache
     a.push(&cuts, m.id)
 }
 
+// next_involvement_for(room, involvement:): the next in the cycle.
+fn next_involvement(direct: bool, involvement: []u8) str {
+    if (direct) {
+        return if (involvement == "everything") "nothing" else "everything"
+    }
+    if (involvement == "mentions") {
+        return "everything"
+    } else if (involvement == "everything") {
+        return "nothing"
+    } else if (involvement == "nothing") {
+        return "invisible"
+    }
+    return "mentions"
+}
+
+fn humanize_involvement(involvement: []u8) str {
+    if (involvement == "mentions") {
+        return "Notifying about @ mentions"
+    } else if (involvement == "everything") {
+        return "Notifying about all messages"
+    } else if (involvement == "nothing") {
+        return "Notifications are off"
+    } else if (involvement == "invisible") {
+        return "Notifications are off and room invisible in sidebar"
+    }
+    return ""
+}
+
+fn bell_asset(involvement: []u8) str {
+    if (involvement == "everything") {
+        return "/assets/notification-bell-everything-cde41b14.svg"
+    } else if (involvement == "nothing") {
+        return "/assets/notification-bell-nothing-d8096c76.svg"
+    } else if (involvement == "invisible") {
+        return "/assets/notification-bell-invisible-8b495073.svg"
+    }
+    return "/assets/notification-bell-mentions-945d1b91.svg"
+}
+
+// account_edit.html
+fn account_edit(a: Allocator, inout out: Buf(u8), name: []u8, invite: []u8, code: []u8, admin: bool, logo_v: []u8) void {
+    a.append_str(&out, "<section class=\"panel txt-align-center flex flex-column gap\" style=\"view-transition-name: account-settings\">\n")
+    if (admin) {
+    a.append_str(&out, "  <form data-controller=\"form upload-preview\" enctype=\"multipart/form-data\" action=\"/account\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n    <label class=\"btn input--file\"><img src=\"/account/logo?v=")
+    a.append_str(&out, logo_v)
+    a.append_str(&out, "\" width=\"96\" height=\"96\" alt=\"Account logo\" data-upload-preview-target=\"image\" /><span>Upload logo</span><input type=\"file\" name=\"account[logo]\" accept=\"image/png,image/jpeg,image/gif,image/webp\" data-upload-preview-target=\"input\" data-action=\"upload-preview#previewImage change-&gt;form#submit\" /></label>\n  </form>\n  <form class=\"flex flex-column gap\" data-controller=\"form\" action=\"/account\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n    <div class=\"flex align-center gap\">\n      <label class=\"flex align-center gap flex-item-grow\"><input class=\"input txt-large\" autocomplete=\"off\" placeholder=\"Name this account\" autofocus=\"autofocus\" name=\"account[name]\" value=\"")
+    html.escape(a, &out, name)
+    a.append_str(&out, "\" /></label>\n      <button class=\"btn btn--reversed center\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button>\n    </div>\n  </form>\n")
+    } else {
+    a.append_str(&out, "  <img class=\"txt-xx-large center\" src=\"/account/logo?v=")
+    a.append_str(&out, logo_v)
+    a.append_str(&out, "\" alt=\"\" width=\"48\" height=\"48\" />\n  <h1 class=\"flex-item-grow txt-x-large\">")
+    html.escape(a, &out, name)
+    a.append_str(&out, "</h1>\n")
+    }
+    a.append_str(&out, "  <div class=\"margin-block pad-inline pad-block-start fill-shade border-radius\">\n    <div class=\"flex flex-column align-center gap\">\n      <label class=\"flex flex-column gap full-width\"><strong id=\"invite_label\" class=\"invite-label\">Share to invite more people</strong><input class=\"input\" type=\"text\" id=\"invite_url\" value=\"")
+    html.escape(a, &out, invite)
+    a.append_str(&out, "\" aria-labelledby=\"invite_label\" readonly /></label>\n      <div class=\"flex align-center gap\">\n        <a class=\"btn\" href=\"/join/")
+    html.escape(a, &out, code)
+    a.append_str(&out, "\">Join link</a>\n")
+    if (admin) {
+    a.append_str(&out, "        <form method=\"post\" action=\"/account/join_code\"><button class=\"btn btn--regenerate\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/refresh-249f0509.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Regenerate join link</span></button></form>\n")
+    }
+    a.append_str(&out, "      </div>\n    </div>\n  </div>\n</section>\n")
+}
+
 // app_bottom.html
 fn app_bottom(a: Allocator, inout out: Buf(u8), footer: []u8, sidebar: []u8) void {
     a.append_str(&out, "      <footer id=\"footer\">\n")
@@ -129,8 +195,8 @@ fn app_bottom(a: Allocator, inout out: Buf(u8), footer: []u8, sidebar: []u8) voi
 }
 
 // app_top.html
-fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) void {
-    layout_top(a, &out, title, user, vapid, logo_v)
+fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, css: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) void {
+    layout_top(a, &out, title, user, vapid, logo_v, css)
     a.append_str(&out, "\n\n")
     a.append_str(&out, head)
     a.append_str(&out, "  </head>\n\n  <body class=\"")
@@ -188,6 +254,51 @@ fn boost(a: Allocator, inout out: Buf(u8), b: model.BoostView, message_id: i64) 
     a.append_str(&out, "\"><input type=\"hidden\" name=\"_method\" value=\"delete\" /><button data-action=\"boost-delete#perform\" data-boost-delete-target=\"button\" class=\"btn btn--negative flex-item-justify-end boost__delete\" type=\"submit\">\n      <img aria-hidden=\"true\" src=\"/assets/minus-b31a1093.svg\" width=\"20\" height=\"20\" />\n      <span class=\"for-screen-reader\">Delete this boost</span>\n</button></form>  </div>\n  <span id=\"delete_boost_accessible_label\" class=\"for-screen-reader\">Press enter to delete this boost</span>")
 }
 
+// bot_form.html
+fn bot_form(a: Allocator, inout out: Buf(u8), id: i64, name: []u8, webhook: []u8) void {
+    a.append_str(&out, "<section class=\"panel\"><form class=\"flex flex-column gap\" action=\"/account/bots")
+    if (id > 0) {
+    a.append_str(&out, "/")
+    a.append_int(&out, id)
+    }
+    a.append_str(&out, "\" method=\"post\">")
+    if (id > 0) {
+    a.append_str(&out, "<input type=\"hidden\" name=\"_method\" value=\"patch\" />")
+    }
+    a.append_str(&out, "\n  <h1 class=\"for-screen-reader\">Chat Bot Setup</h1>\n  <label class=\"flex align-center gap flex-item-grow txt-large input input--actor\"><input class=\"input\" autocomplete=\"name\" placeholder=\"Name the bot\" autofocus=\"autofocus\" required=\"required\" type=\"text\" name=\"user[name]\" value=\"")
+    html.escape(a, &out, name)
+    a.append_str(&out, "\" /></label>\n  <label class=\"flex align-center gap flex-item-grow txt-large input input--actor\"><input class=\"input\" placeholder=\"Webhook URL\" type=\"url\" name=\"user[webhook_url]\" value=\"")
+    html.escape(a, &out, webhook)
+    a.append_str(&out, "\" /></label>\n  <button class=\"btn btn--reversed center txt-large\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button>\n</form></section>\n")
+}
+
+// bots_index.html
+fn bots_index(a: Allocator, inout out: Buf(u8), bots: Buf(model.BotView), base: []u8) void {
+    a.append_str(&out, "<section class=\"panel panel--wide txt-align-center flex flex-column position-relative\" style=\"view-transition-name: chat-bots\">\n  <div class=\"flex align-center gap\"><div class=\"pad-inline-double center\"><h1 class=\"margin-none\">Chat bots</h1><p>With Chat bots, other sites and services can post updates directly to Campfire.</p><a class=\"btn btn--reversed txt-large\" aria-label=\"Add a chat bot\" href=\"/account/bots/new\">Add a chat bot</a></div></div>\n  <div class=\"pad-inline pad-block-start\"><menu class=\"flex flex-column gap margin-none pad\">\n")
+    for (bots) |bot| {
+    a.append_str(&out, "    <li class=\"flex flex-column gap flush fill-shade border-radius pad-block pad-inline-double\"><div class=\"flex align-center gap\"><strong class=\"txt-large\">")
+    html.escape(a, &out, bot.name)
+    a.append_str(&out, "</strong><a class=\"btn flex-item-justify-end\" href=\"/account/bots/")
+    a.append_int(&out, bot.id)
+    a.append_str(&out, "/edit\"><span class=\"for-screen-reader\">Edit ")
+    html.escape(a, &out, bot.name)
+    a.append_str(&out, "</span><img aria-hidden=\"true\" src=\"/assets/pencil-cf9d28aa.svg\" width=\"20\" height=\"20\" /></a></div>\n")
+    for (bot.rooms) |room| {
+    a.append_str(&out, "      <fieldset class=\"gap max-width pad border border-radius\"><legend><strong>")
+    html.escape(a, &out, room.name)
+    a.append_str(&out, "</strong></legend><input type=\"text\" class=\"input full-width fill-white\" aria-label=\"curl command for posting messages\" value=\"curl -d 'Your message' ")
+    a.append_str(&out, base)
+    a.append_str(&out, "/rooms/")
+    a.append_int(&out, room.id)
+    a.append_str(&out, "/")
+    a.append_str(&out, bot.key)
+    a.append_str(&out, "/messages\" readonly /></fieldset>\n")
+    }
+    a.append_str(&out, "    </li>\n")
+    }
+    a.append_str(&out, "  </menu></div>\n</section>\n")
+}
+
 // create_stream.html
 fn create_stream(a: Allocator, inout out: Buf(u8), room: model.RoomView, messages: Buf(model.MessageView)) void {
     a.append_str(&out, "<turbo-stream action=\"append\" target=\"messages_rooms_")
@@ -199,6 +310,18 @@ fn create_stream(a: Allocator, inout out: Buf(u8), room: model.RoomView, message
     message(a, &out, m)
     }
     a.append_str(&out, "</template></turbo-stream>")
+}
+
+// custom_styles.html
+fn custom_styles(a: Allocator, inout out: Buf(u8), css: []u8) void {
+    a.append_str(&out, "<section class=\"panel panel--wide txt-align-center flex flex-column position-relative\" style=\"view-transition-name: custom-styles\">\n  <form action=\"/account/custom_styles\" method=\"post\" class=\"flex flex-column gap\" data-controller=\"form\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n    <h1 class=\"margin-none\">Custom CSS</h1>\n    <p>Add custom CSS styles.</p>\n    <label class=\"flex align-start gap flex-item-grow\"><textarea class=\"input input--code txt--small\" placeholder=\"Add CSS styles…\" rows=\"16\" name=\"account[custom_styles]\">")
+    html.escape(a, &out, css)
+    a.append_str(&out, "</textarea></label>\n    <button class=\"btn btn--reversed center txt-large\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button>\n  </form>\n</section>\n")
+}
+
+// direct_new.html
+fn direct_new(a: Allocator, inout out: Buf(u8)) void {
+    a.append_str(&out, "<turbo-frame id=\"direct_rooms_control\" target=\"_top\">\n  <div class=\"directs directs--new flex flex-column gap\">\n    <form class=\"flex gap flex-item-grow\" data-controller=\"form\" data-action=\"keydown.esc-&gt;form#cancel\" action=\"/rooms/directs\" method=\"post\">\n      <a class=\"btn flex-item-no-shrink\" data-turbo-frame=\"user_sidebar\" data-form-target=\"cancel\" href=\"/users/me/sidebar\"><img aria-hidden=\"true\" src=\"/assets/arrow-left-abe40556.svg\" /><span class=\"for-screen-reader\">Cancel changes</span></a>\n      <section class=\"autocomplete__container unpad input input--actor\"><div class=\"autocomplete__input input flex flex-wrap position-relative flex-item-grow\" data-controller=\"autocomplete\" data-autocomplete-url-value=\"/autocompletable/users\">\n        <select name=\"user_ids[]\" data-autocomplete-target=\"select\" data-template-id=\"autocompletable-user\" multiple=\"true\" hidden required></select>\n        <template id=\"autocompletable-user\"><div class=\"autocomplete__pill max-width\" data-value=\"\" tabindex=\"0\"><img class=\"avatar flex-item-no-shrink\" data-content=\"avatar\" src=\"\" /><span class=\"autocomplete-field__selected-value-text overflow-ellipsis flex-item-grow\" data-content=\"label\"></span><button type=\"button\" data-action=\"autocomplete#remove:prevent\" data-value=\"\" tabindex=\"-1\" class=\"btn btn--plain txt-small translucent flex-item-no-shrink\"><span class=\"for-screen-reader\">Remove <span data-content=\"screenReaderLabel\"></span></span></button></div></template>\n        <input autocomplete=\"off\" autocorrect=\"off\" data-1p-ignore=\"true\" class=\"autocomplete__input input flex flex-wrap position-relative\" data-autocomplete-target=\"input\" data-action=\"input-&gt;autocomplete#search keydown-&gt;autocomplete#didPressKey\" type=\"text\" name=\"rooms_direct[user_ids_input]\" id=\"rooms_direct_user_ids_input\" />\n      </div></section>\n      <button name=\"button\" type=\"submit\" class=\"btn btn--reversed flex-item-no-shrink\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" /><span class=\"for-screen-reader\">Start Ping</span></button>\n    </form><span class=\"txt-small translucent pad-inline-half center\">Type names to ping someone…</span>\n  </div>\n</turbo-frame>\n")
 }
 
 // first_run.html
@@ -246,13 +369,60 @@ fn invite_link(a: Allocator, inout out: Buf(u8), base: []u8, join_code: []u8, ad
     a.append_str(&out, "  </div>\n</div>\n")
 }
 
+// involvement_button.html
+fn involvement_button(a: Allocator, inout out: Buf(u8), room_id: i64, param_key: []u8, direct: bool, involvement: []u8) void {
+    a.append_str(&out, "<form class=\"button_to\" method=\"post\" action=\"/rooms/")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "/involvement?involvement=")
+    a.append_str(&out, next_involvement(direct, involvement))
+    a.append_str(&out, "\"><input type=\"hidden\" name=\"_method\" value=\"put\" /><button role=\"checkbox\" aria-checked=\"true\" aria-labelledby=\"involvement_label_")
+    a.append_str(&out, param_key)
+    a.append_str(&out, "_")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "\" tabindex=\"0\" class=\"btn ")
+    html.escape(a, &out, involvement)
+    a.append_str(&out, "\" type=\"submit\"><img aria-hidden=\"true\" src=\"")
+    a.append_str(&out, bell_asset(involvement))
+    a.append_str(&out, "\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\" id=\"involvement_label_")
+    a.append_str(&out, param_key)
+    a.append_str(&out, "_")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "\">")
+    a.append_str(&out, humanize_involvement(involvement))
+    a.append_str(&out, "</span></button></form>")
+}
+
+// involvement_frame.html
+fn involvement_frame(a: Allocator, inout out: Buf(u8), room_id: i64, kind: []u8, setting: []u8) void {
+    a.append_str(&out, "<turbo-frame data-controller=\"turbo-frame\" data-action=\"notifications:ready@window-&gt;turbo-frame#load\" data-turbo-frame-url-param=\"/rooms/")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "/involvement\" id=\"involvement_rooms_")
+    a.append_str(&out, kind)
+    a.append_str(&out, "_")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "\">\n")
+    involvement_button(a, &out, room_id, if (kind == "direct") "rooms_direct" else if (kind == "closed") "rooms_closed" else "rooms_open", kind == "direct", setting)
+    a.append_str(&out, "</turbo-frame>\n")
+}
+
+// join.html
+fn join_page(a: Allocator, inout out: Buf(u8), code: []u8, account: []u8) void {
+    a.append_str(&out, "<!DOCTYPE html><html><head><title>Join Campfire</title><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />")
+    a.append_str(&out, static_head.ASSETS)
+    a.append_str(&out, "</head><body data-controller=\"local-time lightbox\">\n  <main id=\"main-content\"><form action=\"/join/")
+    html.escape(a, &out, code)
+    a.append_str(&out, "\" method=\"post\" class=\"center\"><section class=\"nametag u-relative\"><div class=\"nametag__inner flex flex-column gap\">\n    <fieldset><legend><img src=\"/account/logo\" alt=\"\" width=\"48\" height=\"48\" /><strong class=\"txt-large\">")
+    html.escape(a, &out, account)
+    a.append_str(&out, "</strong></legend></fieldset>\n    <label class=\"flex align-center gap flex-item-grow txt-large input input--actor\"><input class=\"input\" autocomplete=\"name\" placeholder=\"Name\" autofocus=\"autofocus\" required=\"required\" type=\"text\" name=\"user[name]\" /></label>\n    <label class=\"flex align-center gap flex-item-grow txt-large input input--actor\"><input class=\"input\" autocomplete=\"username\" placeholder=\"Email address\" required=\"required\" type=\"email\" name=\"user[email_address]\" /></label>\n    <label class=\"flex align-center gap flex-item-grow txt-large input input--actor\"><input class=\"input\" autocomplete=\"new-password\" placeholder=\"Password\" required=\"required\" maxlength=\"72\" type=\"password\" name=\"user[password]\" /></label>\n    <button class=\"btn btn--reversed center txt-large\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" /><span class=\"for-screen-reader\">Save</span></button>\n  </div></section></form></main>\n</body></html>\n")
+}
+
 // layout_bottom.html
 fn layout_bottom(a: Allocator, inout out: Buf(u8)) void {
-    a.append_str(&out, "    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n  </body>\n</html>\n")
+    a.append_str(&out, "    <dialog class=\"lightbox\" aria-label=\"Image Viewer (Press escape to close)\" data-lightbox-target=\"dialog\" data-action=\"close->lightbox#reset\">\n  <img src=\"\" class=\"lightbox__image\" data-lightbox-target=\"zoomedImage\" />\n\n  <form method=\"dialog\" class=\"lightbox__btn\">\n    <button class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" />\n      <span class=\"for-screen-reader\">Close image viewer</span>\n    </button>\n  </form>\n\n  <a href=\"\" class=\"lightbox__btn--download btn hide-in-ios-pwa\" data-lightbox-target=\"download\">\n    <img aria-hidden=\"true\" src=\"/assets/download-04029899.svg\" />\n    <span class=\"for-screen-reader\">Download file</span>\n  </a>\n\n  <button class=\"lightbox__btn--share btn\"\n      data-controller=\"web-share\"\n      data-action=\"web-share#share\"\n      data-web-share-files-value=\"\"\n      data-lightbox-target=\"share\">\n    <img aria-hidden=\"true\" src=\"/assets/share-bf28da4f.svg\" />\n    <span class=\"for-screen-reader\">Share file</span>\n  </button>\n</dialog>\n\n\n    <a href=\"https://once.com\" id=\"app-logo\" target=\"_blank\" aria-label=\"Once software from 37signals home page\">\n      <img alt=\"Campfire logo\" width=\"256\" height=\"216\" src=\"/assets/campfire-icon-3d9986c5.png\" />\n    </a>\n    <script>\n      if (!window.campfireFlashInstalled) {\n        window.campfireFlashInstalled = true;\n        document.addEventListener(\"turbo:load\", async () => {\n          try {\n            const message = await fetch(\"/flash\", { cache: \"no-store\" }).then(response => response.json());\n            document.getElementById(\"flash-notice\")?.remove();\n            if (message) {\n              const notice = document.createElement(\"div\");\n              notice.id = \"flash-notice\"; notice.className = \"flash notice\"; notice.role = \"status\";\n              notice.textContent = message;\n              document.querySelector(\"#main-content\")?.prepend(notice);\n            }\n          } catch {}\n        });\n      }\n    </script>\n  </body>\n</html>\n")
 }
 
 // layout_top.html
-fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8) void {
+fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, css: []u8) void {
     a.append_str(&out, "<!DOCTYPE html>\n<html>\n  <head>\n    <title>")
     html.escape(a, &out, title)
     a.append_str(&out, "</title>\n\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content\">\n    <meta name=\"view-transition\" content=\"same-origin\">\n    <meta name=\"color-scheme\" content=\"light dark\">\n    <meta name=\"theme-color\" content=\"#ffffff\" media=\"(prefers-color-scheme: light)\">\n    <meta name=\"theme-color\" content=\"#000000\" media=\"(prefers-color-scheme: dark)\">\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n    <meta name=\"current-user-id\" content=\"")
@@ -267,6 +437,12 @@ fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserVie
     a.append_str(&out, logo_v)
     a.append_str(&out, "\">\n\n    ")
     a.append_str(&out, static_head.ASSETS)
+    if (@len(css) > 0) {
+    a.append_str(&out, "<style>")
+    a.append_str(&out, css)
+    a.append_str(&out, "</style>")
+    }
+    a.append_str(&out, "\n")
 }
 
 // manifest.html
@@ -429,6 +605,68 @@ fn presentation(a: Allocator, inout out: Buf(u8), m: model.MessageView) void {
     a.append_str(&out, "\n</div>\n\n</div>\n")
 }
 
+// profile.html
+fn profile(a: Allocator, inout out: Buf(u8), user: model.UserView, has_email: bool, email: []u8, bio: []u8, shared: Buf(model.ProfileMembership), direct: Buf(model.ProfileMembership), transfer: []u8, qr: []u8) void {
+    a.append_str(&out, "<section class=\"panel flex flex-column gap\" style=\"view-transition-name: avatar-")
+    a.append_int(&out, user.id)
+    a.append_str(&out, "\">\n    <a href=\"/users/me/push_subscriptions\">Manage notification devices</a>\n    <details class=\"notifications-help pwa__instructions hide-in-pwa\" data-controller=\"pwa-install\" data-pwa-install-prompting-class=\"pwa--can-install\" data-notifications-target=\"details\">\n    <summary class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" width=\"20\" height=\"20\" />\n      <strong>Install Campfire as a web app.</strong>\n      <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n    </summary>\n\n        <p>Some platforms require you to install Campfire as a web app to receive push notifications.</p>\n\n    <div class=\"margin-block-start txt-align-center pwa__installer\">\n      <hr class=\"separator margin-block\">\n      <button class=\"btn btn--reversed center\" data-action=\"pwa-install#promptInstall\">\n        <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" />\n        Install now\n      </button>\n    </div>\n  </details>\n\n\n  <div class=\"align-center center avatar__form gap\" data-controller=\"upload-preview\">\n    <form class=\"txt-medium\" data-controller=\"form\" enctype=\"multipart/form-data\" action=\"/users/me/profile\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n      <label class=\"btn input--file\">\n        <img aria-hidden=\"true\" src=\"/assets/camera-927323b8.svg\" width=\"20\" height=\"20\" />\n        <input id=\"file\" class=\"input\" accept=\"image/*\" data-upload-preview-target=\"input\" data-action=\"upload-preview#previewImage change-&gt;form#submit\" type=\"file\" name=\"user[avatar]\" />\n        <span class=\"for-screen-reader\">Upload avatar</span>\n      </label>\n</form>\n    <form data-controller=\"form\" enctype=\"multipart/form-data\" action=\"/users/me/profile\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n      <label class=\"btn avatar input--file txt-xx-large\">\n        <img aria-hidden=\"true\" data-upload-preview-target=\"image\" src=\"")
+    a.append_str(&out, user.avatar)
+    a.append_str(&out, "\" width=\"300\" height=\"300\" />\n        <input id=\"file\" class=\"input\" accept=\"image/*\" data-upload-preview-target=\"input\" data-action=\"upload-preview#previewImage change-&gt;form#submit\" type=\"file\" name=\"user[avatar]\" />\n        <span class=\"for-screen-reader\">Avatar</span>\n      </label>\n</form>\n  </div>\n\n  <form data-controller=\"form\" action=\"/users/me/profile\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\" />\n    <div class=\"flex flex-column gap\">\n      <div class=\"flex align-center gap\">\n        <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your name</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu nombre</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Entrez votre nom</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना नाम दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihren Namen ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira seu nome</dd><dt>🇯🇵</dt><dd class=\"margin-none\">お名前を入力してください</dd></dl></div></details>\n\n        <label class=\"flex align-center gap flex-item-grow input input--actor\">\n          <input class=\"input txt-large \" autocomplete=\"name\" placeholder=\"Enter your name\" autofocus=\"autofocus\" required=\"required\" data-1p-ignore=\"true\" type=\"text\" value=\"")
+    html.escape(a, &out, user.name)
+    a.append_str(&out, "\" name=\"user[name]\" id=\"user_name\" />\n          <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/person-da193438.svg\" width=\"24\" height=\"24\" />\n        </label>\n      </div>\n\n      <div class=\"flex align-center gap\">\n        <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your email address</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class=\"margin-none\">メールアドレスを入力してください</dd></dl></div></details>\n\n        <label class=\"flex align-center gap flex-item-grow input input--actor\">\n          <input class=\"input txt-large\"")
+    if (has_email) {
+    a.append_str(&out, " value=\"")
+    html.escape(a, &out, email)
+    a.append_str(&out, "\"")
+    }
+    a.append_str(&out, " autocomplete=\"username\" placeholder=\"Enter your email address\" type=\"email\" name=\"user[email_address]\" id=\"user_email_address\" />\n          <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/email-6c595bc5.svg\" width=\"24\" height=\"24\" />\n        </label>\n      </div>\n\n      <div class=\"flex align-center gap\">\n        <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Change password</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Cambiar contraseña</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Changer le mot de passe</dd><dt>🇮🇳</dt><dd class=\"margin-none\">पासवर्ड बदलें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Passwort ändern</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Alterar senha</dd><dt>🇯🇵</dt><dd class=\"margin-none\">パスワードを変更</dd></dl></div></details>\n\n        <label class=\"flex align-center gap flex-item-grow input input--actor\">\n          <input class=\"input txt-large\" autocomplete=\"new-password\" placeholder=\"Change password\" maxlength=\"72\" size=\"72\" type=\"password\" name=\"user[password]\" id=\"user_password\" />\n          <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/password-0896da4e.svg\" width=\"24\" height=\"24\" />\n        </label>\n      </div>\n\n      <div class=\"flex align-start gap\">\n        <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter a few words about yourself.</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Ingresa algunas palabras sobre ti mismo.</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Saisissez quelques mots à propos de vous-même.</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपने बारे में कुछ शब्द लिखें.</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie ein paar Worte über sich selbst ein.</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira alguma palavras sobre você.</dd><dt>🇯🇵</dt><dd class=\"margin-none\">ご自分について簡単に記入してください。</dd></dl></div></details>\n\n        <label class=\"flex align--center gap flex-item--grow input input--actor\">\n          <textarea class=\"input txt-large\" placeholder=\"A few words about yourself…\" maxlength=\"200\" rows=\"3\" name=\"user[bio]\" id=\"user_bio\">\n")
+    html.escape(a, &out, bio)
+    a.append_str(&out, "</textarea>\n          <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/bio-567a6005.svg\" width=\"24\" height=\"24\" />\n        </label>\n      </div>\n\n      <button class=\"btn btn--reversed center txt-large\" type=\"submit\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save changes</span></button>\n    </div>\n</form>\n  <div class=\"margin-block pad-inline pad-block fill-shade border-radius\">\n    <menu class=\"flex flex-column gap margin-none pad\">\n")
+    for (shared) |m| {
+    profile_membership(a, &out, m.room_id, m.name, m.param_key, m.direct, m.involvement)
+    }
+    if (@len(direct) > 0 and @len(shared) > 0) {
+    a.append_str(&out, "        <hr class=\"separator full-width\" style=\"--border-style: solid\">\n")
+    }
+    a.append_str(&out, "\n      ")
+    for (direct) |m| {
+    profile_membership(a, &out, m.room_id, m.name, m.param_key, m.direct, m.involvement)
+    }
+    a.append_str(&out, "    </menu>\n  </div>\n\n  \n<fieldset>\n  <legend class=\"gap\">\n    <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/laptop-cf35e6d4.svg\" width=\"36\" height=\"36\" />\n    <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/transfer-3ec4f61b.svg\" width=\"36\" height=\"36\" />\n    <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/mobile-phone-d0d2301d.svg\" width=\"36\" height=\"36\" />\n  </legend>\n\n\n  <div class=\"flex flex-column gap\">\n      <label for=\"session_transfer_url\" class=\"for-screen-reader\">Use this link to login automatically on another device</label>\n\n    <input type=\"text\" class=\"input\" value=\"")
+    html.escape(a, &out, transfer)
+    a.append_str(&out, "\" id=\"session_transfer_url\" readonly>\n\n    <div class=\"flex align-center center gap\">\n      <a class=\"btn\" data-lightbox-target=\"image\" data-action=\"lightbox#open\" data-lightbox-url-value=\"/qr_code/")
+    a.append_str(&out, qr)
+    a.append_str(&out, "\" href=\"/qr_code/")
+    a.append_str(&out, qr)
+    a.append_str(&out, "\">\n        <span class=\"for-screen-reader\">Show auto-login QR code</span>\n        <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/qr-code-dac3b273.svg\" width=\"20\" height=\"20\" />\n</a>\n      <button class=\"btn\" data-controller=\"copy-to-clipboard\" data-action=\"copy-to-clipboard#copy\" data-copy-to-clipboard-success-class=\"btn--success\" data-copy-to-clipboard-content-value=\"")
+    html.escape(a, &out, transfer)
+    a.append_str(&out, "\">\n        <span class=\"for-screen-reader\">Copy auto-login link</span>\n        <img aria-hidden=\"true\" class=\"flex-item-no-shrink colorize--black\" src=\"/assets/copy-paste-4c379063.svg\" width=\"20\" height=\"20\" />\n</button>\n      <button class=\"btn\" hidden=\"hidden\" data-controller=\"web-share\" data-action=\"web-share#share\" data-web-share-url-value=\"")
+    html.escape(a, &out, transfer)
+    a.append_str(&out, "\" data-web-share-text-value=\"This is your own private sign-in URL, DO NOT SHARE IT. Use it to sign-in on another device or if you get locked out.\" data-web-share-title-value=\"Your sign-in link\">\n        <span class=\"for-screen-reader\">Share auto-login link</span>\n        <img aria-hidden=\"true\" class=\"flex-item-no-shrink colorize--black\" src=\"/assets/share-bf28da4f.svg\" width=\"20\" height=\"20\" />\n</button>    </div>\n  </div>\n</fieldset>\n\n</section>\n\n")
+}
+
+// profile_membership.html
+fn profile_membership(a: Allocator, inout out: Buf(u8), room_id: i64, name: []u8, param_key: []u8, direct: bool, involvement: []u8) void {
+    a.append_str(&out, "<li class=\"flex align-center gap margin-none min-width membership-item\">\n  <a class=\"overflow-ellipsis fill-shade txt-primary txt-undecorated\" href=\"/rooms/")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "\">\n    <strong>")
+    html.escape(a, &out, name)
+    a.append_str(&out, "</strong>\n</a>\n  <hr class=\"separator\" aria-hidden=\"true\">\n\n  <span class=\"txt-small\">\n    <turbo-frame id=\"involvement_")
+    a.append_str(&out, param_key)
+    a.append_str(&out, "_")
+    a.append_int(&out, room_id)
+    a.append_str(&out, "\">\n      ")
+    involvement_button(a, &out, room_id, param_key, direct, involvement)
+    a.append_str(&out, "\n</turbo-frame>  </span>\n</li>\n")
+}
+
+// profile_nav.html
+fn profile_nav(a: Allocator, inout out: Buf(u8), back: []u8) void {
+    a.append_str(&out, "  <div class=\"flex-item-justify-start\">\n    <a class=\"btn\" href=\"")
+    html.escape(a, &out, back)
+    a.append_str(&out, "\"><img aria-hidden=\"true\" src=\"/assets/arrow-left-abe40556.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Go Back</span></a>\n  </div>\n\n  <div class=\"flex-item-justify-end\">\n    <form data-controller=\"sessions\" action=\"/session\" accept-charset=\"UTF-8\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"delete\" />\n      <input type=\"hidden\" name=\"push_subscription_endpoint\" id=\"push_subscription_endpoint\" data-sessions-target=\"pushSubscriptionEndpoint\" />\n\n      <button class=\"btn\" data-action=\"sessions#logout:prevent\">\n        <img aria-hidden=\"true\" src=\"/assets/logout-a6131db1.svg\" />\n        <span class=\"for-screen-reader\">Log out</span>\n      </button>\n</form>  </div>\n")
+}
+
 // quick_boost.html
 fn quick_boost(a: Allocator, inout out: Buf(u8), m: model.MessageView, ch: []u8, name: []u8) void {
     a.append_str(&out, "\n          <form data-turbo-frame=\"boosting_message_")
@@ -465,8 +703,8 @@ fn recents(a: Allocator, inout out: Buf(u8), recent: Buf(Buf(u8)), base: []u8) v
 }
 
 // room.html
-fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
-    layout_top(a, &out, room.display, user, vapid, logo_v)
+fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, browser: str, operating_system: str, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
+    layout_top(a, &out, room.display, user, vapid, logo_v, css)
     a.append_str(&out, "\n\n\n  <meta name=\"turbo-cache-control\" content=\"no-preview\">\n  <meta name=\"current-room-id\" content=\"")
     a.append_int(&out, room.id)
     a.append_str(&out, "\">  </head>\n\n  <body class=\"sidebar")
@@ -505,9 +743,15 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     } else {
     a.append_str(&out, "room")
     }
-    a.append_str(&out, "</span>\n      </button>\n</turbo-frame>\n    <dialog data-notifications-target=\"notAllowedNotice\" class=\"dialog pad center center-block border-radius border shadow\" style=\"--inline-space: var(--block-space)\">\n      <div class=\"flex flex-column txt-align-center\">\n        <span class=\"btn btn--faux center txt-x-large\">\n          <img aria-hidden=\"true\" src=\"/assets/notification-bell-alert-b467cde7.svg\" width=\"48\" height=\"48\" />\n          <span class=\"for-screen-reader\">Notifications alert</span>\n        </span>\n\n        <section>\n          <h1 class=\"txt-large margin-none\">Notifications aren’t allowed</h1>\n          <div class=\"txt-align-start margin-block-start\">\n              <details class=\"notifications-help\" data-notifications-target=\"details\">\n    <summary class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/external/web-24ffe636.svg\" width=\"20\" height=\"20\" />\n      <strong>Check your Mozilla settings</strong>\n      <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n    </summary>\n\n        <p>Ensure notifications are enabled for <em>")
+    a.append_str(&out, "</span>\n      </button>\n</turbo-frame>\n    <dialog data-notifications-target=\"notAllowedNotice\" class=\"dialog pad center center-block border-radius border shadow\" style=\"--inline-space: var(--block-space)\">\n      <div class=\"flex flex-column txt-align-center\">\n        <span class=\"btn btn--faux center txt-x-large\">\n          <img aria-hidden=\"true\" src=\"/assets/notification-bell-alert-b467cde7.svg\" width=\"48\" height=\"48\" />\n          <span class=\"for-screen-reader\">Notifications alert</span>\n        </span>\n\n        <section>\n          <h1 class=\"txt-large margin-none\">Notifications aren’t allowed</h1>\n          <div class=\"txt-align-start margin-block-start\">\n              <details class=\"notifications-help\" data-notifications-target=\"details\">\n    <summary class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/external/web-24ffe636.svg\" width=\"20\" height=\"20\" />\n      <strong>Check your ")
+    html.escape(a, &out, browser)
+    a.append_str(&out, " settings</strong>\n      <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n    </summary>\n\n        <p>Ensure notifications are enabled for <em>")
     a.append_str(&out, base)
-    a.append_str(&out, "/</em> in your web browser settings.</p>\n  </details>\n\n            <details class=\"notifications-help hide-in-browser\" data-notifications-target=\"details\">\n  <summary class=\"btn\">\n    <img aria-hidden=\"true\" src=\"/assets/external/gear-50e77d2b.svg\" width=\"20\" height=\"20\" />\n    <strong>Check your  settings</strong>\n    <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n  </summary>\n\n      <p>Ensure notifications are allowed for Mozilla in your system settings.</p>\n</details>\n\n              <details class=\"notifications-help pwa__instructions hide-in-pwa\" data-controller=\"pwa-install\" data-pwa-install-prompting-class=\"pwa--can-install\" data-notifications-target=\"details\">\n    <summary class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" width=\"20\" height=\"20\" />\n      <strong>Install Campfire as a web app.</strong>\n      <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n    </summary>\n\n        <p>Some platforms require you to install Campfire as a web app to receive push notifications.</p>\n\n    <div class=\"margin-block-start txt-align-center pwa__installer\">\n      <hr class=\"separator margin-block\">\n      <button class=\"btn btn--reversed center\" data-action=\"pwa-install#promptInstall\">\n        <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" />\n        Install now\n      </button>\n    </div>\n  </details>\n\n          </div>\n        </section>\n\n        <form method=\"dialog\" class=\"flex align-center gap center\">\n          <button class=\"btn dialog__close\" autofocus=\"true\">\n            <span class=\"for-screen-reader\">Close</span>\n            <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" width=\"20\" height=\"20\" />\n          </button>\n        </form>\n      </div>\n    </dialog>\n  </span>\n</span>    </nav>\n\n\n    <main id=\"main-content\">\n\n<div id=\"message-area\" class=\"message-area\" contents=\"true\" data-controller=\"messages presence drop-target\" data-action=\"turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged\" data-messages-first-of-day-class=\"message--first-of-day\" data-messages-formatted-class=\"message--formatted\" data-messages-me-class=\"message--me\" data-messages-mentioned-class=\"message--mentioned\" data-messages-threaded-class=\"message--threaded\" data-messages-page-url-value=\"")
+    a.append_str(&out, "/</em> in your web browser settings.</p>\n  </details>\n\n            <details class=\"notifications-help hide-in-browser\" data-notifications-target=\"details\">\n  <summary class=\"btn\">\n    <img aria-hidden=\"true\" src=\"/assets/external/gear-50e77d2b.svg\" width=\"20\" height=\"20\" />\n    <strong>Check your ")
+    html.escape(a, &out, operating_system)
+    a.append_str(&out, " settings</strong>\n    <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n  </summary>\n\n      <p>Ensure notifications are allowed for ")
+    html.escape(a, &out, browser)
+    a.append_str(&out, " in your system settings.</p>\n</details>\n\n              <details class=\"notifications-help pwa__instructions hide-in-pwa\" data-controller=\"pwa-install\" data-pwa-install-prompting-class=\"pwa--can-install\" data-notifications-target=\"details\">\n    <summary class=\"btn\">\n      <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" width=\"20\" height=\"20\" />\n      <strong>Install Campfire as a web app.</strong>\n      <img aria-hidden=\"true\" class=\"disclosure\" src=\"/assets/disclosure-26d63471.svg\" width=\"10\" height=\"10\" />\n    </summary>\n\n        <p>Some platforms require you to install Campfire as a web app to receive push notifications.</p>\n\n    <div class=\"margin-block-start txt-align-center pwa__installer\">\n      <hr class=\"separator margin-block\">\n      <button class=\"btn btn--reversed center\" data-action=\"pwa-install#promptInstall\">\n        <img aria-hidden=\"true\" src=\"/assets/external/install-f762b3be.svg\" />\n        Install now\n      </button>\n    </div>\n  </details>\n\n          </div>\n        </section>\n\n        <form method=\"dialog\" class=\"flex align-center gap center\">\n          <button class=\"btn dialog__close\" autofocus=\"true\">\n            <span class=\"for-screen-reader\">Close</span>\n            <img aria-hidden=\"true\" src=\"/assets/remove-0e7a045d.svg\" width=\"20\" height=\"20\" />\n          </button>\n        </form>\n      </div>\n    </dialog>\n  </span>\n</span>    </nav>\n\n\n    <main id=\"main-content\">\n\n<div id=\"message-area\" class=\"message-area\" contents=\"true\" data-controller=\"messages presence drop-target\" data-action=\"turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged\" data-messages-first-of-day-class=\"message--first-of-day\" data-messages-formatted-class=\"message--formatted\" data-messages-me-class=\"message--me\" data-messages-mentioned-class=\"message--mentioned\" data-messages-threaded-class=\"message--threaded\" data-messages-page-url-value=\"")
     a.append_str(&out, base)
     a.append_str(&out, "/rooms/")
     a.append_int(&out, room.id)
@@ -559,9 +803,32 @@ fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model
     layout_bottom(a, &out)
 }
 
+// room_form.html
+fn room_form(a: Allocator, inout out: Buf(u8), room_id: i64, name: []u8) void {
+    a.append_str(&out, "<section class=\"panel txt-align-center\" style=\"view-transition-name: ")
+    if (room_id == 0) {
+    a.append_str(&out, "new-room")
+    } else {
+    a.append_str(&out, "edit-room-")
+    a.append_int(&out, room_id)
+    }
+    a.append_str(&out, "\">\n  <form action=\"/rooms/opens")
+    if (room_id != 0) {
+    a.append_str(&out, "/")
+    a.append_int(&out, room_id)
+    }
+    a.append_str(&out, "\" method=\"post\">")
+    if (room_id != 0) {
+    a.append_str(&out, "<input type=\"hidden\" name=\"_method\" value=\"patch\" />")
+    }
+    a.append_str(&out, "\n    <div class=\"flex align-center gap\">\n      <label class=\"flex-item-grow txt-large\"><input name=\"room[name]\" id=\"room_name\" class=\"input full-width\" required=\"required\" autofocus=\"autofocus\" placeholder=\"Name the room\" type=\"text\" value=\"")
+    html.escape(a, &out, name)
+    a.append_str(&out, "\" /><span class=\"for-screen-reader\">Name this room</span></label>\n    </div>\n    <hr class=\"margin-block borderless\" />\n    <section class=\"room-access margin-block pad-inline fill-shade border-radius\">Everyone</section>\n    <button name=\"button\" type=\"submit\" class=\"btn btn--reversed txt-large center\"><img aria-hidden=\"true\" src=\"/assets/check-7897ff7e.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Save</span></button>\n  </form>\n</section>\n")
+}
+
 // search.html
-fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, admin: bool, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
-    layout_top(a, &out, "Search", user, vapid, logo_v)
+fn search_index(a: Allocator, inout out: Buf(u8), user: model.UserView, messages: Buf(model.MessageView), recent: Buf(Buf(u8)), has_query: bool, query: []u8, has_q: bool, q: []u8, return_room: i64, base: []u8, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, inout frags: fragcache.Cache, inout cuts: Buf(i64)) void {
+    layout_top(a, &out, "Search", user, vapid, logo_v, css)
     a.append_str(&out, "\n\n  </head>\n\n  <body class=\"sidebar searches")
     if (admin) {
     a.append_str(&out, " admin")
@@ -601,8 +868,8 @@ fn service_worker(a: Allocator, inout out: Buf(u8)) void {
 }
 
 // sidebar.html
-fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) void {
-    layout_top(a, &out, "Campfire", user, vapid, logo_v)
+fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) void {
+    layout_top(a, &out, "Campfire", user, vapid, logo_v, css)
     a.append_str(&out, "\n\n  </head>\n\n  <body class=\"")
     if (admin) {
     a.append_str(&out, "admin")

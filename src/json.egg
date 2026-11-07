@@ -354,3 +354,14 @@ fn quote(a: Allocator, inout out: Buf(u8), s: []u8, html_safe: bool) void {
     }
     a.push(&out, '"')
 }
+fn member(a: Allocator, object_text: []u8, name: str) ?Buf(u8) {
+    var members: Buf(Member) = .empty
+    defer a.free(members)
+    if (!object(a, &members, object_text)) { return null }
+    var i = 0
+    while (i < @len(members)) {
+        if (members[i].key == name) { return a.concat(members[i].value, "") }
+        i = i + 1
+    }
+    return null
+}

@@ -1,0 +1,45 @@
+// libcurl owns each reply until copied into Egg's allocator.
+uses alloc
+allow unsafe
+link "cfwebhook"
+link "curl"
+extern fn cf_webhook_post(url: *u8, payload: *u8, length: usize) *u8
+extern fn cf_webhook_body(reply: *u8) *u8
+extern fn cf_webhook_length(reply: *u8) usize
+extern fn cf_webhook_type(reply: *u8) *u8
+extern fn cf_webhook_timeout(reply: *u8) i64
+extern fn cf_webhook_status(reply: *u8) i64
+extern fn cf_webhook_error(reply: *u8) i32
+extern fn cf_webhook_free(reply: *u8) void
+extern fn cf_webhook_type_length(reply: *u8) usize
+const Reply = owned struct {
+    status: i64
+    timeout: i64
+    code: i32
+    content_type: Buf(u8)
+    body: Buf(u8)
+    fn deinit(sink self: Reply, a: Allocator) void {
+        a.free(self.content_type)
+        a.free(self.body)
+        @forget(self)
+    }
+}
+fn post(a: Allocator, url: []u8, payload: []u8) !Reply {
+    const endpoint = a.concat(url, "\0")
+    defer a.free(endpoint)
+    const r = cf_webhook_post(@bufPtr(endpoint), @strPtr(payload), @as(usize, @len(payload)))
+    if (r == null) { return error.OutOfMemory }
+    defer cf_webhook_free(r)
+    const type = cf_webhook_type(r)
+    return Reply{ .timeout = cf_webhook_timeout(r), .status = cf_webhook_status(r), .code = cf_webhook_error(r), .content_type = a.concat(@sliceFromPtr(type, @as(i64, cf_webhook_type_length(r))), ""), .body = a.concat(@sliceFromPtr(cf_webhook_body(r), @as(i64, cf_webhook_length(r))), "") }
+}
+extern fn cf_unfurl_get(url: *u8) *u8
+fn get(a: Allocator, url: []u8) !Reply {
+    const endpoint = a.concat(url, "\0")
+    defer a.free(endpoint)
+    const r = cf_unfurl_get(@bufPtr(endpoint))
+    if (r == null) { return error.OutOfMemory }
+    defer cf_webhook_free(r)
+    const type = cf_webhook_type(r)
+    return Reply{ .timeout = 5, .status = cf_webhook_status(r), .code = cf_webhook_error(r), .content_type = a.concat(@sliceFromPtr(type, @as(i64, cf_webhook_type_length(r))), ""), .body = a.concat(@sliceFromPtr(cf_webhook_body(r), @as(i64, cf_webhook_length(r))), "") }
+}

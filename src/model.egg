@@ -3,6 +3,9 @@
 // copied out of SQLite as it is.
 uses alloc, rand, time
 
+const push = @import("push.egg")
+const uploads = @import("uploads.egg")
+const webhook = @import("webhook.egg")
 const text = @import("std/text")
 const sqlite = @import("sqlite.egg")
 const tf = @import("timefmt.egg")
@@ -82,6 +85,97 @@ const RoomView = owned struct {
     }
 }
 
+const ProfileMembership = owned struct {
+    room_id: i64
+    name: Buf(u8)
+    param_key: Buf(u8)
+    direct: bool
+    involvement: Buf(u8)
+
+    fn deinit(sink self: ProfileMembership, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.param_key)
+        a.free(self.involvement)
+        @forget(self)
+    }
+}
+
+const BotRoom = owned struct {
+    id: i64
+    name: Buf(u8)
+
+    fn deinit(sink self: BotRoom, a: Allocator) void {
+        a.free(self.name)
+        @forget(self)
+    }
+}
+
+const BotView = owned struct {
+    id: i64
+    name: Buf(u8)
+    key: Buf(u8)
+    rooms: Buf(BotRoom)
+
+    fn deinit(sink self: BotView, a: Allocator) void {
+        a.free(self.name)
+        a.free(self.key)
+        a.free(self.rooms)
+        @forget(self)
+    }
+}
+
+fn bots(a: Allocator, db: sqlite.Db) !Buf(BotView) {
+    var out: Buf(BotView) = .empty
+    errdefer a.free(out)
+    var st = try db.prepare("SELECT id, name, bot_token FROM users WHERE role = 2 AND status = 0 ORDER BY LOWER(name)")
+    defer st.finalize()
+    while (try st.next()) {
+        const id = st.int(0)
+        var key: Buf(u8) = .empty
+        errdefer a.free(key)
+        a.append_int(&key, id)
+        a.push(&key, '-')
+        const token = st.text(a, 2)
+        a.append_str(&key, token)
+        a.free(token)
+        var rooms: Buf(BotRoom) = .empty
+        errdefer a.free(rooms)
+        var sr = try db.prepare("SELECT rooms.id, rooms.name FROM rooms JOIN memberships ON memberships.room_id = rooms.id WHERE memberships.user_id = ? AND rooms.type != 'Rooms::Direct' ORDER BY LOWER(rooms.name)")
+        defer sr.finalize()
+        try sr.bind_int(1, id)
+        while (try sr.next()) {
+            a.push(&rooms, BotRoom{ .id = sr.int(0), .name = sr.text(a, 1) })
+        }
+        a.push(&out, BotView{ .id = id, .name = st.text(a, 1), .key = key, .rooms = rooms })
+    }
+    return out
+}
+
+fn profile_memberships(a: Allocator, db: sqlite.Db, user: i64, direct: bool) !Buf(ProfileMembership) {
+    var out: Buf(ProfileMembership) = .empty
+    errdefer a.free(out)
+    var st = try db.prepare("SELECT rooms.id, rooms.name, rooms.type, memberships.involvement FROM memberships JOIN rooms ON rooms.id = memberships.room_id WHERE memberships.user_id = ? ORDER BY LOWER(rooms.name)")
+    defer st.finalize()
+    try st.bind_int(1, user)
+    while (try st.next()) {
+        const kind = st.text(a, 2)
+        defer a.free(kind)
+        const is_direct = kind == "Rooms::Direct"
+        if (is_direct != direct) {
+            continue
+        }
+        const name = if (st.is_null(1)) a.concat("", "") else st.text(a, 1)
+        defer a.free(name)
+        const display = try display_name(a, db, st.int(0), is_direct, name, user)
+        const key = if (is_direct) a.concat("rooms_direct", "") else if (kind == "Rooms::Closed") a.concat("rooms_closed", "") else a.concat("rooms_open", "")
+        a.push(&out, ProfileMembership{
+            .room_id = st.int(0), .name = display, .param_key = key, .direct = is_direct,
+            .involvement = if (st.is_null(3)) a.concat("", "") else st.text(a, 3),
+        })
+    }
+    return out
+}
+
 // A user, from columns i (id), i+1 (name), i+2 (bio), i+3 (updated_at) of st.
 fn user_from(a: Allocator, st: sqlite.Stmt, i: i32, sid_key: []u8) UserView {
     const id = st.int(i)
@@ -141,10 +235,14 @@ fn read_messages(a: Allocator, db: sqlite.Db, sid_key: []u8, inout st: sqlite.St
     defer a.free(newest_first)
     while (try st.next()) {
         var body = st.text(a, 5)
+        errdefer a.free(body)
         if (sanitize.has_markup(body)) {
             const clean = sanitize.sanitize(a, body)
             a.free(@replace(&body, clean))
         }
+        const rendered = try uploads.render_richtext(a, db, body)
+        a.free(@replace(&body, rendered))
+        try uploads.presentation(a, db, &body, st.int(0))
         const all_emoji = emoji.all_emoji_html(body)
         a.push(&newest_first, MessageView{
             .id = st.int(0),
@@ -386,6 +484,14 @@ const SidebarRoom = owned struct {
     }
 }
 
+fn open_sidebar_room(a: Allocator, id: i64, name: []u8) SidebarRoom {
+    return SidebarRoom{ .id = id, .kind = a.concat("open", ""), .name = a.concat(name, ""), .unread = false }
+}
+
+fn sidebar_room_view(a: Allocator, id: i64, name: []u8, kind: []u8) SidebarRoom {
+    return SidebarRoom{ .id = id, .kind = a.concat(kind, ""), .name = a.concat(name, ""), .unread = false }
+}
+
 const Sidebar = owned struct {
     directs: Buf(SidebarDirect)
     rooms: Buf(SidebarRoom)
@@ -598,12 +704,26 @@ fn db_now(a: Allocator, inout out: Buf(u8), clock: Clock) i64 {
 // members' unread marks), in one transaction: one turn at the write lock.
 // The new message's id.
 fn create_message(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, room: i64, user: i64, has_body: bool, body: []u8, client_id: []u8) !i64 {
+    return create_message_notify(a, db, clock, rng, room, user, has_body, body, client_id, "")
+}
+
+fn create_message_notify(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random, room: i64, user: i64, has_body: bool, body: []u8, client_id: []u8, mention_key: []u8) !i64 {
     const client = if (@len(client_id) > 0) a.concat(client_id, "") else uuid(a, rng)
     defer a.free(client)
     try db.exec("BEGIN IMMEDIATE")
     const id = write_message(a, db, clock, room, user, has_body, body, client) catch |e| {
         db.exec("ROLLBACK") catch {}
         return e
+    }
+    if (@len(mention_key) > 0) {
+        push.enqueue(a, db, mention_key, id) catch |e| {
+            db.exec("ROLLBACK") catch {}
+            return e
+        }
+        webhook.enqueue(a, db, mention_key, id) catch |e| {
+            db.exec("ROLLBACK") catch {}
+            return e
+        }
     }
     try db.exec("COMMIT")
     return id

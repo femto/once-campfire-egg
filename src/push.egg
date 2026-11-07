@@ -1,0 +1,175 @@
+uses alloc, time
+allow unsafe
+link "cfwebhook"
+link "crypto"
+link "curl"
+const richtext = @import("richtext.egg")
+const webhook = @import("webhook.egg")
+const crypto = @import("crypto.egg")
+const codec = @import("codec.egg")
+const json = @import("json.egg")
+const sqlite = @import("sqlite.egg")
+const text = @import("std/text")
+extern fn cf_push_public(private_bytes: *u8, out: *u8) i32
+extern fn cf_push_sign(private_bytes: *u8, data: *u8, len: i32, out: *u8) i32
+extern fn cf_push_valid(public_bytes: *u8, n: i32) i32
+extern fn cf_push_encrypt(public_bytes: *u8, auth: *u8, payload: *u8, len: i32, out: *u8) i32
+extern fn cf_push_url_valid(url: *u8, allow_local: i32) i32
+extern fn cf_push_post(url: *u8, body: *u8, length: i32, authorization: *u8, allow_local: i32) i32
+fn public_key(a: Allocator, private_bytes: []u8) !Buf(u8) {
+    if (@len(private_bytes) != 32) { return error.InvalidVapid }
+    const raw = a.alloc(65, @as(u8, 0))
+    defer a.free(raw)
+    if (cf_push_public(@strPtr(private_bytes), @bufPtr(raw)) == 0) { return error.InvalidVapid }
+    var out: Buf(u8) = .empty
+    codec.base64url_encode(a, &out, raw)
+    return out
+}
+fn valid(a: Allocator, endpoint: []u8, public_bytes: []u8, auth: []u8, allow_local: bool) bool {
+    const url = a.concat(endpoint, "\0")
+    defer a.free(url)
+    return @len(public_bytes) == 65 and @len(auth) == 16 and cf_push_valid(@strPtr(public_bytes), 65) == 1 and cf_push_url_valid(@bufPtr(url), if (allow_local) 1 else 0) == 1
+}
+fn send(a: Allocator, clock: Clock, endpoint: []u8, public_bytes: []u8, auth: []u8, payload: []u8, private_bytes: []u8, vapid_public: []u8, subject: []u8, allow_local: bool) !i64 {
+    if (@len(private_bytes) != 32 or @len(public_bytes) != 65 or @len(auth) != 16 or @len(payload) > 3992) { return error.InvalidPush }
+    const scheme = text.find(endpoint, "://") orelse { return error.InvalidPush }
+    const end = text.find_from(endpoint, "/", scheme + 3) orelse @len(endpoint)
+    const audience = endpoint[0..end]
+    var claims: Buf(u8) = .empty
+    defer a.free(claims)
+    a.append_str(&claims, "{\"aud\":")
+    json.encode_plain(a, &claims, audience)
+    a.append_str(&claims, ",\"exp\":")
+    a.append_int(&claims, clock.now() / 1000000000 + 43200)
+    a.append_str(&claims, ",\"sub\":")
+    json.encode_plain(a, &claims, subject)
+    a.push(&claims, '}')
+    var jwt: Buf(u8) = .empty
+    defer a.free(jwt)
+    codec.base64url_encode(a, &jwt, "{\"typ\":\"JWT\",\"alg\":\"ES256\"}")
+    a.push(&jwt, '.')
+    codec.base64url_encode(a, &jwt, claims)
+    const signature = a.alloc(64, @as(u8, 0))
+    defer a.free(signature)
+    if (cf_push_sign(@strPtr(private_bytes), @bufPtr(jwt), @as(i32, @len(jwt)), @bufPtr(signature)) == 0) { return error.InvalidVapid }
+    a.push(&jwt, '.')
+    codec.base64url_encode(a, &jwt, signature)
+    const authorization = a.concat("Authorization: vapid t=", jwt, ",k=", vapid_public, "\0")
+    defer a.free(authorization)
+    const encrypted = a.alloc(@len(payload) + 104, @as(u8, 0))
+    defer a.free(encrypted)
+    const n = cf_push_encrypt(@strPtr(public_bytes), @strPtr(auth), @strPtr(payload), @as(i32, @len(payload)), @bufPtr(encrypted))
+    if (n < 0) { return error.InvalidPush }
+    const url = a.concat(endpoint, "\0")
+    defer a.free(url)
+    return @as(i64, cf_push_post(@bufPtr(url), @bufPtr(encrypted), n, @bufPtr(authorization), if (allow_local) 1 else 0))
+}
+
+fn enqueue(a: Allocator, db: sqlite.Db, mention_key: []u8, id: i64) !void {
+    var message = try db.prepare("SELECT m.room_id, m.creator_id, u.name, r.type, t.body FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id LEFT JOIN action_text_rich_texts t ON t.record_id=m.id AND t.record_type='Message' AND t.name='body' WHERE m.id=?")
+    defer message.finalize()
+    try message.bind_int(1, id)
+    if (!try message.next()) { return }
+    const room = message.int(0)
+    const creator = message.int(1)
+    const name = message.text(a, 2)
+    defer a.free(name)
+    const kind = message.text(a, 3)
+    defer a.free(kind)
+    const body = message.text(a, 4)
+    defer a.free(body)
+    const plain = richtext.plain_text(a, body)
+    defer a.free(plain)
+    var subscribers = try db.prepare("SELECT ps.id, ms.user_id, ms.involvement FROM push_subscriptions ps JOIN users u ON u.id=ps.user_id AND u.status=0 JOIN memberships ms ON ms.user_id=ps.user_id AND ms.room_id=? WHERE ps.user_id!=? AND ms.involvement NOT IN ('nothing','invisible') AND (ms.connected_at IS NULL OR ms.connected_at < STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW', '-60 seconds'))")
+    defer subscribers.finalize()
+    try subscribers.bind_int(1, room)
+    try subscribers.bind_int(2, creator)
+    while (try subscribers.next()) {
+        const setting = subscribers.text(a, 2)
+        defer a.free(setting)
+        var sgid: Buf(u8) = .empty
+        defer a.free(sgid)
+        webhook.mention_id(a, &sgid, mention_key, subscribers.int(1))
+        if (kind != "Rooms::Direct" and setting != "everything" and !webhook.mentioned(a, body, sgid)) { continue }
+        var badge = try db.prepare("SELECT COUNT(*) FROM memberships WHERE user_id=? AND unread_at IS NOT NULL AND involvement NOT IN ('nothing','invisible')")
+        defer badge.finalize()
+        try badge.bind_int(1, subscribers.int(1))
+        var count = 0
+        if (try badge.next()) { count = badge.int(0) }
+        var payload: Buf(u8) = .empty
+        defer a.free(payload)
+        a.append_str(&payload, "{\"title\":")
+        const short_name = bounded(a, name)
+        defer a.free(short_name)
+        json.encode_plain(a, &payload, short_name)
+        a.append_str(&payload, ",\"options\":{\"body\":")
+        const short = bounded(a, plain)
+        defer a.free(short)
+        json.encode_plain(a, &payload, short)
+        a.append_str(&payload, ",\"icon\":\"/account/logo\",\"tag\":\"room:")
+        a.append_int(&payload, room)
+        a.append_str(&payload, "\",\"data\":{\"path\":\"/rooms/")
+        a.append_int(&payload, room)
+        a.append_str(&payload, "/@")
+        a.append_int(&payload, id)
+        a.append_str(&payload, "\",\"badge\":")
+        a.append_int(&payload, count)
+        a.append_str(&payload, "}}}")
+        var insert = try db.prepare("INSERT OR IGNORE INTO egg_push_jobs (subscription_id, message_id, payload, attempts, available_after) VALUES (?, ?, ?, 0, 0)")
+        defer insert.finalize()
+        try insert.bind_int(1, subscribers.int(0))
+        try insert.bind_int(2, id)
+        try insert.bind(3, payload)
+        while (try insert.next()) {}
+    }
+}
+const Job = owned struct {
+    id: i64
+    subscription: i64
+    attempts: i64
+    endpoint: Buf(u8)
+    public_key: Buf(u8)
+    auth: Buf(u8)
+    payload: Buf(u8)
+    valid_source: bool
+    fn deinit(sink self: Job, a: Allocator) void {
+        a.free(self.endpoint)
+        a.free(self.public_key)
+        a.free(self.auth)
+        a.free(self.payload)
+        @forget(self)
+    }
+}
+fn next_job(a: Allocator, db: sqlite.Db, clock: Clock) !?Job {
+    var st = try db.prepare("SELECT j.id, j.subscription_id, j.attempts, ps.endpoint, ps.p256dh_key, ps.auth_key, j.payload, (j.message_id IS NULL OR EXISTS (SELECT 1 FROM messages WHERE id=j.message_id)) FROM egg_push_jobs j LEFT JOIN push_subscriptions ps ON ps.id=j.subscription_id WHERE j.available_after<=? ORDER BY j.id LIMIT 1")
+    defer st.finalize()
+    try st.bind_int(1, clock.now() / 1000000000)
+    if (!try st.next()) { return null }
+    return Job{ .id = st.int(0), .subscription = st.int(1), .attempts = st.int(2), .endpoint = st.text(a, 3), .public_key = st.text(a, 4), .auth = st.text(a, 5), .payload = st.text(a, 6), .valid_source = st.int(7) == 1 }
+}
+fn finish(db: sqlite.Db, clock: Clock, id: i64, subscription: i64, status: i64, attempts: i64) !void {
+    if (status == 404 or status == 410) {
+        var remove = try db.prepare("DELETE FROM push_subscriptions WHERE id=?")
+        defer remove.finalize()
+        try remove.bind_int(1, subscription)
+        while (try remove.next()) {}
+    }
+    if ((status < 0 or status == 429 or status >= 500) and attempts < 2) {
+        var retry = try db.prepare("UPDATE egg_push_jobs SET attempts=attempts+1, available_after=? WHERE id=?")
+        defer retry.finalize()
+        try retry.bind_int(1, clock.now() / 1000000000 + (attempts + 1) * 5)
+        try retry.bind_int(2, id)
+        while (try retry.next()) {}
+    } else {
+        var remove = try db.prepare("DELETE FROM egg_push_jobs WHERE id=?")
+        defer remove.finalize()
+        try remove.bind_int(1, id)
+        while (try remove.next()) {}
+    }
+}
+fn bounded(a: Allocator, plain: []u8) Buf(u8) {
+    if (@len(plain) <= 512) { return a.concat(plain, "") }
+    var end = 512
+    while (end > 0 and (plain[end] & 192) == 128) { end = end - 1 }
+    return a.concat(plain[0..end], "")
+}

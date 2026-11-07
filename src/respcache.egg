@@ -88,8 +88,8 @@ const Cache = owned struct {
     }
 
     // Send entry i, after the request's own headers (own).
-    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, own: []u8, keep: bool) !void {
-        return http.write_parts(c, a, "200 OK", own, self.entries[i].headers, self.entries[i].body, keep)
+    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, own: []u8, req: http.Request) !void {
+        return http.conditional(c, a, req, own, self.entries[i].headers, self.entries[i].body)
     }
 
     // Keep the response for key, if nothing has committed since gen.

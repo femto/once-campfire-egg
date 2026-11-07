@@ -45,8 +45,8 @@ const Cache = owned struct {
         return -1
     }
 
-    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, keep: bool) !void {
-        return http.write_parts(c, a, "200 OK", "", self.entries[i].headers, self.entries[i].body, keep)
+    fn send(self: Cache, c: TcpConn, a: Allocator, i: i64, req: http.Request) !void {
+        return http.conditional(c, a, req, "", self.entries[i].headers, self.entries[i].body)
     }
 
     fn put(inout self: Cache, a: Allocator, key: []u8, headers: []u8, body: []u8) void {

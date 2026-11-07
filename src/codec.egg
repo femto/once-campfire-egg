@@ -180,6 +180,19 @@ fn form_value(a: Allocator, form: []u8, name: str) ?Buf(u8) {
     return null
 }
 
+// Every occurrence of a form field, in request order, decoded separately.
+fn form_values(a: Allocator, form: []u8, name: str) Buf(Buf(u8)) {
+    var out: Buf(Buf(u8)) = .empty
+    var i = 0
+    while (i < @len(form)) {
+        var end = i
+        while (end < @len(form) and form[end] != '&') { end = end + 1 }
+        if (form_value(a, form[i..end], name)) |value| { a.push(&out, value) }
+        i = end + 1
+    }
+    return out
+}
+
 // The raw value of the cookie called name in a Cookie header, or null.
 fn cookie_value(a: Allocator, header: []u8, name: str) ?Buf(u8) {
     var i = 0

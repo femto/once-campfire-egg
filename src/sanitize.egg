@@ -12,7 +12,7 @@ uses alloc
 const text = @import("std/text")
 
 // ContentFilters::SanitizeTags::ALLOWED_TAGS, space-separated and padded.
-const TAGS = " a abbr acronym address b big blockquote br cite code dd del dfn div dl dt em h1 h2 h3 h4 h5 h6 hr i ins kbd li ol p pre samp small span strong sub sup time tt ul var s u mark table thead tbody tfoot tr th td action-text-attachment figure figcaption "
+const TAGS = " img actiontext-opengraph-embed a abbr acronym address b big blockquote br cite code dd del dfn div dl dt em h1 h2 h3 h4 h5 h6 hr i ins kbd li ol p pre samp small span strong sub sup time tt ul var s u mark table thead tbody tfoot tr th td action-text-attachment figure figcaption "
 
 // The attributes both lists allow: SanitizeAttributes' (Action Text's, with
 // the attachment's) and MessagesHelper::AUTO_LINK_ALLOWED_ATTRIBUTES, which

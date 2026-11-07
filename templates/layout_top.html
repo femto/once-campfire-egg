@@ -1,4 +1,4 @@
-<%fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8) %>
+<%fn layout_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, css: []u8) %>
 <!DOCTYPE html>
 <html>
   <head>
@@ -20,4 +20,4 @@
     <link rel="icon" href="/account/logo?v=<%- logo_v %>" type="image/png">
     <link rel="apple-touch-icon" href="/account/logo?v=<%- logo_v %>">
 
-    <%- static_head.ASSETS %>
+    <%- static_head.ASSETS %><% if (@len(css) > 0) { %><style><%- css %></style><% } %>

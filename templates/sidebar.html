@@ -1,5 +1,5 @@
-<%fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) %>
-<% layout_top(a, &out, "Campfire", user, vapid, logo_v) %>
+<%fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) %>
+<% layout_top(a, &out, "Campfire", user, vapid, logo_v, css) %>
 
 
   </head>

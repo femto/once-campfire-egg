@@ -1,0 +1,165 @@
+// Rails-compatible attachable SGIDs and durable bot delivery records.
+uses alloc
+const sqlite = @import("sqlite.egg")
+const crypto = @import("crypto.egg")
+const codec = @import("codec.egg")
+const json = @import("json.egg")
+const text = @import("std/text")
+const richtext = @import("richtext.egg")
+
+fn key(a: Allocator, secret: []u8) Buf(u8) { return crypto.derive_key(a, secret, "signed_global_ids", 64) }
+fn mention_id(a: Allocator, inout out: Buf(u8), k: []u8, id: i64) void {
+    var payload: Buf(u8) = .empty
+    defer a.free(payload)
+    a.append_str(&payload, "{\"_rails\":{\"data\":\"gid://campfire/User/")
+    a.append_int(&payload, id)
+    a.append_str(&payload, "?expires_in\",\"pur\":\"attachable\"}}")
+    var encoded: Buf(u8) = .empty
+    defer a.free(encoded)
+    codec.base64_encode(a, &encoded, payload)
+    var i = 0
+    while (i < @len(encoded)) {
+        if (encoded[i] == '+') { encoded[i] = '-' }
+        if (encoded[i] == '/') { encoded[i] = '_' }
+        i = i + 1
+    }
+    const mac = crypto.hmac_sha1(a, k, encoded)
+    defer a.free(mac)
+    a.append_str(&out, encoded)
+    a.append_str(&out, "--")
+    codec.hex_encode(a, &out, mac)
+}
+fn mentioned(a: Allocator, body: []u8, token: []u8) bool {
+    const wanted = a.concat("sgid=\"", token, "\"")
+    defer a.free(wanted)
+    var at = text.find(body, "<action-text-attachment") orelse -1
+    while (at >= 0) {
+        const end = text.find_from(body, ">", at) orelse @len(body)
+        if (text.contains(body[at..end], wanted)) { return true }
+        at = text.find_from(body, "<action-text-attachment", end) orelse -1
+    }
+    return false
+}
+fn without_mention(a: Allocator, plain: []u8, name: []u8) Buf(u8) {
+    const mention = a.concat("@", name)
+    defer a.free(mention)
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    var at = 0
+    while (at < @len(plain)) {
+        const next = text.find_from(plain, mention, at) orelse @len(plain)
+        a.append_str(&out, plain[at..next])
+        at = next + @len(mention)
+    }
+    return text.trim(a, out)
+}
+// Called in the message's transaction; a reply from the background worker
+// deliberately uses create_message instead, so it cannot start a bot loop.
+fn enqueue(a: Allocator, db: sqlite.Db, k: []u8, id: i64) !void {
+    var message = try db.prepare("SELECT m.room_id, m.creator_id, u.name, r.name, r.type, t.body FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id LEFT JOIN action_text_rich_texts t ON t.record_id=m.id AND t.record_type='Message' AND t.name='body' WHERE m.id=?")
+    defer message.finalize()
+    try message.bind_int(1, id)
+    if (!try message.next()) { return }
+    const room = message.int(0)
+    const creator = message.int(1)
+    const creator_name = message.text(a, 2)
+    defer a.free(creator_name)
+    const room_name = message.text(a, 3)
+    defer a.free(room_name)
+    const kind = message.text(a, 4)
+    defer a.free(kind)
+    const html = message.text(a, 5)
+    defer a.free(html)
+    const plain = richtext.plain_text(a, html)
+    defer a.free(plain)
+    var bots = try db.prepare("SELECT u.id, u.name, u.bot_token, w.url FROM users u JOIN webhooks w ON w.user_id=u.id JOIN memberships ms ON ms.user_id=u.id AND ms.room_id=? WHERE u.role=2 AND u.status=0 AND u.id!=? AND LENGTH(w.url)>0")
+    defer bots.finalize()
+    try bots.bind_int(1, room)
+    try bots.bind_int(2, creator)
+    while (try bots.next()) {
+        const bot = bots.int(0)
+        var sgid: Buf(u8) = .empty
+        defer a.free(sgid)
+        mention_id(a, &sgid, k, bot)
+        if (kind != "Rooms::Direct" and !mentioned(a, html, sgid)) { continue }
+        const name = bots.text(a, 1)
+        defer a.free(name)
+        const token = bots.text(a, 2)
+        defer a.free(token)
+        const url = bots.text(a, 3)
+        defer a.free(url)
+        const trimmed = without_mention(a, plain, name)
+        defer a.free(trimmed)
+        var bot_path: Buf(u8) = .empty
+        defer a.free(bot_path)
+        a.append_str(&bot_path, "/rooms/")
+        a.append_int(&bot_path, room)
+        a.push(&bot_path, '/')
+        a.append_int(&bot_path, bot)
+        a.push(&bot_path, '-')
+        a.append_str(&bot_path, token)
+        a.append_str(&bot_path, "/messages")
+        var message_path: Buf(u8) = .empty
+        defer a.free(message_path)
+        a.append_str(&message_path, "/rooms/")
+        a.append_int(&message_path, room)
+        a.append_str(&message_path, "/@")
+        a.append_int(&message_path, id)
+        var payload: Buf(u8) = .empty
+        defer a.free(payload)
+        a.append_str(&payload, "{\"user\":{\"id\":")
+        a.append_int(&payload, creator)
+        a.append_str(&payload, ",\"name\":")
+        json.encode_plain(a, &payload, creator_name)
+        a.append_str(&payload, "},\"room\":{\"id\":")
+        a.append_int(&payload, room)
+        a.append_str(&payload, ",\"name\":")
+        if (kind == "Rooms::Direct") { a.append_str(&payload, "null") } else { json.encode_plain(a, &payload, room_name) }
+        a.append_str(&payload, ",\"path\":")
+        json.encode_plain(a, &payload, bot_path)
+        a.append_str(&payload, "},\"message\":{\"id\":")
+        a.append_int(&payload, id)
+        a.append_str(&payload, ",\"body\":{\"html\":")
+        json.encode_plain(a, &payload, html)
+        a.append_str(&payload, ",\"plain\":")
+        json.encode_plain(a, &payload, trimmed)
+        a.append_str(&payload, "},\"path\":")
+        json.encode_plain(a, &payload, message_path)
+        a.append_str(&payload, "}}")
+        var insert = try db.prepare("INSERT OR IGNORE INTO egg_webhook_jobs (message_id, bot_id, room_id, url, payload) VALUES (?, ?, ?, ?, ?)")
+        defer insert.finalize()
+        try insert.bind_int(1, id)
+        try insert.bind_int(2, bot)
+        try insert.bind_int(3, room)
+        try insert.bind(4, url)
+        try insert.bind(5, payload)
+        while (try insert.next()) {}
+    }
+}
+const Job = owned struct {
+    message: i64
+    id: i64
+    room: i64
+    bot: i64
+    url: Buf(u8)
+    payload: Buf(u8)
+    fn deinit(sink self: Job, a: Allocator) void {
+        a.free(self.url)
+        a.free(self.payload)
+        @forget(self)
+    }
+}
+fn next_job(a: Allocator, db: sqlite.Db) !?Job {
+    var st = try db.prepare("SELECT id, room_id, bot_id, url, payload, message_id FROM egg_webhook_jobs ORDER BY id LIMIT 1")
+    defer st.finalize()
+    if (!try st.next()) { return null }
+    return Job{ .message = st.int(5), .id = st.int(0), .room = st.int(1), .bot = st.int(2), .url = st.text(a, 3), .payload = st.text(a, 4) }
+}
+fn active_bot(db: sqlite.Db, bot: i64, room: i64, message: i64) !bool {
+    var st = try db.prepare("SELECT 1 FROM users u JOIN memberships ms ON ms.user_id=u.id WHERE u.id=? AND u.role=2 AND u.status=0 AND ms.room_id=? AND EXISTS (SELECT 1 FROM messages WHERE id=? AND room_id=ms.room_id)")
+    defer st.finalize()
+    try st.bind_int(1, bot)
+    try st.bind_int(2, room)
+    try st.bind_int(3, message)
+    return st.next()
+}

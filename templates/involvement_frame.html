@@ -1,0 +1,4 @@
+<%fn involvement_frame(a: Allocator, inout out: Buf(u8), room_id: i64, kind: []u8, setting: []u8) %>
+<turbo-frame data-controller="turbo-frame" data-action="notifications:ready@window-&gt;turbo-frame#load" data-turbo-frame-url-param="/rooms/<%d room_id %>/involvement" id="involvement_rooms_<%- kind %>_<%d room_id %>">
+  <% involvement_button(a, &out, room_id, if (kind == "direct") "rooms_direct" else if (kind == "closed") "rooms_closed" else "rooms_open", kind == "direct", setting) %>
+</turbo-frame>

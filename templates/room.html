@@ -1,5 +1,5 @@
-<%fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, vapid: []u8, logo_v: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
-<% layout_top(a, &out, room.display, user, vapid, logo_v) %>
+<%fn room_show(a: Allocator, inout out: Buf(u8), user: model.UserView, room: model.RoomView, messages: Buf(model.MessageView), base: []u8, browser: str, operating_system: str, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, loaded_ms: i64, stream: []u8, invite: bool, join_code: []u8, inout frags: fragcache.Cache, inout cuts: Buf(i64)) %>
+<% layout_top(a, &out, room.display, user, vapid, logo_v, css) %>
 
 
 
@@ -48,7 +48,7 @@
               <details class="notifications-help" data-notifications-target="details">
     <summary class="btn">
       <img aria-hidden="true" src="/assets/external/web-24ffe636.svg" width="20" height="20" />
-      <strong>Check your Mozilla settings</strong>
+      <strong>Check your <%= browser %> settings</strong>
       <img aria-hidden="true" class="disclosure" src="/assets/disclosure-26d63471.svg" width="10" height="10" />
     </summary>
 
@@ -58,11 +58,11 @@
             <details class="notifications-help hide-in-browser" data-notifications-target="details">
   <summary class="btn">
     <img aria-hidden="true" src="/assets/external/gear-50e77d2b.svg" width="20" height="20" />
-    <strong>Check your  settings</strong>
+    <strong>Check your <%= operating_system %> settings</strong>
     <img aria-hidden="true" class="disclosure" src="/assets/disclosure-26d63471.svg" width="10" height="10" />
   </summary>
 
-      <p>Ensure notifications are allowed for Mozilla in your system settings.</p>
+      <p>Ensure notifications are allowed for <%= browser %> in your system settings.</p>
 </details>
 
               <details class="notifications-help pwa__instructions hide-in-pwa" data-controller="pwa-install" data-pwa-install-prompting-class="pwa--can-install" data-notifications-target="details">

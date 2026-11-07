@@ -1,0 +1,45 @@
+// One-use encrypted notices. AES-GCM authenticates the expiry and text.
+uses alloc, rand, time
+allow unsafe
+link "cfwebhook"
+link "crypto"
+const crypto = @import("crypto.egg")
+const codec = @import("codec.egg")
+const text = @import("std/text")
+extern fn cf_flash_seal(key: *u8, nonce: *u8, data: *u8, length: i32, out: *u8) i32
+extern fn cf_flash_open(key: *u8, nonce: *u8, data: *u8, length: i32, out: *u8) i32
+fn key(a: Allocator, secret: []u8) Buf(u8) { return crypto.derive_key(a, secret, "campfire/flash", 32) }
+fn set(a: Allocator, inout headers: Buf(u8), k: []u8, rng: Random, clock: Clock, message: []u8) void {
+    var nonce = a.alloc(12, @as(u8, 0))
+    defer a.free(nonce)
+    rng.fill(&nonce)
+    var plain: Buf(u8) = .empty
+    defer a.free(plain)
+    a.append_int(&plain, clock.now() + 60 * 1000000000)
+    a.push(&plain, '\n')
+    a.append_str(&plain, message)
+    const encrypted = a.alloc(@len(plain) + 16, @as(u8, 0))
+    defer a.free(encrypted)
+    if (cf_flash_seal(@strPtr(k), @bufPtr(nonce), @bufPtr(plain), @as(i32, @len(plain)), @bufPtr(encrypted)) < 0) { return }
+    const payload = a.concat(nonce, encrypted)
+    defer a.free(payload)
+    a.append_str(&headers, "Set-Cookie: campfire_flash=")
+    codec.base64url_encode(a, &headers, payload)
+    a.append_str(&headers, "; Path=/; HttpOnly; SameSite=Lax; Max-Age=60\r\n")
+}
+fn consume(a: Allocator, k: []u8, cookie: []u8, clock: Clock) Buf(u8) {
+    const token = codec.cookie_value(a, cookie, "campfire_flash") orelse { return .empty }
+    defer a.free(token)
+    var raw: Buf(u8) = .empty
+    defer a.free(raw)
+    if (!codec.base64_decode(a, &raw, token) or @len(raw) < 28 or @len(raw) > 4096) { return .empty }
+    var plain = a.alloc(@len(raw), @as(u8, 0))
+    defer a.free(plain)
+    const n = cf_flash_open(@strPtr(k), @strPtr(raw[0..12]), @strPtr(raw[12..]), @as(i32, @len(raw) - 12), @bufPtr(plain))
+    if (n < 0) { return .empty }
+    a.resize(&plain, @as(i64, n), 0)
+    const split = text.find(plain, "\n") orelse { return .empty }
+    const expiry = text.parse_int(plain[0..split]) orelse { return .empty }
+    if (expiry <= clock.now()) { return .empty }
+    return a.concat(plain[split + 1..], "")
+}

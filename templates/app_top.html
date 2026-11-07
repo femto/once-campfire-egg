@@ -1,5 +1,5 @@
-<%fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) %>
-<% layout_top(a, &out, title, user, vapid, logo_v) %>
+<%fn app_top(a: Allocator, inout out: Buf(u8), title: []u8, user: model.UserView, vapid: []u8, logo_v: []u8, css: []u8, body_class: []u8, admin: bool, head: []u8, nav: []u8) %>
+<% layout_top(a, &out, title, user, vapid, logo_v, css) %>
 
 
 <%- head %>  </head>

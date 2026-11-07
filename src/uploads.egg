@@ -1,0 +1,230 @@
+uses alloc, fs, rand, time
+const richtext = @import("richtext.egg")
+const sanitize = @import("sanitize.egg")
+const http = @import("http.egg")
+const media = @import("media.egg")
+const sqlite = @import("sqlite.egg")
+const crypto = @import("crypto.egg")
+const codec = @import("codec.egg")
+const session = @import("session.egg")
+const tf = @import("timefmt.egg")
+const html = @import("html.egg")
+const text = @import("std/text")
+
+fn path(a: Allocator, root: str, key: []u8) Buf(u8) { return a.concat(root, "/", key[0..2], "/", key[2..4], "/", key) }
+fn write(a: Allocator, files: Fs, rng: Random, root: str, data: []u8) !Buf(u8) {
+    const key = session.base58(a, rng, 28)
+    errdefer a.free(key)
+    const dir = a.concat(root, "/", key[0..2], "/", key[2..4])
+    defer a.free(dir)
+    var i = 1
+    while (i <= @len(dir)) {
+        if (i == @len(dir) or dir[i] == '/') { files.make_dir(dir[0..i]) catch {} }
+        i = i + 1
+    }
+    const filename = a.concat(dir, "/", key)
+    defer a.free(filename)
+    try files.write(filename, data)
+    return key
+}
+fn picture(a: Allocator, files: Fs, rng: Random, root: str, data: []u8) !Buf(u8) {
+    const format = media.image_format(data) orelse { return error.InvalidImage }
+    const key = try write(a, files, rng, root, data)
+    defer a.free(key)
+    const original = path(a, root, key)
+    defer a.free(original)
+    defer files.remove_file(original) catch {}
+    const input = a.concat(format, ":", original, "[0]")
+    defer a.free(input)
+    const output = a.concat(original, ".webp")
+    defer a.free(output)
+    defer files.remove_file(output) catch {}
+    try media.image(a, input, output)
+    return files.read(a, output)
+}
+fn blob(a: Allocator, db: sqlite.Db, clock: Clock, key: []u8, filename: []u8, mime: []u8, data: []u8) !i64 {
+    var stamp: Buf(u8) = .empty
+    defer a.free(stamp)
+    tf.db_time(a, &stamp, clock.now())
+    const digest = crypto.md5(a, data)
+    defer a.free(digest)
+    var checksum: Buf(u8) = .empty
+    defer a.free(checksum)
+    codec.base64_encode(a, &checksum, digest)
+    var st = try db.prepare("INSERT INTO active_storage_blobs (key, filename, content_type, metadata, service_name, byte_size, created_at, checksum) VALUES (?, ?, ?, '{}', 'local', ?, ?, ?)")
+    defer st.finalize()
+    try st.bind(1, key)
+    try st.bind(2, filename)
+    try st.bind(3, mime)
+    try st.bind_int(4, @len(data))
+    try st.bind(5, stamp)
+    try st.bind(6, checksum)
+    while (try st.next()) {}
+    return db.last_id()
+}
+fn attach(db: sqlite.Db, record: str, id: i64, name: str, blob_id: i64) !void {
+    var st = try db.prepare("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES (?, ?, ?, ?, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))")
+    defer st.finalize()
+    try st.bind(1, name)
+    try st.bind(2, record)
+    try st.bind_int(3, id)
+    try st.bind_int(4, blob_id)
+    while (try st.next()) {}
+}
+fn replace_picture(a: Allocator, db: sqlite.Db, clock: Clock, record: str, id: i64, name: str, key: []u8, data: []u8, small_key: []u8) !void {
+    try db.exec("BEGIN IMMEDIATE")
+    update_picture(a, db, clock, record, id, name, key, data, small_key) catch |e| {
+        db.exec("ROLLBACK") catch {}
+        return e
+    }
+    try db.exec("COMMIT")
+}
+fn update_picture(a: Allocator, db: sqlite.Db, clock: Clock, record: str, id: i64, name: str, key: []u8, data: []u8, small_key: []u8) !void {
+    var remove = try db.prepare("DELETE FROM active_storage_attachments WHERE record_type=? AND record_id=? AND name=?")
+    defer remove.finalize()
+    try remove.bind(1, record)
+    try remove.bind_int(2, id)
+    try remove.bind(3, name)
+    while (try remove.next()) {}
+    const blob_id = try blob(a, db, clock, key, if (record == "Account") "logo.png" else "image.webp", if (record == "Account") "image/png" else "image/webp", data)
+    try attach(db, record, id, name, blob_id)
+    if (@len(small_key) > 0) {
+        var preview = try db.prepare("INSERT INTO egg_blob_previews (blob_id, key) VALUES (?, ?)")
+        defer preview.finalize()
+        try preview.bind_int(1, blob_id)
+        try preview.bind(2, small_key)
+        while (try preview.next()) {}
+    }
+    var touch = try db.prepare(if (record == "User") "UPDATE users SET updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id=?" else "UPDATE accounts SET updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id=?")
+    defer touch.finalize()
+    try touch.bind_int(1, id)
+    while (try touch.next()) {}
+}
+fn presentation(a: Allocator, db: sqlite.Db, inout out: Buf(u8), id: i64) !void {
+    var st = try db.prepare("SELECT b.key, b.filename, b.content_type, p.key FROM active_storage_attachments att JOIN active_storage_blobs b ON b.id=att.blob_id LEFT JOIN egg_blob_previews p ON p.blob_id=b.id WHERE att.record_type='Message' AND att.record_id=? AND att.name='attachment'")
+    defer st.finalize()
+    try st.bind_int(1, id)
+    while (try st.next()) {
+        const key = st.text(a, 0)
+        defer a.free(key)
+        const filename = st.text(a, 1)
+        defer a.free(filename)
+        const mime = st.text(a, 2)
+        defer a.free(mime)
+        const preview = st.text(a, 3)
+        defer a.free(preview)
+        a.append_str(&out, "<figure class=\"attachment\">")
+        if (text.starts_with(mime, "video/")) {
+            a.append_str(&out, "<video controls preload=\"metadata\" src=\"/attachments/")
+            a.append_str(&out, key)
+            a.append_str(&out, "?inline=1\"")
+            if (@len(preview) > 0) {
+                a.append_str(&out, " poster=\"/attachments/")
+                a.append_str(&out, key)
+                a.append_str(&out, "?preview=1\"")
+            }
+            a.append_str(&out, "></video>")
+        } else if (text.starts_with(mime, "audio/")) {
+            a.append_str(&out, "<audio controls preload=\"metadata\" src=\"/attachments/")
+            a.append_str(&out, key)
+            a.append_str(&out, "?inline=1\"></audio>")
+        } else if (@len(preview) > 0) {
+            a.append_str(&out, "<img loading=\"lazy\" src=\"/attachments/")
+            a.append_str(&out, key)
+            a.append_str(&out, "?preview=1\" alt=\"")
+            html.escape(a, &out, filename)
+            a.append_str(&out, "\" />")
+        }
+        a.append_str(&out, "<figcaption><a href=\"/attachments/")
+        a.append_str(&out, key)
+        a.append_str(&out, "\">")
+        html.escape(a, &out, filename)
+        a.append_str(&out, "</a></figcaption></figure>")
+    }
+}
+// Attribute values from canonical Action Text markup; decode entities only
+// when the result will be escaped or scrubbed again.
+fn attribute(a: Allocator, tag: []u8, name: str) Buf(u8) {
+    const needle = a.concat(" ", name, "=\"")
+    defer a.free(needle)
+    const at = text.find(tag, needle) orelse { return .empty }
+    const from = at + @len(needle)
+    const end = text.find_from(tag, "\"", from) orelse { return .empty }
+    var out: Buf(u8) = .empty
+    richtext.decode(a, &out, tag[from..end])
+    return out
+}
+fn render_richtext(a: Allocator, db: sqlite.Db, body: []u8) !Buf(u8) {
+    var out: Buf(u8) = .empty
+    errdefer a.free(out)
+    var at = 0
+    while (at < @len(body)) {
+        const begin = text.find_from(body, "<action-text-attachment", at) orelse @len(body)
+        a.append_str(&out, body[at..begin])
+        if (begin == @len(body)) { break }
+        const end = text.find_from(body, ">", begin) orelse @len(body) - 1
+        const close = text.find_from(body, "</action-text-attachment>", end) orelse -1
+        const sgid = attribute(a, body[begin..end + 1], "sgid")
+        defer a.free(sgid)
+        const content_type = attribute(a, body[begin..end + 1], "content-type")
+        defer a.free(content_type)
+        const content = attribute(a, body[begin..end + 1], "content")
+        defer a.free(content)
+        var user = try db.prepare("SELECT u.id, u.name FROM egg_attachables a JOIN users u ON u.id=a.record_id WHERE a.sgid=? AND a.record_type='User' AND u.status=0")
+        defer user.finalize()
+        try user.bind(1, sgid)
+        if (@len(sgid) > 0 and try user.next()) {
+            const name = user.text(a, 1)
+            defer a.free(name)
+            a.append_str(&out, "<span class=\"mention\"><a href=\"/users/")
+            a.append_int(&out, user.int(0))
+            a.append_str(&out, "\">@")
+            html.escape(a, &out, name)
+            a.append_str(&out, "</a></span>")
+        } else if (content_type == "application/vnd.actiontext.opengraph-embed" and @len(content) > 0) {
+            const safe = sanitize.sanitize(a, content)
+            defer a.free(safe)
+            a.append_str(&out, safe)
+        } else if (close > end + 1) {
+            a.append_str(&out, body[end + 1..close])
+        }
+        at = if (close >= 0) close + @len("</action-text-attachment>") else end + 1
+    }
+    return out
+}
+fn register_user(db: sqlite.Db, sgid: []u8, id: i64) !void {
+    var st = try db.prepare("INSERT OR IGNORE INTO egg_attachables (sgid, record_type, record_id) VALUES (?, 'User', ?)")
+    defer st.finalize()
+    try st.bind(1, sgid)
+    try st.bind_int(2, id)
+    while (try st.next()) {}
+}
+fn metadata(a: Allocator, body: []u8, property: str) Buf(u8) {
+    const normalized = sanitize.normalize(a, body)
+    defer a.free(normalized)
+    var at = text.find(normalized, "<meta") orelse -1
+    while (at >= 0) {
+        const end = text.find_from(normalized, ">", at) orelse { break }
+        const found = attribute(a, normalized[at..end + 1], "property")
+        defer a.free(found)
+        const name = attribute(a, normalized[at..end + 1], "name")
+        defer a.free(name)
+        if (found == property or name == property) { return attribute(a, normalized[at..end + 1], "content") }
+        at = text.find_from(normalized, "<meta", end) orelse -1
+    }
+    return .empty
+}
+fn icon(a: Allocator, files: Fs, rng: Random, root: str, data: []u8, size: i64) !Buf(u8) {
+    const key = try write(a, files, rng, root, data)
+    defer a.free(key)
+    const original = path(a, root, key)
+    defer a.free(original)
+    defer files.remove_file(original) catch {}
+    const input = a.concat("webp:", original)
+    defer a.free(input)
+    const output = a.concat(original, ".png")
+    defer a.free(output)
+    defer files.remove_file(output) catch {}
+    try media.icon(a, input, output, size)
+    return files.read(a, output)
+}

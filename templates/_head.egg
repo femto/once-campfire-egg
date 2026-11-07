@@ -116,3 +116,42 @@ fn cached_message(a: Allocator, inout out: Buf(u8), inout frags: fragcache.Cache
     a.push(&cuts, @len(out))
     a.push(&cuts, m.id)
 }
+
+// next_involvement_for(room, involvement:): the next in the cycle.
+fn next_involvement(direct: bool, involvement: []u8) str {
+    if (direct) {
+        return if (involvement == "everything") "nothing" else "everything"
+    }
+    if (involvement == "mentions") {
+        return "everything"
+    } else if (involvement == "everything") {
+        return "nothing"
+    } else if (involvement == "nothing") {
+        return "invisible"
+    }
+    return "mentions"
+}
+
+fn humanize_involvement(involvement: []u8) str {
+    if (involvement == "mentions") {
+        return "Notifying about @ mentions"
+    } else if (involvement == "everything") {
+        return "Notifying about all messages"
+    } else if (involvement == "nothing") {
+        return "Notifications are off"
+    } else if (involvement == "invisible") {
+        return "Notifications are off and room invisible in sidebar"
+    }
+    return ""
+}
+
+fn bell_asset(involvement: []u8) str {
+    if (involvement == "everything") {
+        return "/assets/notification-bell-everything-cde41b14.svg"
+    } else if (involvement == "nothing") {
+        return "/assets/notification-bell-nothing-d8096c76.svg"
+    } else if (involvement == "invisible") {
+        return "/assets/notification-bell-invisible-8b495073.svg"
+    }
+    return "/assets/notification-bell-mentions-945d1b91.svg"
+}

@@ -10,6 +10,9 @@ const sqlite = @import("sqlite.egg")
 const setup = @import("setup.egg")
 const cable = @import("cable.egg")
 const turbo = @import("turbo.egg")
+const push = @import("push.egg")
+const crypto = @import("crypto.egg")
+const codec = @import("codec.egg")
 const sys = @import("sys.egg")
 
 const Worker = owned struct {
@@ -23,7 +26,12 @@ const Worker = owned struct {
 
 fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     var served = 0
-    while (try http.read_request(c, a, served)) |req| {
+    while (true) {
+        const req = (http.read_request(c, a, served) catch |e| {
+            if (e == error.BodyTooLarge) { return http.write_response(c, a, "413 Payload Too Large", "Content-Type: text/plain\r\n", "Uploads are limited to 32 MB", false) }
+            if (e == error.BadRequest) { return http.write_response(c, a, "400 Bad Request", "", "", false) }
+            return e
+        }) orelse { return }
         defer req.deinit(a)
         served = served + 1
         if (!try app.handle(c, a, &ctx, req) or !req.keep) {
@@ -48,6 +56,32 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
             }
             continue
         }
+    }
+}
+
+// Isolated background HTTP delivery; its own DB connection and caches.
+fn webhook_work(sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade), sink hub_tx: Sender(cable.Cmd), io: Io, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
+    var ctx = app.open(a, cfg, clock, rng, files, lock_rx, lock_tx, cable_tx, hub_tx) catch |e| {
+        io.eprint("cannot open webhook worker: ", @errorName(e))
+        return
+    }
+    defer ctx.close(a)
+    const pause = threads.channel(bool, 1)
+    defer pause.close()
+    const awake = pause.sender()
+    defer awake.close()
+    while (true) {
+        const delivered = app.deliver_webhook(a, &ctx) catch |e| {
+            io.eprint("webhook delivery failed: ", @errorName(e))
+            _ = pause.recv_timeout(1000)
+            continue
+        }
+        const pushed = app.deliver_push(a, &ctx) catch |e| {
+            io.eprint("push delivery failed: ", @errorName(e))
+            _ = pause.recv_timeout(1000)
+            continue
+        }
+        if (!delivered and !pushed) { _ = pause.recv_timeout(100) }
     }
 }
 
@@ -102,10 +136,23 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         io.eprint("cannot prepare ", db_path, ": ", @errorName(e))
         return
     }
+    var private_key: Buf(u8) = .empty
+    defer a.free(private_key)
+    if (args.env("VAPID_PRIVATE_KEY")) |encoded| {
+        if (!codec.base64_decode(a, &private_key, encoded)) { return error.InvalidVapid }
+    } else { a.free(@replace(&private_key, crypto.derive_key(a, secret, "campfire/vapid", 32))) }
+    const public_key = try push.public_key(a, private_key)
+    defer a.free(public_key)
+    if (args.env("VAPID_PUBLIC_KEY")) |configured| {
+        if (configured != public_key) { return error.InvalidVapid }
+    }
     const cfg = app.Config{
         .db_path = db_path,
         .secret = secret,
-        .vapid = args.env("VAPID_PUBLIC_KEY") orelse "",
+        .vapid = a.leak(public_key),
+        .push_private = a.leak(private_key),
+        .push_subject = args.env("VAPID_SUBJECT") orelse "mailto:admin@example.com",
+        .push_allow_local = (args.env("CAMPFIRE_PUSH_ALLOW_LOCAL") orelse "0") == "1",
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
         .cache = (args.env("CAMPFIRE_CACHE") orelse "0") == "1",
@@ -129,6 +176,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     const hub_tx = cmds.sender()
     const loops = text.parse_int(args.env("CAMPFIRE_CABLE_LOOPS") orelse "4") orelse 4
     threads.spawn(cable.run, upgrades, cmds, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, net, a, threads, clock, cfg.db_path, if (loops < 1) 1 else loops).detach()
+    threads.spawn(webhook_work, lock.clone(), lock_tx.clone(), cable_tx.clone(), hub_tx.clone(), io, a, threads, clock, rng, files, cfg).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
     var pool: Buf(Worker) = .empty
