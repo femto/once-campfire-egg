@@ -155,7 +155,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .push_allow_local = (args.env("CAMPFIRE_PUSH_ALLOW_LOCAL") orelse "0") == "1",
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
-        .cache = (args.env("CAMPFIRE_CACHE") orelse "0") == "1",
+        .cache = (args.env("CAMPFIRE_CACHE") orelse "1") != "0",
         .response_cache = (args.env("CAMPFIRE_RESPONSE_CACHE") orelse "1") != "0",
     }
     const open_files = sys.raise_open_files()

@@ -46,7 +46,8 @@ const Config = struct {
     files: str
     assets: str
     // Keep messages' HTML and gzip, and whole responses unless
-    // response_cache is off (CAMPFIRE_CACHE=1, CAMPFIRE_RESPONSE_CACHE=0).
+    // response_cache is off (by default; CAMPFIRE_CACHE=0 turns them all off,
+    // CAMPFIRE_RESPONSE_CACHE=0 only whole responses).
     cache: bool
     response_cache: bool
 }

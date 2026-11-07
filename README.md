@@ -54,10 +54,11 @@ on a fresh database.
 
 ## Performance
 
-Uncached, Egg renders and gzips every page. With `CAMPFIRE_CACHE=1` each
+By default each
 worker keeps, as the Rust app does for the process, whole responses until
 the next commit, messages' HTML, and each page's gzip in pieces it splices
-together (src/respcache.egg, src/fragcache.egg, src/splice.egg).
+together (src/respcache.egg, src/fragcache.egg, src/splice.egg). With
+`CAMPFIRE_CACHE=0` it renders and gzips every page.
 On GitHub's ubuntu-latest, requests a second:
 
 | route | Rust | Egg | Egg, cached |
@@ -114,8 +115,8 @@ remote link-card images are currently omitted.
 | `CAMPFIRE_DATABASE_PATH` | `<storage>/db/production.sqlite3` |
 | `CAMPFIRE_FILES_PATH` | `<storage>/files` (Active Storage) |
 | `CAMPFIRE_ASSETS_PATH` | `build/assets` |
-| `CAMPFIRE_CACHE` | `0`; `1` keeps messages' HTML, their gzip, and whole responses |
-| `CAMPFIRE_RESPONSE_CACHE` | `1`; `0` (with `CAMPFIRE_CACHE=1`) keeps all but whole responses |
+| `CAMPFIRE_CACHE` | `1`: keeps messages' HTML, their gzip, and whole responses; `0` keeps none |
+| `CAMPFIRE_RESPONSE_CACHE` | `1`; `0` keeps all but whole responses |
 | `SECRET_KEY_BASE` | required; also derives stable VAPID keys when no pair is supplied |
 | `VAPID_PRIVATE_KEY`, `VAPID_PUBLIC_KEY` | optional matching P-256 keys, URL-safe Base64 |
 | `VAPID_SUBJECT` | `mailto:admin@example.com`; configure your contact URI |

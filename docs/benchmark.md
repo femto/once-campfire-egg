@@ -2,9 +2,11 @@
 
 once-campfire-verification's benchmark (`bin/benchmark`), run from
 [femto's fork](https://github.com/femto/once-campfire-verification/tree/egg),
-whose `egg` branch adds two apps:
+whose `egg` branch adds these apps. The runs below predate 2026-11-07, when
+the image started caching by default; `egg` here is the image with
+`CAMPFIRE_CACHE=0`.
 
-- `egg`: this app's image as it is, rendering every page;
+- `egg`: rendering every page;
 - `egg-cache`: the same image with `CAMPFIRE_CACHE=1`, which keeps whole
   responses per worker (src/respcache.egg), as once-campfire-rust's
   response cache does for the whole process, and messages' HTML
