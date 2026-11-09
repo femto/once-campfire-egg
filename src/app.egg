@@ -2616,7 +2616,7 @@ fn insert_webhook_attachment(a: Allocator, inout ctx: Context, job: i64, room: i
     try attach.bind_int(2, blob)
     try attach.bind(3, stamp)
     while (try attach.next()) {}
-    try push.enqueue(a, ctx.db, ctx.mention_key, id)
+    try push.queue(ctx.db, id)
     try finish_webhook(ctx.db, job)
     return id
 }
@@ -2665,7 +2665,7 @@ fn write_webhook_text(a: Allocator, inout ctx: Context, job: i64, room: i64, bot
         ctx.db.exec("ROLLBACK") catch {}
         return e
     }
-    push.enqueue(a, ctx.db, ctx.mention_key, id) catch |e| {
+    push.queue(ctx.db, id) catch |e| {
         ctx.db.exec("ROLLBACK") catch {}
         return e
     }
@@ -2787,7 +2787,7 @@ fn insert_user_attachment(a: Allocator, inout ctx: Context, room: i64, user: i64
         while (try st.next()) {}
     }
     try bot_hooks.enqueue(a, ctx.db, ctx.mention_key, id)
-    try push.enqueue(a, ctx.db, ctx.mention_key, id)
+    try push.queue(ctx.db, id)
     return id
 }
 
@@ -2808,24 +2808,58 @@ fn flash_notice(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
     json.encode_plain(a, &body, message)
     return http.respond(c, a, req, "200 OK", "Content-Type: application/json\r\nCache-Control: no-store\r\nSet-Cookie: campfire_flash=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n", body)
 }
+// One round of the push worker: queued messages made into notifications
+// and a batch of due notifications sent, reading and sending outside the
+// write lock, then all of it written in one turn at the lock. False if
+// there was nothing to do.
 fn deliver_push(a: Allocator, inout ctx: Context) !bool {
-    const job = try push.next_job(a, ctx.db, ctx.clock) orelse { return false }
-    defer job.deinit(a)
-    var public_bytes: Buf(u8) = .empty
-    defer a.free(public_bytes)
-    var auth: Buf(u8) = .empty
-    defer a.free(auth)
-    var status: i64 = 400
-    if (job.valid_source and @len(job.endpoint) > 0 and codec.base64_decode(a, &public_bytes, job.public_key) and codec.base64_decode(a, &auth, job.auth)) {
-        status = push.send(a, ctx.clock, job.endpoint, public_bytes, auth, job.payload, ctx.push_private, ctx.vapid, ctx.push_subject, ctx.push_allow_local) catch 400
+    var ids: Buf(i64) = .empty
+    defer a.free(ids)
+    try push.queued(a, ctx.db, &ids)
+    var planned: Buf(push.Planned) = .empty
+    defer a.free(planned)
+    var k = 0
+    while (k < @len(ids)) {
+        try push.plan(a, ctx.db, ctx.mention_key, ids[k], &planned)
+        k = k + 1
+    }
+    var jobs: Buf(push.Job) = .empty
+    defer a.free(jobs)
+    try push.next_jobs(a, ctx.db, ctx.clock, &jobs)
+    if (@len(ids) == 0 and @len(jobs) == 0) { return false }
+    var statuses: Buf(i64) = .empty
+    defer a.free(statuses)
+    var j = 0
+    while (j < @len(jobs)) {
+        var public_bytes: Buf(u8) = .empty
+        defer a.free(public_bytes)
+        var auth: Buf(u8) = .empty
+        defer a.free(auth)
+        var status: i64 = 400
+        if (jobs[j].valid_source and @len(jobs[j].endpoint) > 0 and codec.base64_decode(a, &public_bytes, jobs[j].public_key) and codec.base64_decode(a, &auth, jobs[j].auth)) {
+            status = push.send(a, ctx.clock, jobs[j].endpoint, public_bytes, auth, jobs[j].payload, ctx.push_private, ctx.vapid, ctx.push_subject, ctx.push_allow_local) catch 400
+        }
+        a.push(&statuses, status)
+        j = j + 1
     }
     _ = ctx.lock_rx.recv()
-    push.finish(ctx.db, ctx.clock, job.id, job.subscription, status, job.attempts) catch |e| {
+    push_round(ctx.db, ctx.clock, ids, planned, jobs, statuses) catch |e| {
+        ctx.db.exec("ROLLBACK") catch {}
         ctx.lock_tx.send(true)
         return e
     }
     ctx.lock_tx.send(true)
     return true
+}
+fn push_round(db: sqlite.Db, clock: Clock, ids: Buf(i64), planned: Buf(push.Planned), jobs: Buf(push.Job), statuses: Buf(i64)) !void {
+    try db.exec("BEGIN IMMEDIATE")
+    try push.store(db, ids, planned)
+    var i = 0
+    while (i < @len(jobs)) {
+        try push.finish(db, clock, jobs[i].id, jobs[i].subscription, statuses[i], jobs[i].attempts)
+        i = i + 1
+    }
+    try db.exec("COMMIT")
 }
 fn push_subscriptions(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
     const user = try session.current_user(a, ctx.db, ctx.key, ctx.clock, req.cookie) orelse { return to_sign_in(c, a, req) }

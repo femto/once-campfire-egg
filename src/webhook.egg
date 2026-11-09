@@ -56,6 +56,11 @@ fn without_mention(a: Allocator, plain: []u8, name: []u8) Buf(u8) {
 // Called in the message's transaction; a reply from the background worker
 // deliberately uses create_message instead, so it cannot start a bot loop.
 fn enqueue(a: Allocator, db: sqlite.Db, k: []u8, id: i64) !void {
+    // Most rooms have no bot with a webhook: nothing more to read then.
+    var any = try db.prepare("SELECT 1 FROM messages m JOIN memberships ms ON ms.room_id=m.room_id JOIN users u ON u.id=ms.user_id AND u.role=2 AND u.status=0 AND u.id!=m.creator_id JOIN webhooks w ON w.user_id=u.id AND LENGTH(w.url)>0 WHERE m.id=? LIMIT 1")
+    defer any.finalize()
+    try any.bind_int(1, id)
+    if (!try any.next()) { return }
     var message = try db.prepare("SELECT m.room_id, m.creator_id, u.name, r.name, r.type, t.body FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id LEFT JOIN action_text_rich_texts t ON t.record_id=m.id AND t.record_type='Message' AND t.name='body' WHERE m.id=?")
     defer message.finalize()
     try message.bind_int(1, id)

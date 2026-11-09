@@ -716,7 +716,7 @@ fn create_message_notify(a: Allocator, db: sqlite.Db, clock: Clock, rng: Random,
         return e
     }
     if (@len(mention_key) > 0) {
-        push.enqueue(a, db, mention_key, id) catch |e| {
+        push.queue(db, id) catch |e| {
             db.exec("ROLLBACK") catch {}
             return e
         }

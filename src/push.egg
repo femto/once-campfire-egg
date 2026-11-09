@@ -65,7 +65,61 @@ fn send(a: Allocator, clock: Clock, endpoint: []u8, public_bytes: []u8, auth: []
     return @as(i64, cf_push_post(@bufPtr(url), @bufPtr(encrypted), n, @bufPtr(authorization), if (allow_local) 1 else 0))
 }
 
-fn enqueue(a: Allocator, db: sqlite.Db, mention_key: []u8, id: i64) !void {
+// Room::PushMessageJob.perform_later: in the message's transaction, the
+// message waits in egg_push_messages for the background worker, which
+// makes its notifications (plan, then store) outside the request.
+fn queue(db: sqlite.Db, id: i64) !void {
+    var st = try db.prepare("INSERT OR IGNORE INTO egg_push_messages (message_id) VALUES (?)")
+    defer st.finalize()
+    try st.bind_int(1, id)
+    while (try st.next()) {}
+}
+
+// A notification to be queued for a subscription.
+const Planned = owned struct {
+    subscription: i64
+    message: i64
+    payload: Buf(u8)
+
+    fn deinit(sink self: Planned, a: Allocator) void {
+        a.free(self.payload)
+        @forget(self)
+    }
+}
+
+// Up to 64 queued messages, oldest first.
+fn queued(a: Allocator, db: sqlite.Db, inout ids: Buf(i64)) !void {
+    var st = try db.prepare("SELECT message_id FROM egg_push_messages ORDER BY message_id LIMIT 64")
+    defer st.finalize()
+    while (try st.next()) {
+        a.push(&ids, st.int(0))
+    }
+}
+
+// The planned notifications as jobs, and their messages off the queue; in
+// the caller's transaction, holding the write lock.
+fn store(db: sqlite.Db, ids: Buf(i64), planned: Buf(Planned)) !void {
+    var insert = try db.prepare("INSERT OR IGNORE INTO egg_push_jobs (subscription_id, message_id, payload, attempts, available_after) VALUES (?, ?, ?, 0, 0)")
+    defer insert.finalize()
+    for (planned) |p| {
+        insert.reset()
+        try insert.bind_int(1, p.subscription)
+        try insert.bind_int(2, p.message)
+        try insert.bind(3, p.payload)
+        while (try insert.next()) {}
+    }
+    var done = try db.prepare("DELETE FROM egg_push_messages WHERE message_id=?")
+    defer done.finalize()
+    for (ids) |id| {
+        done.reset()
+        try done.bind_int(1, id)
+        while (try done.next()) {}
+    }
+}
+
+// Room::MessagePusher: the notification each subscriber of message id's
+// room is to get, onto out; reads only.
+fn plan(a: Allocator, db: sqlite.Db, mention_key: []u8, id: i64, inout out: Buf(Planned)) !void {
     var message = try db.prepare("SELECT m.room_id, m.creator_id, u.name, r.type, t.body FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id LEFT JOIN action_text_rich_texts t ON t.record_id=m.id AND t.record_type='Message' AND t.name='body' WHERE m.id=?")
     defer message.finalize()
     try message.bind_int(1, id)
@@ -115,12 +169,7 @@ fn enqueue(a: Allocator, db: sqlite.Db, mention_key: []u8, id: i64) !void {
         a.append_str(&payload, "\",\"badge\":")
         a.append_int(&payload, count)
         a.append_str(&payload, "}}}")
-        var insert = try db.prepare("INSERT OR IGNORE INTO egg_push_jobs (subscription_id, message_id, payload, attempts, available_after) VALUES (?, ?, ?, 0, 0)")
-        defer insert.finalize()
-        try insert.bind_int(1, subscribers.int(0))
-        try insert.bind_int(2, id)
-        try insert.bind(3, payload)
-        while (try insert.next()) {}
+        a.push(&out, Planned{ .subscription = subscribers.int(0), .message = id, .payload = a.concat(payload, "") })
     }
 }
 const Job = owned struct {
@@ -140,12 +189,14 @@ const Job = owned struct {
         @forget(self)
     }
 }
-fn next_job(a: Allocator, db: sqlite.Db, clock: Clock) !?Job {
-    var st = try db.prepare("SELECT j.id, j.subscription_id, j.attempts, ps.endpoint, ps.p256dh_key, ps.auth_key, j.payload, (j.message_id IS NULL OR EXISTS (SELECT 1 FROM messages WHERE id=j.message_id)) FROM egg_push_jobs j LEFT JOIN push_subscriptions ps ON ps.id=j.subscription_id WHERE j.available_after<=? ORDER BY j.id LIMIT 1")
+// Up to 32 jobs that are due, oldest first, onto jobs.
+fn next_jobs(a: Allocator, db: sqlite.Db, clock: Clock, inout jobs: Buf(Job)) !void {
+    var st = try db.prepare("SELECT j.id, j.subscription_id, j.attempts, ps.endpoint, ps.p256dh_key, ps.auth_key, j.payload, (j.message_id IS NULL OR EXISTS (SELECT 1 FROM messages WHERE id=j.message_id)) FROM egg_push_jobs j LEFT JOIN push_subscriptions ps ON ps.id=j.subscription_id WHERE j.available_after<=? ORDER BY j.id LIMIT 32")
     defer st.finalize()
     try st.bind_int(1, clock.now() / 1000000000)
-    if (!try st.next()) { return null }
-    return Job{ .id = st.int(0), .subscription = st.int(1), .attempts = st.int(2), .endpoint = st.text(a, 3), .public_key = st.text(a, 4), .auth = st.text(a, 5), .payload = st.text(a, 6), .valid_source = st.int(7) == 1 }
+    while (try st.next()) {
+        a.push(&jobs, Job{ .id = st.int(0), .subscription = st.int(1), .attempts = st.int(2), .endpoint = st.text(a, 3), .public_key = st.text(a, 4), .auth = st.text(a, 5), .payload = st.text(a, 6), .valid_source = st.int(7) == 1 })
+    }
 }
 fn finish(db: sqlite.Db, clock: Clock, id: i64, subscription: i64, status: i64, attempts: i64) !void {
     if (status == 404 or status == 410) {

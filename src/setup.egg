@@ -44,6 +44,8 @@ fn prepare(a: Allocator, db: sqlite.Db, clock: Clock) !void {
     try db.exec("CREATE TABLE IF NOT EXISTS egg_blob_previews (blob_id INTEGER PRIMARY KEY NOT NULL, key TEXT NOT NULL)")
     try db.exec("CREATE TABLE IF NOT EXISTS egg_attachables (sgid TEXT PRIMARY KEY NOT NULL, record_type TEXT NOT NULL, record_id INTEGER NOT NULL)")
     try db.exec("CREATE TABLE IF NOT EXISTS egg_push_jobs (id INTEGER PRIMARY KEY, subscription_id INTEGER NOT NULL, message_id INTEGER, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_after INTEGER NOT NULL DEFAULT 0, UNIQUE(subscription_id, message_id))")
+    // Messages whose push notifications are still to be made (push.queue).
+    try db.exec("CREATE TABLE IF NOT EXISTS egg_push_messages (message_id INTEGER PRIMARY KEY NOT NULL)")
     // Shared across HTTP workers; fixed windows start with the first attempt.
     try db.exec("CREATE TABLE IF NOT EXISTS egg_login_limits (ip TEXT PRIMARY KEY NOT NULL, attempts INTEGER NOT NULL, expires_at INTEGER NOT NULL)")
 }
