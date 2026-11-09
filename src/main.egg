@@ -143,13 +143,22 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     } else { a.free(@replace(&private_key, crypto.derive_key(a, secret, "campfire/vapid", 32))) }
     const public_key = try push.public_key(a, private_key)
     defer a.free(public_key)
+    // The configured key may be Base64 in either alphabet, padded or not;
+    // pages show it as given, as Rails and Rust do.
+    var shown = a.concat(public_key, "")
+    defer a.free(shown)
     if (args.env("VAPID_PUBLIC_KEY")) |configured| {
-        if (configured != public_key) { return error.InvalidVapid }
+        var ours: Buf(u8) = .empty
+        defer a.free(ours)
+        var theirs: Buf(u8) = .empty
+        defer a.free(theirs)
+        if (!codec.base64_decode(a, &ours, public_key) or !codec.base64_decode(a, &theirs, configured) or ours != theirs) { return error.InvalidVapid }
+        a.free(@replace(&shown, a.concat(configured, "")))
     }
     const cfg = app.Config{
         .db_path = db_path,
         .secret = secret,
-        .vapid = a.leak(public_key),
+        .vapid = a.leak(shown),
         .push_private = a.leak(private_key),
         .push_subject = args.env("VAPID_SUBJECT") orelse "mailto:admin@example.com",
         .push_allow_local = (args.env("CAMPFIRE_PUSH_ALLOW_LOCAL") orelse "0") == "1",
