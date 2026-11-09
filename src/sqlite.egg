@@ -240,6 +240,26 @@ fn configure(db: Db) !void {
     try db.exec("PRAGMA synchronous = NORMAL")
     try db.exec("PRAGMA journal_size_limit = 67108864")
     try db.exec("PRAGMA cache_size = 2000")
+    // No commit checkpoints the WAL itself (and syncs it, holding the
+    // write lock): the checkpointer does it, as the Rust app's does.
+    try db.exec("PRAGMA wal_autocheckpoint = 0")
+}
+
+// One PASSIVE checkpoint, which waits for no writer: the pages the WAL
+// still holds after it.
+fn checkpoint_passive(db: Db) !i64 {
+    var st = try db.prepare("PRAGMA wal_checkpoint(PASSIVE)")
+    defer st.finalize()
+    if (!try st.next()) { return 0 }
+    return st.int(1)
+}
+
+// A RESTART checkpoint, for the caller holding the write lock: the WAL
+// copied entirely, so the next commit writes it from its start again.
+fn checkpoint_restart(db: Db) !void {
+    var st = try db.prepare("PRAGMA wal_checkpoint(RESTART)")
+    defer st.finalize()
+    while (try st.next()) {}
 }
 
 // The same, making the file if there is none (SQLITE_OPEN_CREATE).

@@ -59,6 +59,37 @@ fn work(sink jobs: Receiver(TcpConn), sink lock_rx: Receiver(bool), sink lock_tx
     }
 }
 
+// WAL checkpoints, off the writers' path (they no longer checkpoint on
+// commit): a PASSIVE one every 100 ms, which copies what it can while
+// writes go on, and once the WAL holds 10,000 pages (about 40 MB), a
+// RESTART one at the write lock, so the WAL starts over; as the Rust app's
+// checkpointer and writer do.
+fn checkpointer(sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), io: Io, a: Allocator, threads: Threads, db_path: str) void {
+    defer lock_rx.close()
+    defer lock_tx.close()
+    const db = sqlite.open(a, db_path) catch |e| {
+        io.eprint("cannot open the checkpointer's connection: ", @errorName(e))
+        return
+    }
+    defer db.close()
+    const pause = threads.channel(bool, 1)
+    defer pause.close()
+    const awake = pause.sender()
+    defer awake.close()
+    while (true) {
+        _ = pause.recv_timeout(100)
+        const pages = sqlite.checkpoint_passive(db) catch |e| {
+            io.eprint("checkpoint failed: ", @errorName(e))
+            continue
+        }
+        if (pages >= 10000) {
+            _ = lock_rx.recv()
+            sqlite.checkpoint_restart(db) catch |e| { io.eprint("checkpoint failed: ", @errorName(e)) }
+            lock_tx.send(true)
+        }
+    }
+}
+
 // Isolated background HTTP delivery; its own DB connection and caches.
 fn webhook_work(sink lock_rx: Receiver(bool), sink lock_tx: Sender(bool), sink cable_tx: Sender(cable.Upgrade), sink hub_tx: Sender(cable.Cmd), io: Io, a: Allocator, threads: Threads, clock: Clock, rng: Random, files: Fs, cfg: app.Config) void {
     var ctx = app.open(a, cfg, clock, rng, files, lock_rx, lock_tx, cable_tx, hub_tx) catch |e| {
@@ -186,6 +217,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     // 1 to 62: the hub keeps a bit for each loop.
     const loops = text.parse_int(args.env("CAMPFIRE_CABLE_LOOPS") orelse "4") orelse 4
     threads.spawn(cable.run, upgrades, cmds, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, net, a, threads, clock, cfg.db_path, if (loops < 1) 1 else if (loops > 62) 62 else loops).detach()
+    threads.spawn(checkpointer, lock.clone(), lock_tx.clone(), io, a, threads, cfg.db_path).detach()
     threads.spawn(webhook_work, lock.clone(), lock_tx.clone(), cable_tx.clone(), hub_tx.clone(), io, a, threads, clock, rng, files, cfg).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
