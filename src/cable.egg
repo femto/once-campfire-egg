@@ -58,10 +58,13 @@ const WELCOME = "{\"type\":\"welcome\"}"
 const UNAUTHORIZED = "{\"type\":\"disconnect\",\"reason\":\"unauthorized\",\"reconnect\":false}"
 
 // ActionCable.server.broadcast(stream, message): message is the JSON of
-// what each subscriber gets.
+// what each subscriber gets. Loops send it too, with gate their number,
+// when they start (on) or stop listening to stream.
 const Cmd = owned struct {
     stream: Buf(u8)
     text: Buf(u8)
+    gate: i64
+    on: bool
 
     fn deinit(sink self: Cmd, a: Allocator) void {
         a.free(self.stream)
@@ -71,7 +74,7 @@ const Cmd = owned struct {
 }
 
 fn broadcast(a: Allocator, to_hub: Sender(Cmd), stream: []u8, message: []u8) void {
-    to_hub.send(Cmd{ .stream = a.concat(stream, ""), .text = a.concat(message, "") })
+    to_hub.send(Cmd{ .stream = a.concat(stream, ""), .text = a.concat(message, ""), .gate = -1, .on = false })
 }
 
 // What a loop is handed: a connection to serve (ups), or a broadcast.
@@ -106,16 +109,52 @@ const Gate = owned struct {
     }
 }
 
-// The hub: each broadcast, to every loop.
+// The hub: each broadcast, to the loops listening to its stream. It keeps
+// which those are (a bit for each loop) as the loops tell it, in the order
+// the commands come, so a broadcast sent after a loop's subscribe reaches
+// it; the others are not woken.
 fn hub(sink cmds: Receiver(Cmd), sink gates: Buf(Gate), a: Allocator) void {
     defer cmds.close()
     defer a.free(gates)
+    var watched = map.HashMap(Buf(u8), i64).init()
+    defer a.free(watched)
     while (cmds.recv()) |c| {
-        for (gates) |g| {
-            g.give(In{ .user = 0, .stream = a.concat(c.stream, ""), .text = a.concat(c.text, ""), .ups = .empty })
+        if (c.gate >= 0) {
+            const bit = 1 << c.gate
+            const was = watched.get_text(c.stream) orelse 0
+            const now = if (c.on) was | bit else was - (was & bit)
+            if (now == 0) {
+                _ = watched.remove_text(a, c.stream)
+            } else {
+                watched.put_text(a, c.stream, now)
+            }
+        } else {
+            const mask = watched.get_text(c.stream) orelse 0
+            var i = 0
+            while (i < @len(gates)) {
+                if ((mask >> i) & 1 == 1) {
+                    gates[i].give(In{ .user = 0, .stream = a.concat(c.stream, ""), .text = a.concat(c.text, ""), .ups = .empty })
+                }
+                i = i + 1
+            }
         }
         c.deinit(a)
     }
+}
+
+// Whether a socket of loop l listens to stream.
+fn listening(l: Loop, stream: []u8) bool {
+    for (l.listeners) |x| {
+        if (x.stream == stream) {
+            return true
+        }
+    }
+    return false
+}
+
+// Tells the hub loop l starts (on) or stops listening to stream.
+fn watch(a: Allocator, l: Loop, stream: []u8, on: bool) void {
+    l.to_hub.send(Cmd{ .stream = a.concat(stream, ""), .text = .empty, .gate = l.id, .on = on })
 }
 
 // What subscriptions there are: their identifier as the client wrote it,
@@ -180,6 +219,8 @@ const Listener = owned struct {
 // by token), their streams, a database connection of its own, and what it
 // shares: the write token, the key for signed stream names, the hub.
 const Loop = owned struct {
+    // Its number, for the hub.
+    id: i64
     p: Poller
     conns: Buf(Conn)
     index: map.HashMap(i64, i64)
@@ -255,7 +296,7 @@ fn run(sink ups: Receiver(Upgrade), sink cmds: Receiver(Cmd), sink to_hub: Sende
             return
         }
         a.push(&hubs, Gate{ .tx = q.sender(), .w = w2 })
-        const l = Loop{ .p = p, .conns = .empty, .index = map.HashMap(i64, i64).init(), .listeners = .empty, .db = db, .key = a.concat(key, ""), .clock = clock, .lock_rx = lock_rx.clone(), .lock_tx = lock_tx.clone(), .to_hub = to_hub.clone(), .inbox = q }
+        const l = Loop{ .id = i, .p = p, .conns = .empty, .index = map.HashMap(i64, i64).init(), .listeners = .empty, .db = db, .key = a.concat(key, ""), .clock = clock, .lock_rx = lock_rx.clone(), .lock_tx = lock_tx.clone(), .to_hub = to_hub.clone(), .inbox = q }
         threads.spawn(serve, l, io, a).detach()
         i = i + 1
     }
@@ -534,6 +575,9 @@ fn stop(a: Allocator, inout l: Loop, t: i64, identifier: []u8) void {
         if (l.listeners[i].token == t and (@len(identifier) == 0 or l.listeners[i].identifier == identifier)) {
             @swap(&l.listeners, i, @len(l.listeners) - 1)
             if (a.pop(&l.listeners)) |gone| {
+                if (!listening(l, gone.stream)) {
+                    watch(a, l, gone.stream, false)
+                }
                 gone.deinit(a)
             }
         } else {
@@ -556,6 +600,9 @@ fn reject(a: Allocator, inout l: Loop, ci: i64, identifier: []u8) void {
 fn listen(a: Allocator, inout l: Loop, ci: i64, identifier: []u8, stream: []u8) void {
     var encoded: Buf(u8) = .empty
     json.encode_string(a, &encoded, identifier)
+    if (!listening(l, stream)) {
+        watch(a, l, stream, true)
+    }
     a.push(&l.listeners, Listener{ .token = l.conns[ci].token, .stream = a.concat(stream, ""), .identifier = encoded })
     confirm(a, &l, ci, identifier)
 }

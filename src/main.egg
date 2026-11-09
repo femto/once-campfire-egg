@@ -183,8 +183,9 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
     const cable_tx = upgrades.sender()
     const cmds = threads.channel(cable.Cmd, 1024)
     const hub_tx = cmds.sender()
+    // 1 to 62: the hub keeps a bit for each loop.
     const loops = text.parse_int(args.env("CAMPFIRE_CABLE_LOOPS") orelse "4") orelse 4
-    threads.spawn(cable.run, upgrades, cmds, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, net, a, threads, clock, cfg.db_path, if (loops < 1) 1 else loops).detach()
+    threads.spawn(cable.run, upgrades, cmds, hub_tx.clone(), lock.clone(), lock_tx.clone(), turbo.key(a, cfg.secret), io, net, a, threads, clock, cfg.db_path, if (loops < 1) 1 else if (loops > 62) 62 else loops).detach()
     threads.spawn(webhook_work, lock.clone(), lock_tx.clone(), cable_tx.clone(), hub_tx.clone(), io, a, threads, clock, rng, files, cfg).detach()
     const jobs = threads.channel(TcpConn, 64)
     const queue = jobs.sender()
