@@ -59,19 +59,21 @@ worker keeps, as the Rust app does for the process, whole responses until
 the next commit, messages' HTML, and each page's gzip in pieces it splices
 together (src/respcache.egg, src/fragcache.egg, src/splice.egg). With
 `CAMPFIRE_CACHE=0` it renders and gzips every page.
-On GitHub's ubuntu-latest, requests a second:
+In a 4 + 4 core Linux VM (2026-11-09), requests a second, against
+once-campfire-rust with its caches:
 
-| route | Rust | Egg | Egg, cached |
-| --- | ---: | ---: | ---: |
-| room page | 12710 | 592 | 41833 |
-| sidebar | 14287 | 3888 | 51243 |
-| avatar | 47899 | 51165 | 50559 |
-| static CSS | 48060 | 108952 | 108761 |
-| post a message | 1818 | 1963 | 1771 |
+| route | Rust | Egg |
+| --- | ---: | ---: |
+| room page | 13789 | 49051 |
+| sidebar | 12613 | 61308 |
+| search | 12620 | 52558 |
+| avatar | 42810 | 56726 |
+| static CSS | 49718 | 99995 |
+| post a message | 1452 | 2409 |
 
 With 1000 WebSockets on one busy room (`loadgen cable`), every message
-reaches every client, as fast as the Rust app's (195-222 against 178
-messages a second to all, at full load), in 35-39 MiB against its 134.
+reaches every client, as fast as the Rust app's (209 against 186 messages
+a second to all, at full load), in 47 MiB against its 136.
 
 docs/benchmark.md has every route, the local runs, the WebSocket run, the
 setup and how to read the numbers; `.github/workflows/benchmark.yml` runs

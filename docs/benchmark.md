@@ -1,10 +1,36 @@
 # Benchmark
 
-once-campfire-verification's benchmark (`bin/benchmark`), run from
-[femto's fork](https://github.com/femto/once-campfire-verification/tree/egg),
-whose `egg` branch adds these apps. The runs below predate 2026-11-07, when
-the image started caching by default; `egg` here is the image with
-`CAMPFIRE_CACHE=0`.
+once-campfire-verification's benchmark (`bin/benchmark`), with `egg` as one
+of its apps ([femto's branch](https://github.com/femto/once-campfire-verification/tree/add-egg-implementation)).
+The image caches by default; `EGG_BENCH_ENV='{"CAMPFIRE_CACHE":"0"}'`
+measures it uncached.
+
+## Local: OrbStack Linux VM, 4 + 4 cores, 2026-11-09
+
+Commit `e152b5b`, Rust `6dae2fd` (its published image, with its caches),
+`~/bench/run.sh` in the VM described below: apps on CPUs 0-3, the load
+generator on 4-7, 3 alternating rounds. Median requests/second:
+
+| route | Rust | Egg | Egg/Rust |
+| --- | ---: | ---: | ---: |
+| room page | 13789 | 49051 | 3.6x |
+| messages page | 11807 | 45301 | 3.8x |
+| sidebar | 12613 | 61308 | 4.9x |
+| search | 12620 | 52558 | 4.2x |
+| avatar | 42810 | 56726 | 1.3x |
+| static CSS | 49718 | 99995 | 2.0x |
+| /up | 21688 | 120968 | 5.6x |
+| post a message | 1452 | 2409 | 1.7x |
+
+Rust's posts vary most from run to run here (1450-1980 the same day); Egg's
+were 2350-2490. Three fixes that day brought Egg's posts from about 1000:
+broadcasts wake only the cable loops listening to their stream (`1a3b47e`),
+a message's transaction only queues its push notifications (`6180d8d`), and
+WAL checkpoints run on a thread of their own instead of in the commit that
+crosses 1,000 pages, holding the write lock (`e152b5b`), as Rust's do.
+
+The sections after this one are older runs, from before 2026-11-07, of the
+apps the fork's `egg` branch had then:
 
 - `egg`: rendering every page;
 - `egg-cache`: the same image with `CAMPFIRE_CACHE=1`, which keeps whole
@@ -121,8 +147,9 @@ are level rather than one ahead. Egg serves its sockets from
   and compresses nothing. Rust sends the avatar from disk (`send_file`) and
   the CSS from its binary, which embeds the assets, gzipping it on every
   request as Rack::Deflater does.
-- Posting: the two are on par. The Rust app also broadcasts the message
-  over Action Cable, queues Web Push and calls bots' webhooks after it
-  answers; Egg does none of these yet (see PLAN.md).
+- Posting: both write the message, its search entry and unread marks in
+  one transaction, queue its Web Push notifications and bots' webhooks,
+  and broadcast it over Action Cable. In the older runs below Egg did none
+  of the last three yet.
 - The benchmark measures one user's identical requests. It does not measure
   how many users or connections an app holds, nor WebSockets.
