@@ -867,6 +867,50 @@ fn service_worker(a: Allocator, inout out: Buf(u8)) void {
     a.append_str(&out, "self.addEventListener(\"push\", async (event) => {\n  const data = await event.data.json()\n  event.waitUntil(Promise.all([ showNotification(data), updateBadgeCount(data.options) ]))\n})\n\nasync function showNotification({ title, options }) {\n  return self.registration.showNotification(title, options)\n}\n\nasync function updateBadgeCount({ data: { badge } }) {\n  return self.navigator.setAppBadge?.(badge || 0)\n}\n\nself.addEventListener(\"notificationclick\", (event) => {\n  event.notification.close()\n\n  const url = new URL(event.notification.data.path, self.location.origin).href\n  event.waitUntil(openURL(url))\n})\n\nasync function openURL(url) {\n  const clients = await self.clients.matchAll({ type: \"window\" })\n  const focused = clients.find((client) => client.focused)\n\n  if (focused) {\n    await focused.navigate(url)\n  } else {\n    await self.clients.openWindow(url)\n  }\n}\n")
 }
 
+// session_new.html
+fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, account: []u8, alert: bool, has_email: bool, email: []u8, owner: bool, owner_name: []u8, owner_email: []u8, version: []u8) void {
+    guest_top(a, &out, "Sign in", vapid, logo)
+    if (@len(css) > 0) {
+    a.append_str(&out, "<style>")
+    a.append_str(&out, css)
+    a.append_str(&out, "</style>")
+    }
+    a.append_str(&out, "\n\n    <meta name=\"turbo-visit-control\" content=\"reload\">\n  </head>\n\n  <body class=\"\" data-controller=\"local-time lightbox\">\n    <a href=\"#main-content\" class=\"skip-navigation btn\">Skip to main content</a>\n\n    <nav id=\"nav\">\n      \n    </nav>\n\n")
+    if (alert) {
+    a.append_str(&out, "      <div class=\"flash\" data-controller=\"element-removal\" data-action=\"animationend->element-removal#remove\">\n        <div class=\"flash__inner shadow\" style=\"--flash-background: var(--color-negative)\">\n            <img aria-hidden=\"true\" class=\"colorize--white\" src=\"/assets/alert-b937985b.svg\" width=\"24\" height=\"24\" /></span>\n        </div>\n        <span class=\"for-screen-reader\" role=\"alert\" aria-atomic=\"true\">Too many requests or unauthorized.</span>\n      </div>\n")
+    }
+    a.append_str(&out, "\n    <main id=\"main-content\">\n      \n<section class=\"txt-align-center\">\n  <div class=\"panel ")
+    if (alert) {
+    a.append_str(&out, "shake")
+    }
+    a.append_str(&out, "\">\n    <figure class=\"account-logo avatar center margin-block-end txt-xx-large\"><img alt=\"Account logo\" src=\"")
+    a.append_str(&out, logo)
+    a.append_str(&out, "\" width=\"300\" height=\"300\" /></figure>\n\n    <form class=\"flex flex-column gap\" action=\"/session\" accept-charset=\"UTF-8\" method=\"post\">\n      <fieldset class=\"flex flex-column gap center-block upad\">\n        <legend class=\"txt-large txt-align-center\"><strong>")
+    html.escape(a, &out, account)
+    a.append_str(&out, "</strong></legend>\n\n        <div class=\"flex align-center gap\">\n          <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your email address</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class=\"margin-none\">メールアドレスを入力してください</dd></dl></div></details>\n          <label class=\"flex align-center gap input input--actor txt-large\">\n            <input required=\"required\" class=\"input\" autofocus=\"autofocus\" autocomplete=\"username\" placeholder=\"Enter your email address\" ")
+    if (has_email) {
+    a.append_str(&out, "value=\"")
+    html.escape(a, &out, email)
+    a.append_str(&out, "\" ")
+    }
+    a.append_str(&out, "type=\"email\" name=\"email_address\" id=\"email_address\" />\n            <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/email-6c595bc5.svg\" width=\"24\" height=\"24\" />\n          </label>\n        </div>\n\n        <div class=\"flex align-center gap\">\n          <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your password</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu contraseña</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Saisissez votre mot de passe</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना पासवर्ड दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihr Passwort ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira sua senha</dd><dt>🇯🇵</dt><dd class=\"margin-none\">パスワードを入力してください</dd></dl></div></details>\n          <label class=\"flex align-center gap input input--actor txt-large\">\n            <input required=\"required\" class=\"input\" autocomplete=\"current-password\" placeholder=\"Enter your password\" maxlength=\"72\" size=\"72\" type=\"password\" name=\"password\" id=\"password\" />\n            <img aria-hidden=\"true\" class=\"colorize--black\" src=\"/assets/password-0896da4e.svg\" width=\"24\" height=\"24\" />\n          </label>\n        </div>\n\n        <button name=\"log_in\" type=\"submit\" class=\"btn btn--reversed center txt-large\">\n          <img aria-hidden=\"true\" src=\"/assets/arrow-right-8f3eb40d.svg\" />\n          <span class=\"for-screen-reader\">Go</span>\n</button>      </fieldset>\n</form>  </div>\n\n")
+    if (owner) {
+    a.append_str(&out, "    <div class=\"txt-align-center margin-block-double full-width\">\n    <a class=\"btn center\" title=\"Email ")
+    html.escape(a, &out, owner_name)
+    a.append_str(&out, "\" href=\"mailto:&quot;")
+    html.escape(a, &out, owner_name)
+    a.append_str(&out, "&quot; &lt;")
+    html.escape(a, &out, owner_email)
+    a.append_str(&out, "&gt;\">\n      <img aria-hidden=\"true\" src=\"/assets/lifebuoy-f31f26aa.svg\" />\n      <span>")
+    html.escape(a, &out, owner_email)
+    a.append_str(&out, "</span>\n</a>\n    <div class=\"txt-align-center center margin-block txt-subtle\">Campfire&trade; version <span class=\"version-badge\">")
+    html.escape(a, &out, version)
+    a.append_str(&out, "</span></div>\n  </div>\n")
+    }
+    a.append_str(&out, "\n</section>\n\n\n      <footer id=\"footer\">\n        \n      </footer>\n    </main>\n\n    <aside id=\"sidebar\" data-controller=\"toggle-class\" data-toggle-class-toggle-class=\"open\">\n      \n    </aside>\n\n")
+    layout_bottom(a, &out)
+}
+
 // sidebar.html
 fn sidebar_show(a: Allocator, inout out: Buf(u8), user: model.UserView, sb: model.Sidebar, vapid: []u8, logo_v: []u8, css: []u8, admin: bool, can_create_rooms: bool, rooms_stream: []u8, user_stream: []u8) void {
     layout_top(a, &out, "Campfire", user, vapid, logo_v, css)

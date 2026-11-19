@@ -186,6 +186,10 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         if (!codec.base64_decode(a, &ours, public_key) or !codec.base64_decode(a, &theirs, configured) or ours != theirs) { return error.InvalidVapid }
         a.free(@replace(&shown, a.concat(configured, "")))
     }
+    // Rails' app_version: APP_VERSION, else GIT_REVISION, else "0".
+    var version: str = "0"
+    if (args.env("GIT_REVISION")) |v| { if (@len(v) > 0) { version = v } }
+    if (args.env("APP_VERSION")) |v| { if (@len(v) > 0) { version = v } }
     const cfg = app.Config{
         .db_path = db_path,
         .secret = secret,
@@ -193,6 +197,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .push_private = a.leak(private_key),
         .push_subject = args.env("VAPID_SUBJECT") orelse "mailto:admin@example.com",
         .push_allow_local = (args.env("CAMPFIRE_PUSH_ALLOW_LOCAL") orelse "0") == "1",
+        .version = version,
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
         .cache = (args.env("CAMPFIRE_CACHE") orelse "1") != "0",
