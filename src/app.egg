@@ -42,6 +42,8 @@ const Config = struct {
     push_private: str
     push_subject: str
     push_allow_local: bool
+    // The version on the sign-in page.
+    version: str
     // Active Storage's root, and the precompiled assets.
     files: str
     assets: str
@@ -65,6 +67,7 @@ const Context = owned struct {
     push_private: Buf(u8)
     push_subject: str
     push_allow_local: bool
+    version: str
     clock: Clock
     rng: Random
     fs: Fs
@@ -131,6 +134,7 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
         .push_private = a.concat(cfg.push_private, ""),
         .push_subject = cfg.push_subject,
         .push_allow_local = cfg.push_allow_local,
+        .version = cfg.version,
         .clock = clock,
         .rng = rng,
         .fs = files,
@@ -148,8 +152,6 @@ fn open(a: Allocator, cfg: Config, clock: Clock, rng: Random, files: Fs, sink lo
 }
 
 const HTML = "Content-Type: text/html; charset=utf-8\r\n"
-
-const SIGN_IN = "<!DOCTYPE html><html><head><title>Campfire</title></head><body><form action=\"/session\" method=\"post\"><input type=\"email\" name=\"email_address\" required autofocus><input type=\"password\" name=\"password\" required><button type=\"submit\">Sign in</button></form></body></html>"
 
 // Answers req; whether c goes on serving HTTP (not after a WebSocket
 // handshake).
@@ -233,7 +235,11 @@ fn dispatch(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
         if (!try model.users_exist(ctx.db)) {
             return redirect(c, a, req, "/first_run")
         }
-        return http.respond(c, a, req, "200 OK", HTML, SIGN_IN)
+        if (codec.form_value(a, req.query, "email_address")) |email| {
+            defer a.free(email)
+            return sign_in_page(c, a, &ctx, req, "200 OK", false, true, email)
+        }
+        return sign_in_page(c, a, &ctx, req, "200 OK", false, false, "")
     }
     if (req.method == "GET" and req.path == "/account/logo") {
         return account_logo(c, a, &ctx, req)
@@ -599,14 +605,22 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     }
     ctx.lock_tx.send(true)
     if (!allowed) {
-        return http.respond(c, a, req, "429 Too Many Requests", HTML, SIGN_IN)
+        if (codec.form_value(a, req.body, "email_address")) |email| {
+            defer a.free(email)
+            return sign_in_page(c, a, &ctx, req, "429 Too Many Requests", true, true, email)
+        }
+        return sign_in_page(c, a, &ctx, req, "429 Too Many Requests", true, false, "")
     }
     const email = codec.form_value(a, req.body, "email_address") orelse a.concat("", "")
     defer a.free(email)
     const password = codec.form_value(a, req.body, "password") orelse a.concat("", "")
     defer a.free(password)
     const user = try session.authenticate(a, ctx.db, email, password) orelse {
-        return http.respond(c, a, req, "401 Unauthorized", HTML, SIGN_IN)
+        if (codec.form_value(a, req.body, "email_address")) |given| {
+            a.free(given)
+            return sign_in_page(c, a, &ctx, req, "401 Unauthorized", true, true, email)
+        }
+        return sign_in_page(c, a, &ctx, req, "401 Unauthorized", true, false, "")
     }
     _ = ctx.lock_rx.recv()
     const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
@@ -621,6 +635,33 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
     session.set_cookie(a, &headers, ctx.key, ctx.clock, token)
     a.append_str(&headers, HTML)
     return http.respond(c, a, req, "302 Found", headers, "")
+}
+
+// sessions/new: the account's logo and name, the sign-in form (shaken, with
+// the alert, when rejected; the email address kept), and whom to ask for help.
+fn sign_in_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, status: str, alert: bool, has_email: bool, email: []u8) !void {
+    var logo: Buf(u8) = .empty
+    defer a.free(logo)
+    a.append_str(&logo, "/account/logo?v=")
+    try logo_stamp(a, &logo, ctx.db)
+    const css = try custom_css(a, ctx.db)
+    defer a.free(css)
+    var account = try ctx.db.prepare("SELECT name FROM accounts ORDER BY id LIMIT 1")
+    defer account.finalize()
+    const name = if (try account.next()) account.text(a, 0) else a.concat("", "")
+    defer a.free(name)
+    // User.administrator.first
+    var owner = try ctx.db.prepare("SELECT name, email_address FROM users WHERE role = 1 ORDER BY id LIMIT 1")
+    defer owner.finalize()
+    const has_owner = try owner.next()
+    const owner_name = if (has_owner) owner.text(a, 0) else a.concat("", "")
+    defer a.free(owner_name)
+    const owner_email = if (has_owner) owner.text(a, 1) else a.concat("", "")
+    defer a.free(owner_email)
+    var body: Buf(u8) = .empty
+    defer a.free(body)
+    views.session_new(a, &body, ctx.vapid, logo, css, req.host, name, alert, has_email, email, has_owner, owner_name, owner_email, ctx.version)
+    return http.respond(c, a, req, status, HTML, body)
 }
 
 fn sign_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
