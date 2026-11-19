@@ -1,0 +1,73 @@
+<%fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, has_logo: bool, account: []u8, email: []u8, rejected: bool, admin_name: []u8, admin_email: []u8, version: []u8) %>
+<% guest_top(a, &out, "Sign in", vapid, logo) %><% if (@len(css) > 0) { %><style data-turbo-track="reload"><%- css %></style><% } %>
+
+    <meta name="turbo-visit-control" content="reload">
+  </head>
+
+  <body class="<% if (has_logo) { %>account-has-logo<% } %>" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+
+    <nav id="nav">
+      
+    </nav>
+
+<% if (rejected) { %>      <div class="flash" data-controller="element-removal" data-action="animationend->element-removal#remove">
+        <div class="flash__inner shadow" style="--flash-background: var(--color-negative)">
+            <img aria-hidden="true" class="colorize--white" src="/assets/alert-b937985b.svg" width="24" height="24" />
+        </div>
+        <span class="for-screen-reader" role="alert" aria-atomic="true">Too many requests or unauthorized.</span>
+      </div>
+<% } %>
+    <main id="main-content">
+      
+<section class="txt-align-center">
+  <div class="panel <% if (rejected) { %>shake<% } %>">
+    <figure class="account-logo avatar center margin-block-end txt-xx-large"><img alt="Account logo" src="<%- logo %>" width="300" height="300" /></figure>
+
+    <form class="flex flex-column gap" action="/session" accept-charset="UTF-8" method="post">
+      <fieldset class="flex flex-column gap center-block upad">
+        <legend class="txt-large txt-align-center"><strong><%= account %></strong></legend>
+
+        <div class="flex align-center gap">
+          <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Enter your email address</dd><dt>🇪🇸</dt><dd class="margin-none">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class="margin-none">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class="margin-none">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class="margin-none">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class="margin-none">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class="margin-none">メールアドレスを入力してください</dd></dl></div></details>
+          <label class="flex align-center gap input input--actor txt-large">
+            <input required="required" class="input" autofocus="autofocus" autocomplete="username" placeholder="Enter your email address"<% if (@len(email) > 0) { %> value="<%= email %>"<% } %> type="email" name="email_address" id="email_address" />
+            <img aria-hidden="true" class="colorize--black" src="/assets/email-6c595bc5.svg" width="24" height="24" />
+          </label>
+        </div>
+
+        <div class="flex align-center gap">
+          <details class="position-relative" data-controller="popup" data-action="keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside" data-popup-orientation-top-class="popup-orientation-top"><summary class="btn" tabindex="-1"><img aria-hidden="true" class="color-icon" src="/assets/globe-8c54d23b.svg" width="20" height="20" /><span class="for-screen-reader">Translate</span></summary><div class="language-list-menu shadow" data-popup-target="menu"><dl class="language-list"><dt>🇺🇸</dt><dd class="margin-none">Enter your password</dd><dt>🇪🇸</dt><dd class="margin-none">Introduce tu contraseña</dd><dt>🇫🇷</dt><dd class="margin-none">Saisissez votre mot de passe</dd><dt>🇮🇳</dt><dd class="margin-none">अपना पासवर्ड दर्ज करें</dd><dt>🇩🇪</dt><dd class="margin-none">Geben Sie Ihr Passwort ein</dd><dt>🇧🇷</dt><dd class="margin-none">Insira sua senha</dd><dt>🇯🇵</dt><dd class="margin-none">パスワードを入力してください</dd></dl></div></details>
+          <label class="flex align-center gap input input--actor txt-large">
+            <input required="required" class="input" autocomplete="current-password" placeholder="Enter your password" maxlength="72" size="72" type="password" name="password" id="password" />
+            <img aria-hidden="true" class="colorize--black" src="/assets/password-0896da4e.svg" width="24" height="24" />
+          </label>
+        </div>
+
+        <button name="log_in" type="submit" class="btn btn--reversed center txt-large">
+          <img aria-hidden="true" src="/assets/arrow-right-8f3eb40d.svg" />
+          <span class="for-screen-reader">Go</span>
+</button>      </fieldset>
+</form>  </div>
+
+<% if (@len(admin_email) > 0) { %>    <div class="txt-align-center margin-block-double full-width">
+    <a class="btn center" title="Email <%= admin_name %>" href="mailto:&quot;<%= admin_name %>&quot; &lt;<%= admin_email %>&gt;">
+      <img aria-hidden="true" src="/assets/lifebuoy-f31f26aa.svg" />
+      <span><%= admin_email %></span>
+</a>
+    <div class="txt-align-center center margin-block txt-subtle">Campfire&trade; version <span class="version-badge"><%= version %></span></div>
+  </div>
+<% } %>
+</section>
+
+
+      <footer id="footer">
+        
+      </footer>
+    </main>
+
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+      
+    </aside>
+
+<% layout_bottom(a, &out) %>
