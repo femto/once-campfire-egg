@@ -1,4 +1,4 @@
-<%fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, host: []u8, account: []u8, alert: bool, has_email: bool, email: []u8, owner: bool, owner_name: []u8, owner_email: []u8, version: []u8) %>
+<%fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, account: []u8, alert: bool, has_email: bool, email: []u8, owner: bool, owner_name: []u8, owner_email: []u8, version: []u8) %>
 <% guest_top(a, &out, "Sign in", vapid, logo) %><% if (@len(css) > 0) { %><style><%- css %></style><% } %>
 
 
@@ -27,7 +27,7 @@
   <div class="panel <% if (alert) { %>shake<% } %>">
     <figure class="account-logo avatar center margin-block-end txt-xx-large"><img alt="Account logo" src="<%- logo %>" width="300" height="300" /></figure>
 
-    <form class="flex flex-column gap" action="http://<%= host %>/session" accept-charset="UTF-8" method="post">
+    <form class="flex flex-column gap" action="/session" accept-charset="UTF-8" method="post">
       <fieldset class="flex flex-column gap center-block upad">
         <legend class="txt-large txt-align-center"><strong><%= account %></strong></legend>
 

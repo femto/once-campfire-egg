@@ -660,7 +660,7 @@ fn sign_in_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request,
     defer a.free(owner_email)
     var body: Buf(u8) = .empty
     defer a.free(body)
-    views.session_new(a, &body, ctx.vapid, logo, css, req.host, name, alert, has_email, email, has_owner, owner_name, owner_email, ctx.version)
+    views.session_new(a, &body, ctx.vapid, logo, css, name, alert, has_email, email, has_owner, owner_name, owner_email, ctx.version)
     return http.respond(c, a, req, status, HTML, body)
 }
 

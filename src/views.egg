@@ -868,7 +868,7 @@ fn service_worker(a: Allocator, inout out: Buf(u8)) void {
 }
 
 // session_new.html
-fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, host: []u8, account: []u8, alert: bool, has_email: bool, email: []u8, owner: bool, owner_name: []u8, owner_email: []u8, version: []u8) void {
+fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: []u8, account: []u8, alert: bool, has_email: bool, email: []u8, owner: bool, owner_name: []u8, owner_email: []u8, version: []u8) void {
     guest_top(a, &out, "Sign in", vapid, logo)
     if (@len(css) > 0) {
     a.append_str(&out, "<style>")
@@ -885,9 +885,7 @@ fn session_new(a: Allocator, inout out: Buf(u8), vapid: []u8, logo: []u8, css: [
     }
     a.append_str(&out, "\">\n    <figure class=\"account-logo avatar center margin-block-end txt-xx-large\"><img alt=\"Account logo\" src=\"")
     a.append_str(&out, logo)
-    a.append_str(&out, "\" width=\"300\" height=\"300\" /></figure>\n\n    <form class=\"flex flex-column gap\" action=\"http://")
-    html.escape(a, &out, host)
-    a.append_str(&out, "/session\" accept-charset=\"UTF-8\" method=\"post\">\n      <fieldset class=\"flex flex-column gap center-block upad\">\n        <legend class=\"txt-large txt-align-center\"><strong>")
+    a.append_str(&out, "\" width=\"300\" height=\"300\" /></figure>\n\n    <form class=\"flex flex-column gap\" action=\"/session\" accept-charset=\"UTF-8\" method=\"post\">\n      <fieldset class=\"flex flex-column gap center-block upad\">\n        <legend class=\"txt-large txt-align-center\"><strong>")
     html.escape(a, &out, account)
     a.append_str(&out, "</strong></legend>\n\n        <div class=\"flex align-center gap\">\n          <details class=\"position-relative\" data-controller=\"popup\" data-action=\"keydown.esc-&gt;popup#close toggle-&gt;popup#toggle click@document-&gt;popup#closeOnClickOutside\" data-popup-orientation-top-class=\"popup-orientation-top\"><summary class=\"btn\" tabindex=\"-1\"><img aria-hidden=\"true\" class=\"color-icon\" src=\"/assets/globe-8c54d23b.svg\" width=\"20\" height=\"20\" /><span class=\"for-screen-reader\">Translate</span></summary><div class=\"language-list-menu shadow\" data-popup-target=\"menu\"><dl class=\"language-list\"><dt>🇺🇸</dt><dd class=\"margin-none\">Enter your email address</dd><dt>🇪🇸</dt><dd class=\"margin-none\">Introduce tu correo electrónico</dd><dt>🇫🇷</dt><dd class=\"margin-none\">Entrez votre adresse courriel</dd><dt>🇮🇳</dt><dd class=\"margin-none\">अपना ईमेल पता दर्ज करें</dd><dt>🇩🇪</dt><dd class=\"margin-none\">Geben Sie Ihre E-Mail-Adresse ein</dd><dt>🇧🇷</dt><dd class=\"margin-none\">Insira seu endereço de email</dd><dt>🇯🇵</dt><dd class=\"margin-none\">メールアドレスを入力してください</dd></dl></div></details>\n          <label class=\"flex align-center gap input input--actor txt-large\">\n            <input required=\"required\" class=\"input\" autofocus=\"autofocus\" autocomplete=\"username\" placeholder=\"Enter your email address\" ")
     if (has_email) {
