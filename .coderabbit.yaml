@@ -1,6 +1,8 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
   # CodeRabbit's default filters leave out *.egg (taken for Python egg
-  # archives), which are the app's Egg source here: review every file.
+  # archives), which are the app's Egg source here. Its !**/*.egg wins over
+  # a bare **/*, so the Egg files are named on their own.
   path_filters:
     - "**/*"
+    - "**/*.egg"
