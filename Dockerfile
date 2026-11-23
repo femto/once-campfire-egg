@@ -4,8 +4,8 @@
 # The assets come from the build context: run script/assets.sh build/assets
 # first.
 ARG DEBIAN_RELEASE=trixie
-# egg main with #83 (TcpConn.peer_ip).
-ARG EGG_REF=2dd9984
+# egg v0.2.2: std/ws with a Conn for either end, and TcpConn.peer_ip.
+ARG EGG_REF=8dfb793
 # gzip through zlib-ng's zlib-compatible build, linked statically: the Rust
 # app deflates with zlib-rs, of the same speed, and stock zlib is slower.
 ARG ZLIB_NG_VERSION=2.2.4

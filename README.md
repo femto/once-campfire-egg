@@ -96,8 +96,8 @@ runs (Debian, zlib-ng).
 
 `make test-accounts` checks group Ping membership, profile password
 preservation, session metadata, login limits and sign-out using a disposable
-database. Docker applies the local `TcpConn.peer_ip` compiler patch to its
-pinned Egg checkout; native builds need that API in `EGG_DIR` too.
+database. The WebSocket framing is Egg's `std/ws`, so `EGG_DIR` needs Egg
+v0.2.2 or newer, the version Docker pins.
 
 `make test-webhooks` exercises real local callbacks, signed mentions, payloads,
 text and binary replies, attachment permissions, timeout handling, sender
