@@ -12,7 +12,7 @@
 // frame made once for each subscription's identifier.
 uses alloc, io, net, thread, time
 
-const ws = @import("ws.egg")
+const ws = @import("std/ws")
 const json = @import("json.egg")
 const turbo = @import("turbo.egg")
 const sqlite = @import("sqlite.egg")
@@ -184,8 +184,7 @@ const Conn = owned struct {
     user: i64
     // The user's name, for typing notifications; looked up once.
     name: Buf(u8)
-    inbox: Buf(u8)
-    part: ws.Partial
+    ws: ws.Conn
     outbox: Buf(u8)
     subs: Buf(Sub)
     // To be let go once this round is over.
@@ -193,8 +192,7 @@ const Conn = owned struct {
 
     fn deinit(sink self: Conn, a: Allocator) void {
         a.free(self.name)
-        a.free(self.inbox)
-        self.part.deinit(a)
+        self.ws.deinit(a)
         a.free(self.outbox)
         a.free(self.subs)
         @forget(self)
@@ -311,13 +309,28 @@ fn run(sink ups: Receiver(Upgrade), sink cmds: Receiver(Cmd), sink to_hub: Sende
     }
 }
 
+// A server's frame of opcode with payload: unmasked, and the same for
+// every socket, so made once for all who get it.
+fn server_frame(a: Allocator, opcode: i64, payload: []u8) Buf(u8) {
+    var c = ws.server(.empty)
+    defer c.deinit(a)
+    return ws.frame(a, &c, opcode, payload)
+}
+
+// A close frame with code and no reason.
+fn close_frame(a: Allocator, code: i64) Buf(u8) {
+    var c = ws.server(.empty)
+    defer c.deinit(a)
+    return ws.close_frame(a, &c, code, "")
+}
+
 fn ping(a: Allocator, clock: Clock) Buf(u8) {
     var msg: Buf(u8) = .empty
     defer a.free(msg)
     a.append_str(&msg, "{\"type\":\"ping\",\"message\":")
     a.append_int(&msg, clock.now() / 1000000000)
     a.append_str(&msg, "}")
-    return ws.text_frame(a, msg)
+    return server_frame(a, ws.TEXT, msg)
 }
 
 // A loop, for as long as the process runs.
@@ -378,9 +391,9 @@ fn take_in(a: Allocator, inout l: Loop, sink m: In) void {
         const t = l.p.add(u.take(), .read) catch {
             continue
         }
-        a.push(&l.conns, Conn{ .token = t, .user = user, .name = .empty, .inbox = .empty, .part = ws.partial(), .outbox = .empty, .subs = .empty, .dead = false })
+        a.push(&l.conns, Conn{ .token = t, .user = user, .name = .empty, .ws = ws.server(.empty), .outbox = .empty, .subs = .empty, .dead = false })
         l.index.put(a, t, @len(l.conns) - 1)
-        const w = ws.text_frame(a, WELCOME)
+        const w = server_frame(a, ws.TEXT, WELCOME)
         defer a.free(w)
         const ci = @len(l.conns) - 1
         send(a, &l, ci, w)
@@ -409,7 +422,7 @@ fn cast(a: Allocator, inout l: Loop, stream: []u8, message: []u8) void {
                 a.append_str(&msg, ",\"message\":")
                 a.append_str(&msg, message)
                 a.append_str(&msg, "}")
-                a.free(@replace(&frame, ws.text_frame(a, msg)))
+                a.free(@replace(&frame, server_frame(a, ws.TEXT, msg)))
                 a.free(@replace(&made_for, a.concat(l.listeners[i].identifier, "")))
             }
             if (l.index.get(l.listeners[i].token)) |ci| {
@@ -494,30 +507,30 @@ fn readable(a: Allocator, io: Io, inout l: Loop, t: i64, inout data: Buf(u8)) vo
         l.conns[ci].dead = true
         return
     }
-    a.append_str(&l.conns[ci].inbox, chunk)
+    var wc = @replace(&l.conns[ci].ws, ws.server(.empty))
+    ws.received(a, &wc, chunk)
+    const empty = @replace(&l.conns[ci].ws, wc)
+    empty.deinit(a)
     while (!l.conns[ci].dead) {
-        var inbox = @replace(&l.conns[ci].inbox, .empty)
-        var part = @replace(&l.conns[ci].part, ws.partial())
-        const kind = ws.take(a, &inbox, &part, &data)
-        a.free(@replace(&l.conns[ci].inbox, inbox))
-        const old = @replace(&l.conns[ci].part, part)
-        old.deinit(a)
+        var conn = @replace(&l.conns[ci].ws, ws.server(.empty))
+        const kind = ws.take(a, &conn, &data)
+        const none = @replace(&l.conns[ci].ws, conn)
+        none.deinit(a)
         if (kind == ws.NEED_MORE) {
             return
         }
         if (kind == ws.TEXT) {
             command(a, io, &l, ci, data)
         } else if (kind == ws.PING) {
-            var pong: Buf(u8) = .empty
-            ws.frame(a, &pong, ws.PONG, data)
-            send_owned(a, &l, ci, pong)
+            send_owned(a, &l, ci, server_frame(a, ws.PONG, data))
         } else if (kind == ws.CLOSE) {
             // The closing handshake: the same code back, or a normal close.
-            const code = if (@len(data) >= 2) @as(i64, data[0]) << 8 | @as(i64, data[1]) else 1000
-            send_owned(a, &l, ci, ws.close_frame(a, code))
+            const code = if (@len(data) >= 2) ws.close_code(data) else 1000
+            send_owned(a, &l, ci, close_frame(a, code))
             l.conns[ci].dead = true
-        } else if (kind == ws.PROTOCOL_ERROR or kind == ws.TOO_BIG) {
-            send_owned(a, &l, ci, ws.close_frame(a, -kind))
+        } else if (kind < 0) {
+            // PROTOCOL_ERROR, BAD_TEXT or TOO_BIG: -kind is the close code.
+            send_owned(a, &l, ci, close_frame(a, -kind))
             l.conns[ci].dead = true
         } else if (kind == ws.BINARY) {
             io.eprint("cable: Couldn't handle non-string message")
@@ -624,7 +637,7 @@ fn reply_encoded(a: Allocator, encoded: []u8, kind: str) Buf(u8) {
     a.append_str(&msg, ",\"type\":\"")
     a.append_str(&msg, kind)
     a.append_str(&msg, "\"}")
-    return ws.text_frame(a, msg)
+    return server_frame(a, ws.TEXT, msg)
 }
 
 // Is members' key the string value?

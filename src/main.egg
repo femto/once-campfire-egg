@@ -193,6 +193,7 @@ fn main(io: Io, args: Args, net: Net, a: Allocator, threads: Threads, clock: Clo
         .push_private = a.leak(private_key),
         .push_subject = args.env("VAPID_SUBJECT") orelse "mailto:admin@example.com",
         .push_allow_local = (args.env("CAMPFIRE_PUSH_ALLOW_LOCAL") orelse "0") == "1",
+        .version = args.env("APP_VERSION") orelse (args.env("GIT_REVISION") orelse "0"),
         .files = files_dir,
         .assets = args.env("CAMPFIRE_ASSETS_PATH") orelse "build/assets",
         .cache = (args.env("CAMPFIRE_CACHE") orelse "1") != "0",
