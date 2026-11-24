@@ -40,6 +40,9 @@ fn read_request(c: TcpConn, a: Allocator, inout inbox: Buf(u8), served: i64) !?R
     defer a.free(chunk)
     var framed = false
     while (true) {
+        if (leading(inbox) > MAX_HEAD) {
+            return error.BadRequest
+        }
         if (!framed) {
             framed = try not_chunked(inbox)
         }
@@ -49,9 +52,6 @@ fn read_request(c: TcpConn, a: Allocator, inout inbox: Buf(u8), served: i64) !?R
                 std.close_after(&req)
             }
             return req
-        }
-        if (std.idle(inbox) and @len(inbox) > MAX_HEAD) {
-            return error.BadRequest
         }
         const n = c.read(a, &chunk, READ_SIZE) catch |e| {
             if (e == error.TimedOut and std.idle(inbox)) {
@@ -70,15 +70,21 @@ fn read_request(c: TcpConn, a: Allocator, inout inbox: Buf(u8), served: i64) !?R
     return null
 }
 
+// How many CR and LF bytes come before inbox's next request.
+fn leading(inbox: []u8) i64 {
+    var at = 0
+    while (at < @len(inbox) and (inbox[at] == '\r' or inbox[at] == '\n')) {
+        at = at + 1
+    }
+    return at
+}
+
 // Has inbox the whole head of its next request, without Transfer-Encoding?
 // false while the head has not all come; error.LengthRequired for a
 // Transfer-Encoding. Looks at no more than MAX_HEAD past the empty lines
 // before the request; std.parse refuses a longer head.
 fn not_chunked(inbox: []u8) !bool {
-    var at = 0
-    while (at < @len(inbox) and (inbox[at] == '\r' or inbox[at] == '\n')) {
-        at = at + 1
-    }
+    var at = leading(inbox)
     const limit = at + MAX_HEAD
     while (at < @len(inbox) and at < limit) {
         const nl = text.find_from(inbox, "\n", at) orelse { return false }
@@ -206,16 +212,78 @@ fn file(a: Allocator, req: Request, name: []u8) ?Upload {
 
 // A stored file: whole (encoded, with its ETag) unless the request asks
 // for one range of bytes, which it gets (206, or 416 for one not in it).
-// A Range std.ranged would not honor (several ranges, another unit) goes
-// the way no Range does, as does one with If-None-Match: the validator is
-// then looked at first (RFC 9110 13.2.2), and the whole body is a fine
-// answer to a Range.
+// A Range of several ranges or another unit goes the way no Range does,
+// as does one with If-None-Match: the validator is then looked at first
+// (RFC 9110 13.2.2), and the whole body is a fine answer to a Range.
 fn file_response(c: TcpConn, a: Allocator, req: Request, headers: []u8, body: []u8) !void {
     const range = header(req, "Range")
-    if (text.starts_with(range, "bytes=") and !text.contains(range, ",") and @len(header(req, "If-None-Match")) == 0) {
-        return std.ranged(c, a, req, headers, body)
+    const with_ranges = a.concat(headers, "Accept-Ranges: bytes\r\n")
+    defer a.free(with_ranges)
+    if (!text.starts_with(range, "bytes=") or text.contains(range, ",") or @len(header(req, "If-None-Match")) > 0) {
+        return respond(c, a, req, "200 OK", with_ranges, body)
     }
-    const ranged = a.concat(headers, "Accept-Ranges: bytes\r\n")
-    defer a.free(ranged)
-    return respond(c, a, req, "200 OK", ranged, body)
+    // std.ranged's, but for positions: leading zeros are taken, as RFC
+    // 9110's 1*DIGIT allows, where std/http stops at 18 digits.
+    var from = -1
+    var to = @len(body) - 1
+    const dash = text.find_from(range, "-", 6) orelse -1
+    if (dash == 6) {
+        // bytes=-n: the last n.
+        const suffix = position(range[dash + 1..]) orelse 0
+        if (suffix > 0) {
+            from = if (suffix >= @len(body)) 0 else @len(body) - suffix
+        }
+    } else if (dash > 6) {
+        from = position(range[6..dash]) orelse -1
+        if (dash + 1 < @len(range)) {
+            const last = position(range[dash + 1..]) orelse -1
+            to = if (last < 0) -1 else if (last < to) last else to
+        }
+    }
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    a.append_str(&out, with_ranges)
+    a.append_str(&out, "Content-Range: bytes ")
+    if (from < 0 or from >= @len(body) or to < from) {
+        a.append_str(&out, "*/")
+        a.append_int(&out, @len(body))
+        a.append_str(&out, "\r\n")
+        return std.respond(c, a, req, "416 Range Not Satisfiable", "", out, "")
+    }
+    a.append_int(&out, from)
+    a.push(&out, '-')
+    a.append_int(&out, to)
+    a.push(&out, '/')
+    a.append_int(&out, @len(body))
+    a.append_str(&out, "\r\n")
+    return std.respond(c, a, req, "206 Partial Content", "", out, body[from..to + 1])
+}
+
+// A position in a Range: decimal digits, leading zeros and all; past any
+// body (MAX_POSITION) if it has more than 18 digits once they are gone;
+// null for what is not digits.
+const MAX_POSITION = 1000000000000000000
+
+fn position(s: []u8) ?i64 {
+    if (@len(s) == 0) {
+        return null
+    }
+    for (s) |d| {
+        if (d < '0' or d > '9') {
+            return null
+        }
+    }
+    var i = 0
+    while (i < @len(s) - 1 and s[i] == '0') {
+        i = i + 1
+    }
+    if (@len(s) - i > 18) {
+        return MAX_POSITION
+    }
+    var n = 0
+    while (i < @len(s)) {
+        n = n * 10 + @as(i64, s[i] - '0')
+        i = i + 1
+    }
+    return n
 }

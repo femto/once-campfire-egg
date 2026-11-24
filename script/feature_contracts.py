@@ -133,6 +133,14 @@ def run(base,db,endpoint,restart):
         owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':'bytes=99999999-'}))
         raise AssertionError('unsatisfiable range accepted')
     except urllib.error.HTTPError as error: assert error.code==416
+    # Positions may have leading zeros, as many as a client sends.
+    for spec,want in [('bytes=0000-0007',png[:8]),('bytes=-0000000000000000008',png[-8:]),('bytes='+'0'*40+'1-',png[1:]),('bytes=-'+'9'*30,png)]:
+        with owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':spec})) as response: assert response.status==206 and response.read()==want, spec
+    for spec in ['bytes=-0','bytes=-000','bytes='+'9'*30+'-']:
+        try:
+            owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':spec}))
+            raise AssertionError('unsatisfiable range accepted: '+spec)
+        except urllib.error.HTTPError as error: assert error.code==416, spec
     # Several ranges get the whole file as no Range does, validator and all;
     # so does a Range with If-None-Match, which a matching tag answers first.
     with owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':'bytes=0-0,2-2'})) as response:
