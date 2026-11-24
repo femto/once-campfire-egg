@@ -1,0 +1,6 @@
+# CodeRabbit leaves out *.egg by default, which is nearly all of this app.
+reviews:
+  path_filters:
+    - "**/*.egg"
+    # Generated from templates/ by script/templates.rb.
+    - "!src/views.egg"
