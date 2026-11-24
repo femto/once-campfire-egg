@@ -1,4 +1,5 @@
-# eggc from an egg checkout at main.
+# eggc from an egg checkout at main. Since Egg 0.2.0, eggc build compiles
+# the C at -O0 unless given --release (-O2).
 EGG_DIR ?= $(HOME)/crystal-project/egg
 EGGC ?= ruby -I$(EGG_DIR)/lib $(EGG_DIR)/bin/eggc
 CC ?= cc
@@ -9,7 +10,7 @@ OPENSSL ?= $(shell test -d /usr/local/opt/openssl@3 && echo /usr/local/opt/opens
 LIBDIRS = -L build $(EXTRA_LIBDIRS) $(if $(OPENSSL),-L $(OPENSSL)/lib)
 
 build/campfire: build/libcfbcrypt.a build/libcfsys.a build/libcfqr.a build/libcfwebhook.a build/libcfmedia.a src/views.egg $(wildcard src/*.egg src/*/*.egg)
-	$(EGGC) build src/main.egg -o build/campfire $(LIBDIRS)
+	$(EGGC) build --release src/main.egg -o build/campfire $(LIBDIRS)
 
 src/views.egg: script/templates.rb $(wildcard templates/*)
 	ruby script/templates.rb > $@
