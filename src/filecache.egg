@@ -76,5 +76,5 @@ fn open() Cache {
 
 // The key for a file's response: its path and whether it goes gzipped.
 fn key_for(a: Allocator, path: []u8, req: http.Request) Buf(u8) {
-    return a.concat(path, if (req.gzip) "\ngzip" else "\nidentity")
+    return a.concat(path, if (http.gzip(req)) "\ngzip" else "\nidentity")
 }
