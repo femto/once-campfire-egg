@@ -12,6 +12,8 @@ const codec = @import("codec.egg")
 const text = @import("std/text")
 
 const MAX_BODY = 33554432
+const MAX_HEAD = 65536
+const READ_SIZE = 65536
 // How many requests a connection makes before the next is answered with
 // Connection: close.
 const MAX_REQUESTS = 1000
@@ -23,15 +25,76 @@ const Upload = std.Upload
 // connection, with what came after the request), or null when the client
 // is done: it closed, or sent nothing more for 5 s. served is how many
 // requests the connection has made. Fails with error.BadRequest,
-// error.HeadTooLarge or error.BodyTooLarge on a request that cannot be
-// read safely; the caller then answers and closes.
+// error.HeadTooLarge, error.BodyTooLarge or error.LengthRequired on a
+// request that cannot be read safely; the caller then answers and closes.
+//
+// std.parse takes the request from inbox once it is whole; reading here
+// bounds what inbox may hold meanwhile: no more than MAX_HEAD of empty
+// lines before a request, a head of at most MAX_HEAD (std.parse), and a
+// body of a Content-Length of at most MAX_BODY. A chunked body is refused,
+// as Campfire always has (browsers do not send one): its framing would
+// have no bound, and std.parse would scan it again with every read.
 fn read_request(c: TcpConn, a: Allocator, inout inbox: Buf(u8), served: i64) !?Request {
     try c.set_timeout(5000)
-    var req = (try std.read_request(c, a, &inbox, MAX_BODY)) orelse { return null }
-    if (served >= MAX_REQUESTS) {
-        std.close_after(&req)
+    var chunk: Buf(u8) = .empty
+    defer a.free(chunk)
+    var framed = false
+    while (true) {
+        if (!framed) {
+            framed = try not_chunked(inbox)
+        }
+        if (try std.parse(a, &inbox, MAX_BODY)) |got| {
+            var req = got
+            if (served >= MAX_REQUESTS) {
+                std.close_after(&req)
+            }
+            return req
+        }
+        if (std.idle(inbox) and @len(inbox) > MAX_HEAD) {
+            return error.BadRequest
+        }
+        const n = c.read(a, &chunk, READ_SIZE) catch |e| {
+            if (e == error.TimedOut and std.idle(inbox)) {
+                return null
+            }
+            return e
+        }
+        if (n == 0) {
+            if (std.idle(inbox)) {
+                return null
+            }
+            return error.BadRequest
+        }
+        a.append_str(&inbox, chunk)
     }
-    return req
+    return null
+}
+
+// Has inbox the whole head of its next request, without Transfer-Encoding?
+// false while the head has not all come; error.LengthRequired for a
+// Transfer-Encoding. Looks at no more than MAX_HEAD past the empty lines
+// before the request; std.parse refuses a longer head.
+fn not_chunked(inbox: []u8) !bool {
+    var at = 0
+    while (at < @len(inbox) and (inbox[at] == '\r' or inbox[at] == '\n')) {
+        at = at + 1
+    }
+    const limit = at + MAX_HEAD
+    while (at < @len(inbox) and at < limit) {
+        const nl = text.find_from(inbox, "\n", at) orelse { return false }
+        var end = nl
+        if (end > at and inbox[end - 1] == '\r') {
+            end = end - 1
+        }
+        if (end == at) {
+            return true
+        }
+        if (end - at >= 18 and std.same(inbox[at..at + 18], "transfer-encoding:")) {
+            return error.LengthRequired
+        }
+        at = nl + 1
+    }
+    return false
 }
 
 // A header's value, or empty if the request has none.
@@ -141,10 +204,15 @@ fn file(a: Allocator, req: Request, name: []u8) ?Upload {
     return std.file(a, req, name)
 }
 
-// A stored file: whole (encoded, with its ETag) without a Range, or the
-// range of it asked for (206, or 416 for one not in it).
+// A stored file: whole (encoded, with its ETag) unless the request asks
+// for one range of bytes, which it gets (206, or 416 for one not in it).
+// A Range std.ranged would not honor (several ranges, another unit) goes
+// the way no Range does, as does one with If-None-Match: the validator is
+// then looked at first (RFC 9110 13.2.2), and the whole body is a fine
+// answer to a Range.
 fn file_response(c: TcpConn, a: Allocator, req: Request, headers: []u8, body: []u8) !void {
-    if (@len(header(req, "Range")) > 0) {
+    const range = header(req, "Range")
+    if (text.starts_with(range, "bytes=") and !text.contains(range, ",") and @len(header(req, "If-None-Match")) == 0) {
         return std.ranged(c, a, req, headers, body)
     }
     const ranged = a.concat(headers, "Accept-Ranges: bytes\r\n")

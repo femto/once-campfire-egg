@@ -31,6 +31,7 @@ fn serve(c: TcpConn, a: Allocator, inout ctx: app.Context) !void {
     while (true) {
         const req = (http.read_request(c, a, &inbox, served) catch |e| {
             if (e == error.BodyTooLarge) { return http.write_response(c, a, "413 Payload Too Large", "Content-Type: text/plain\r\n", "Uploads are limited to 32 MB", false) }
+            if (e == error.LengthRequired) { return http.write_response(c, a, "411 Length Required", "", "", false) }
             if (e == error.HeadTooLarge) { return http.write_response(c, a, "431 Request Header Fields Too Large", "", "", false) }
             if (e == error.BadRequest) { return http.write_response(c, a, "400 Bad Request", "", "", false) }
             return e

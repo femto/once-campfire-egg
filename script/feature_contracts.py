@@ -133,6 +133,14 @@ def run(base,db,endpoint,restart):
         owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':'bytes=99999999-'}))
         raise AssertionError('unsatisfiable range accepted')
     except urllib.error.HTTPError as error: assert error.code==416
+    # Several ranges get the whole file as no Range does, validator and all;
+    # so does a Range with If-None-Match, which a matching tag answers first.
+    with owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':'bytes=0-0,2-2'})) as response:
+        assert response.status==200 and response.read()==png; tag=response.headers['ETag']; assert tag
+    try:
+        owner.open(urllib.request.Request(base+'/attachments/'+blob,headers={'Range':'bytes=0-7','If-None-Match':tag}))
+        raise AssertionError('a matching validator was passed over for the range')
+    except urllib.error.HTTPError as error: assert error.code==304
     # Video posters and native audio controls use the same protected endpoints.
     with tempfile.TemporaryDirectory(prefix='campfire-video-') as temp:
         video_path=temp+'/clip.mp4'
