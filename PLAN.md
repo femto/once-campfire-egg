@@ -72,7 +72,8 @@ and Rack-escaped on the wire.
   /rails/storage/{db,files}); `docker build -t once-campfire-egg:app .`
   after script/assets.sh build/assets RUST_URL. Its pages match Rust's.
 - the benchmark: .github/workflows/benchmark.yml (manual) runs
-  femto/once-campfire-verification's egg branch (apps egg and egg-cache)
+  femto/once-campfire-verification's egg branch (app egg, which caches
+  by default)
   against once-campfire-rust's published image on ubuntu-latest
 
 The pages follow once-campfire-rust's HTML, not Rails': no CSRF tokens (Rust

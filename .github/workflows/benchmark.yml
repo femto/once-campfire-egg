@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       apps:
-        description: Apps, in order (rust, egg, egg-cache)
-        default: rust,egg,egg-cache
+        description: Apps, in order (rust, egg; egg caches by default, so egg-cache is the same)
+        default: rust,egg
       routes:
         description: Routes
         default: room_show,messages_page,sidebar,search,avatar,static_css,up,post_message
