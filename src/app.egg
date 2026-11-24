@@ -195,18 +195,20 @@ fn cable_protocol(asked: []u8) ?str {
 fn cable_open(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !bool {
     const base = a.concat("http://", req.host)
     defer a.free(base)
-    if (!req.upgrade or req.origin != base or req.ws_version != "13" or !ws.valid_key(a, req.ws_key)) {
+    if (!ws.is_handshake(a, req) or http.origin(req) != base) {
         try not_found(c, a, req)
         return true
     }
     var head: Buf(u8) = .empty
     defer a.free(head)
     a.append_str(&head, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: ")
-    const key = ws.accept(a, req.ws_key)
+    const key = ws.accept(a, http.header(req, "Sec-WebSocket-Key"))
     defer a.free(key)
     a.append_str(&head, key)
     a.append_str(&head, "\r\n")
-    if (cable_protocol(req.ws_protocol)) |p| {
+    const protocols = http.protocols(a, req)
+    defer a.free(protocols)
+    if (cable_protocol(protocols)) |p| {
         a.append_str(&head, "Sec-WebSocket-Protocol: ")
         a.append_str(&head, p)
         a.append_str(&head, "\r\n")
@@ -487,10 +489,10 @@ fn cache_key(a: Allocator, route: str, user: i64, req: http.Request) Buf(u8) {
     a.append_str(&k, req.query)
     a.append_str(&k, "\n")
     a.append_str(&k, req.host)
-    a.append_str(&k, if (req.gzip) "\ngzip\n" else "\nidentity\n")
+    a.append_str(&k, if (http.gzip(req)) "\ngzip\n" else "\nidentity\n")
     a.append_str(&k, req.cookie)
     a.append_str(&k, "\n")
-    a.append_str(&k, req.user_agent)
+    a.append_str(&k, http.user_agent(req))
     return k
 }
 
@@ -509,7 +511,7 @@ fn cached(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: 
 fn page_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, gen: i64, key: []u8, own: []u8, body: []u8, cuts: Buf(i64)) !void {
     // The fragments this page kept are of gen only if nothing committed.
     ctx.frags.finish(a, try ctx.cache.generation_now(a))
-    if (req.gzip and ctx.pieces.on and @len(cuts) > 0) {
+    if (http.gzip(req) and ctx.pieces.on and @len(cuts) > 0) {
         if (splice.gzip(a, &ctx.pieces, body, cuts)) |z| {
             defer a.free(z)
             const headers = a.concat(HTML, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
@@ -592,7 +594,7 @@ fn room_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request, id
     const invite = try model.invitation(a, &join_code, ctx.db, room.id)
     const css = try custom_css(a, ctx.db)
     defer a.free(css)
-    views.room_show(a, &body, user, room, messages, base, platform.browser(req.user_agent), platform.operating_system(req.user_agent), ctx.vapid, logo, css, admin, tf.epoch_ms(room.updated_ns), stream, invite, join_code, &ctx.frags, &cuts)
+    views.room_show(a, &body, user, room, messages, base, platform.browser(http.user_agent(req)), platform.operating_system(http.user_agent(req)), ctx.vapid, logo, css, admin, tf.epoch_ms(room.updated_ns), stream, invite, join_code, &ctx.frags, &cuts)
     return page_out(c, a, &ctx, req, gen, key, own, body, cuts)
 }
 
@@ -628,8 +630,11 @@ fn sign_in_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request,
 }
 
 fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    // The peer's address, before the write token is taken.
+    const peer = try c.peer_ip(a)
+    defer a.free(peer)
     _ = ctx.lock_rx.recv()
-    const allowed = session.allow_login(ctx.db, ctx.clock, req.peer_ip) catch |e| {
+    const allowed = session.allow_login(ctx.db, ctx.clock, peer) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -647,7 +652,7 @@ fn sign_in(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !voi
         return sign_in_page(c, a, &ctx, req, "401 Unauthorized", email, true)
     }
     _ = ctx.lock_rx.recv()
-    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, peer, http.user_agent(req)) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -675,6 +680,9 @@ fn sign_out(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !vo
 }
 
 fn session_transfer(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    // The peer's address, before the write token is taken.
+    const peer = try c.peer_ip(a)
+    defer a.free(peer)
     if (req.method == "GET") {
         var body: Buf(u8) = .empty
         defer a.free(body)
@@ -697,7 +705,7 @@ fn session_transfer(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Requ
         return http.respond(c, a, req, "400 Bad Request", "", "")
     }
     _ = ctx.lock_rx.recv()
-    const session_token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
+    const session_token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, peer, http.user_agent(req)) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -942,6 +950,9 @@ fn first_run_page(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reques
 // POST /first_run: the account, its administrator, signed in, and All
 // Talk; back to the start if someone was first.
 fn first_run(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    // The peer's address, before the write token is taken.
+    const peer = try c.peer_ip(a)
+    defer a.free(peer)
     if (try model.account_exists(ctx.db)) {
         return to_root(c, a, req)
     }
@@ -971,7 +982,7 @@ fn first_run(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !v
         ctx.lock_tx.send(true)
         return e
     }
-    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, req.peer_ip, req.user_agent) catch |e| {
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user, peer, http.user_agent(req)) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -1184,6 +1195,9 @@ fn reset_join_code(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Reque
 }
 
 fn join_account(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request) !void {
+    // The peer's address, before the write token is taken.
+    const peer = try c.peer_ip(a)
+    defer a.free(peer)
     const code = req.path[@len("/join/")..]
     var st = try ctx.db.prepare("SELECT name FROM accounts WHERE join_code = ? LIMIT 1")
     defer st.finalize()
@@ -1216,7 +1230,7 @@ fn join_account(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Request)
         ctx.lock_tx.send(true)
         return e
     }
-    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user_id, req.peer_ip, req.user_agent) catch |e| {
+    const token = session.start(a, ctx.db, ctx.clock, ctx.rng, user_id, peer, http.user_agent(req)) catch |e| {
         ctx.lock_tx.send(true)
         return e
     }
@@ -2316,14 +2330,15 @@ fn service_worker(c: TcpConn, a: Allocator, req: http.Request) !void {
 // tokens: an Origin must be this app's, and Sec-Fetch-Site same-origin or
 // same-site, or absent (this is plain HTTP).
 fn same_origin(a: Allocator, req: http.Request) bool {
-    if (@len(req.origin) > 0) {
+    if (@len(http.origin(req)) > 0) {
         const base = a.concat("http://", req.host)
         defer a.free(base)
-        if (req.origin != base) {
+        if (http.origin(req) != base) {
             return false
         }
     }
-    return @len(req.fetch_site) == 0 or req.fetch_site == "same-origin" or req.fetch_site == "same-site"
+    const site = http.fetch_site(req)
+    return @len(site) == 0 or site == "same-origin" or site == "same-site"
 }
 
 // POST /rooms/:id/messages: the message, and a turbo-stream appending it to
@@ -2917,7 +2932,7 @@ fn push_subscriptions(c: TcpConn, a: Allocator, inout ctx: Context, req: http.Re
         defer a.free(auth)
         if (!codec.base64_decode(a, &public_bytes, public_key) or !codec.base64_decode(a, &auth, auth_key) or !push.valid(a, endpoint, public_bytes, auth, ctx.push_allow_local)) { return http.respond(c, a, req, "422 Unprocessable Content", HTML, "") }
         _ = ctx.lock_rx.recv()
-        save_push(ctx.db, user, endpoint, public_key, auth_key, req.user_agent) catch |e| { ctx.lock_tx.send(true)
+        save_push(ctx.db, user, endpoint, public_key, auth_key, http.user_agent(req)) catch |e| { ctx.lock_tx.send(true)
             return e }
         ctx.lock_tx.send(true)
         return http.respond(c, a, req, "200 OK", "Content-Type: text/vnd.turbo-stream.html\r\n", "")
